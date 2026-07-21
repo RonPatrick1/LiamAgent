@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ollama list *)",
+      "Bash(ollama ps)",
+      "Bash(ollama --version)",
+      "Bash(nvidia-smi *)",
+      "Bash(adb devices)",
+      "Bash(lspci *)",
+      "Bash(curl -s http://localhost:11434*)",
+      "Bash(pip3 list)",
+      "Bash(pip3 show *)"
+    ]
+  }
+}
