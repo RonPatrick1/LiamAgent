@@ -19,6 +19,12 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
-        resp = requests.post(self.url, json=payload, timeout=600)
-        resp.raise_for_status()
-        return resp.json()["message"]
+        try:
+            resp = requests.post(self.url, json=payload, timeout=600)
+            resp.raise_for_status()
+            return resp.json()["message"]
+        except requests.exceptions.RequestException as exc:
+            # A network/timeout failure here shouldn't take down the whole
+            # REPL — surface it as a plain assistant message (no tool_calls)
+            # so the caller's loop treats it as a final answer and moves on.
+            return {"role": "assistant", "content": f"[error] Could not reach Ollama: {exc}"}

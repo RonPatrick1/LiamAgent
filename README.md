@@ -20,19 +20,40 @@ a different Ollama model.
 
 ## Web search
 
-`web_search` tries Google Custom Search first, falling back to Brave Search
-if Google errors out (daily quota exhausted, not configured, etc.). Set
-whichever of these env vars you have before running `LiamAgent.py`:
+`web_search` uses the Brave Search API (api-dashboard.search.brave.com).
+Google Custom Search was considered but dropped — as of Jan 2026 Google no
+longer allows newly created search engines to search the open web, only up
+to 50 specified domains, which isn't useful as a general-purpose tool.
+
+Set your key by copying `.env.example` to `.env` and editing it yourself:
 
 ```
-export GOOGLE_SEARCH_API_KEY=...   # https://developers.google.com/custom-search/v1/introduction
-export GOOGLE_SEARCH_CX=...        # your Custom Search Engine ID
-export BRAVE_API_KEY=...           # https://api.search.brave.com/app/keys
+cp .env.example .env
 ```
 
-Either provider can be left unset — if Google isn't configured it falls
-through to Brave immediately; if both are unset, `web_search` reports that
-plainly instead of failing silently.
+Then open `.env` in an editor and paste your key after `BRAVE_API_KEY=`.
+`LiamAgent.py` loads `.env` automatically at startup (it's gitignored, so
+the key never gets committed). If `BRAVE_API_KEY` isn't set, `web_search`
+reports that plainly instead of failing silently.
+
+## Persistent memory
+
+Liam remembers past conversations across restarts via a MySQL table
+(`messages`) on a fixed database server — host, port, and database name are
+hardcoded in `agent/memory.py` (`192.168.0.136` / `liams_memory`), since
+that's infrastructure, not something the agent should rediscover each run.
+Only the credentials come from `.env`:
+
+```
+DB_USER=...
+DB_PASSWORD=...
+```
+
+The `messages` table is created automatically on first use. Each user
+message and Liam's final reply get saved; on startup, the last 20 messages
+are loaded back into context. If the database is unreachable, memory calls
+fail quietly (a `[memory] ...` warning is printed) rather than crashing the
+agent — search and file tools still work fine without it.
 
 ## Layout
 
@@ -40,5 +61,6 @@ plainly instead of failing silently.
 - `agent/llm.py` — thin client for Ollama's `/api/chat` endpoint.
 - `agent/tools.py` — tool schemas and implementations (`read_file`,
   `write_file`, `list_directory`, `run_shell_command`, `web_search`).
+- `agent/memory.py` — persistent conversation history backed by MySQL.
 - `agent/core.py` — the agent loop: sends messages, executes tool calls the
   model requests, feeds results back, repeats until a final answer.

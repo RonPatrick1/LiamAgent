@@ -1,1 +1,4 @@
 requests
+pymysql
+playwright
+prompt_toolkit

@@ -1,3 +1,8 @@
 # Ignore files and folders containing 'claude'
 *claude*
 backup/
+
+.env
+__pycache__/
+*.pyc
+.liam_history
