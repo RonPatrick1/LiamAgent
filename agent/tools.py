@@ -1,47 +1,292 @@
 """Basic tool implementations and their JSON schemas."""
 
+import difflib
+import hashlib
 import os
 import re
 import subprocess
+import time
 import urllib.parse
+import uuid
 
 import requests
 from playwright.sync_api import sync_playwright
 
-from . import memory
-
-WORKDIR = os.getcwd()
+from . import memory, routines
 
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY")
 
-
-def _resolve(path):
-    return os.path.abspath(os.path.expanduser(path))
-
-
-def read_file(path, max_chars=200_000):
-    with open(_resolve(path), "r", errors="replace") as f:
-        return f.read(max_chars)
+COMFYUI_URL = "http://127.0.0.1:8188"
+SD_CHECKPOINT = os.environ.get("LIAM_SD_CHECKPOINT", "sd_xl_base_1.0.safetensors")
+GENERATED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".liam_generated")
 
 
-def write_file(path, content):
-    full_path = _resolve(path)
+def _resolve(path, base_dir=None):
+    path = os.path.expanduser(path)
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(base_dir or os.getcwd(), path))
+
+
+def read_file(path, base_dir=None, max_chars=200_000, offset=None, limit=None):
+    """offset/limit (1-indexed line numbers, both inclusive) read a
+    specific line range instead of the whole file — for a large file,
+    or to double-check a small range right before an edit_file call."""
+    if offset is None and limit is None:
+        with open(_resolve(path, base_dir), "r", errors="replace") as f:
+            return f.read(max_chars)
+    with open(_resolve(path, base_dir), "r", errors="replace") as f:
+        lines = f.readlines()
+    start = max((offset or 1) - 1, 0)
+    end = start + limit if limit is not None else len(lines)
+    return "".join(lines[start:end])[:max_chars]
+
+
+def write_file(path, content, base_dir=None):
+    full_path = _resolve(path, base_dir)
     parent = os.path.dirname(full_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    unchanged = False
+    if os.path.exists(full_path):
+        with open(full_path, "r", errors="replace") as f:
+            unchanged = f.read() == content
     with open(full_path, "w") as f:
         f.write(content)
+    if unchanged:
+        return (
+            f"Wrote {len(content)} bytes to {full_path} — WARNING: this is "
+            f"byte-for-byte identical to what was already there. If the goal "
+            f"was to fix an error, nothing actually changed — edit the "
+            f"content itself before writing again, don't resubmit the same "
+            f"code and expect a different result."
+        )
     return f"Wrote {len(content)} bytes to {full_path}"
 
 
-def list_directory(path="."):
-    full_path = _resolve(path)
+def edit_file(path, old_string, new_string, base_dir=None, replace_all=False):
+    """Replace old_string with new_string in an existing file — for a
+    targeted change to part of a file, instead of retransmitting the
+    entire file through write_file. Prefer this for fixing a specific
+    line/function; it can't accidentally touch anything else in the file
+    the way a full rewrite can (proven repeatedly: full-rewrite
+    write_file calls have introduced unrelated regressions — reordered
+    functions, Python syntax appearing in a .cpp file — that a targeted
+    edit structurally cannot cause, since it can only change the exact
+    text matched). By default old_string must be unique (the wrong
+    occurrence could otherwise get replaced); pass replace_all=True for
+    a deliberate mechanical replacement of every occurrence, e.g.
+    renaming a variable throughout the file."""
+    full_path = _resolve(path, base_dir)
+    with open(full_path, "r", errors="replace") as f:
+        content = f.read()
+    count = content.count(old_string)
+    if count == 0:
+        return (
+            f"Error: old_string not found in {full_path}. Nothing was "
+            f"changed — check it matches the file exactly, including "
+            f"whitespace/indentation, then try again."
+        )
+    if count > 1 and not replace_all:
+        return (
+            f"Error: old_string appears {count} times in {full_path} — it "
+            f"must be unique, or the wrong occurrence could get replaced. "
+            f"Add more surrounding context to old_string, or pass "
+            f"replace_all=True if you actually want to replace all {count}."
+        )
+    if old_string == new_string:
+        return "Error: old_string and new_string are identical — nothing would actually change. Fix the content of new_string and try again."
+    new_content = content.replace(old_string, new_string, -1 if replace_all else 1)
+    with open(full_path, "w") as f:
+        f.write(new_content)
+    replaced = count if replace_all else 1
+    return f"Replaced {replaced} occurrence(s) in {full_path} ({len(new_content)} bytes now)."
+
+
+def list_directory(path=".", base_dir=None):
+    full_path = _resolve(path, base_dir)
     return "\n".join(sorted(os.listdir(full_path)))
 
 
-def run_shell_command(command, timeout=60):
+_SEARCH_SKIP_DIRS = {".git", "node_modules", "__pycache__", "build", "dist", ".venv", "venv"}
+
+
+def search_text(pattern, path=".", base_dir=None, max_results=100):
+    """Recursive case-insensitive text search across files under path —
+    like rg/git grep, but pure Python (no dependency on ripgrep/git being
+    installed, no shell string to get subtly wrong). Skips common noise
+    directories (.git, node_modules, __pycache__, build, dist, venv)."""
+    root = _resolve(path, base_dir)
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        return f"Error: invalid regex pattern: {exc}"
+    results = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SEARCH_SKIP_DIRS]
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            try:
+                with open(full_path, "r", errors="ignore") as f:
+                    for lineno, line in enumerate(f, 1):
+                        if regex.search(line):
+                            results.append(f"{full_path}:{lineno}: {line.strip()}")
+                            if len(results) >= max_results:
+                                results.append(f"... stopped at {max_results} results")
+                                return "\n".join(results)
+            except (IsADirectoryError, PermissionError, UnicodeDecodeError):
+                continue
+    return "\n".join(results) if results else "No matches found."
+
+
+def find_files(name_pattern, path=".", base_dir=None, max_results=200):
+    """Recursive filename search using glob-style matching (e.g.
+    "*.cpp") — like rg --files/find/git ls-files, but pure Python."""
+    import fnmatch
+    root = _resolve(path, base_dir)
+    results = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SEARCH_SKIP_DIRS]
+        for filename in filenames:
+            if fnmatch.fnmatch(filename, name_pattern):
+                results.append(os.path.join(dirpath, filename))
+                if len(results) >= max_results:
+                    results.append(f"... stopped at {max_results} results")
+                    return "\n".join(results)
+    return "\n".join(results) if results else "No matching files found."
+
+
+def file_info(path, base_dir=None):
+    """stat/wc/file/readlink/realpath in one call: size, line count (for
+    text files), modified time, permissions, and the fully resolved real
+    path (symlinks followed)."""
+    full_path = _resolve(path, base_dir)
+    real_path = os.path.realpath(full_path)
+    st = os.stat(full_path)
+    lines = None
+    try:
+        with open(full_path, "r", errors="ignore") as f:
+            lines = sum(1 for _ in f)
+    except (IsADirectoryError, UnicodeDecodeError):
+        pass
+    kind = "directory" if os.path.isdir(full_path) else "file"
+    info = [
+        f"path: {full_path}",
+        f"real path: {real_path}",
+        f"type: {kind}",
+        f"size: {st.st_size} bytes",
+        f"permissions: {oct(st.st_mode)[-3:]}",
+        f"modified: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime))}",
+    ]
+    if lines is not None:
+        info.append(f"lines: {lines}")
+    return "\n".join(info)
+
+
+def diff_files(path_a, path_b, base_dir=None):
+    """Unified diff between two files — like diff/cmp, via Python's own
+    difflib rather than shelling out."""
+    import difflib
+    full_a = _resolve(path_a, base_dir)
+    full_b = _resolve(path_b, base_dir)
+    with open(full_a, "r", errors="replace") as f:
+        lines_a = f.readlines()
+    with open(full_b, "r", errors="replace") as f:
+        lines_b = f.readlines()
+    if lines_a == lines_b:
+        return f"{full_a} and {full_b} are identical."
+    diff = difflib.unified_diff(lines_a, lines_b, fromfile=full_a, tofile=full_b)
+    return "".join(diff) or "Files differ only in trailing newline."
+
+
+def read_json(path, query=None, base_dir=None):
+    """Read and parse a JSON file, optionally extracting one dotted-path
+    key (e.g. "a.b.0.c") — like jq, via Python's own json module."""
+    import json as json_mod
+    full_path = _resolve(path, base_dir)
+    with open(full_path, "r", errors="replace") as f:
+        data = json_mod.load(f)
+    if not query:
+        return json_mod.dumps(data, indent=2)
+    current = data
+    for part in query.split("."):
+        if isinstance(current, list):
+            current = current[int(part)]
+        else:
+            current = current[part]
+    return json_mod.dumps(current, indent=2) if isinstance(current, (dict, list)) else str(current)
+
+
+def make_directory(path, base_dir=None):
+    full_path = _resolve(path, base_dir)
+    os.makedirs(full_path, exist_ok=True)
+    return f"Created directory {full_path}"
+
+
+def copy_path(src, dst, base_dir=None):
+    import shutil
+    full_src = _resolve(src, base_dir)
+    full_dst = _resolve(dst, base_dir)
+    if os.path.isdir(full_src):
+        shutil.copytree(full_src, full_dst, dirs_exist_ok=True)
+    else:
+        shutil.copy2(full_src, full_dst)
+    return f"Copied {full_src} to {full_dst}"
+
+
+def move_path(src, dst, base_dir=None):
+    import shutil
+    full_src = _resolve(src, base_dir)
+    full_dst = _resolve(dst, base_dir)
+    shutil.move(full_src, full_dst)
+    return f"Moved {full_src} to {full_dst}"
+
+
+def delete_path(path, base_dir=None):
+    import shutil
+    full_path = _resolve(path, base_dir)
+    if os.path.isdir(full_path):
+        shutil.rmtree(full_path)
+    else:
+        os.remove(full_path)
+    return f"Deleted {full_path}"
+
+
+def _run_git(args, base_dir=None):
     result = subprocess.run(
-        command, shell=True, capture_output=True, text=True, timeout=timeout
+        ["git"] + args, capture_output=True, text=True, timeout=30, cwd=base_dir or os.getcwd(),
+    )
+    output = result.stdout or result.stderr
+    return output[:20_000] or "(no output)"
+
+
+def git_status(base_dir=None):
+    return _run_git(["status"], base_dir)
+
+
+def git_diff(path=None, base_dir=None):
+    return _run_git(["diff"] + ([path] if path else []), base_dir)
+
+
+def git_log(path=None, limit=10, base_dir=None):
+    args = ["log", f"-{int(limit)}", "--oneline"]
+    if path:
+        args += ["--", path]
+    return _run_git(args, base_dir)
+
+
+def git_blame(path, base_dir=None):
+    return _run_git(["blame", path], base_dir)
+
+
+def git_add(path, base_dir=None):
+    return _run_git(["add", path], base_dir)
+
+
+def run_shell_command(command, base_dir=None, timeout=60):
+    result = subprocess.run(
+        command, shell=True, capture_output=True, text=True, timeout=timeout,
+        cwd=base_dir or None,
     )
     output = result.stdout
     if result.stderr:
@@ -79,6 +324,111 @@ def web_search(query, num_results=5):
         return _format_search_results(results)
     except Exception as exc:
         return f"Web search failed: {exc}"
+
+
+def image_search(query, num_results=5):
+    """Search for real images via Brave's image search. Returns each
+    result's actual image URL (properties.url — the real file, not a
+    thumbnail) plus its title/source, so the model can pick one and show
+    it using standard Markdown image syntax ![description](url), which
+    LiamGUI renders inline (downloading and embedding it) rather than
+    leaving as literal text."""
+    if not BRAVE_API_KEY:
+        return "Image search failed: BRAVE_API_KEY is not set."
+    memory.log_search(query)
+    try:
+        resp = requests.get(
+            "https://api.search.brave.com/res/v1/images/search",
+            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
+            params={"q": query, "count": min(max(num_results, 1), 10)},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("results", [])
+        if not items:
+            return "No images found."
+        lines = []
+        for i, item in enumerate(items, 1):
+            image_url = item.get("properties", {}).get("url", "")
+            title = item.get("title", "")
+            source = item.get("source", "")
+            lines.append(f"{i}. {title}\n   image: {image_url}\n   source: {source}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Image search failed: {exc}"
+
+
+def _sdxl_workflow(prompt, negative_prompt, width, height):
+    seed = uuid.uuid4().int & ((1 << 32) - 1)
+    return {
+        "3": {
+            "class_type": "KSampler",
+            "inputs": {
+                "cfg": 7, "denoise": 1, "sampler_name": "euler", "scheduler": "normal",
+                "seed": seed, "steps": 30,
+                "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0],
+            },
+        },
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": SD_CHECKPOINT}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["4", 1]}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": negative_prompt, "clip": ["4", 1]}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "liam", "images": ["8", 0]}},
+    }
+
+
+def generate_image(prompt, negative_prompt="", width=1024, height=1024):
+    """Generate a brand-new image from a text description using the local
+    Stable Diffusion (SDXL) install on this machine's own GPU — not a web
+    search. Use this whenever the user asks to draw, create, imagine, or
+    generate a picture (as opposed to image_search, which finds an
+    existing real photo). Returns Markdown image syntax pointing at the
+    saved local file, which LiamGUI renders inline."""
+    try:
+        resp = requests.post(
+            f"{COMFYUI_URL}/prompt",
+            json={"prompt": _sdxl_workflow(prompt, negative_prompt, width, height), "client_id": str(uuid.uuid4())},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        prompt_id = resp.json()["prompt_id"]
+
+        deadline = time.time() + 180
+        history = None
+        while time.time() < deadline:
+            hist_resp = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=10)
+            hist_resp.raise_for_status()
+            data = hist_resp.json()
+            if prompt_id in data:
+                history = data[prompt_id]
+                break
+            time.sleep(2)
+        if history is None:
+            return "Image generation timed out waiting for the local Stable Diffusion service."
+
+        images = history.get("outputs", {}).get("9", {}).get("images", [])
+        if not images:
+            return "Image generation finished but produced no image."
+        image = images[0]
+
+        img_resp = requests.get(
+            f"{COMFYUI_URL}/view",
+            params={"filename": image["filename"], "subfolder": image.get("subfolder", ""), "type": image.get("type", "output")},
+            timeout=30,
+        )
+        img_resp.raise_for_status()
+
+        os.makedirs(GENERATED_DIR, exist_ok=True)
+        digest = hashlib.sha256(img_resp.content).hexdigest()[:24]
+        path = os.path.join(GENERATED_DIR, f"{digest}.png")
+        with open(path, "wb") as f:
+            f.write(img_resp.content)
+        return f"Generated image saved. ![{prompt}]({path})"
+    except requests.exceptions.ConnectionError:
+        return "Image generation failed: the local Stable Diffusion service isn't running."
+    except Exception as exc:
+        return f"Image generation failed: {exc}"
 
 
 _WEATHER_CODES = {
@@ -165,11 +515,31 @@ def get_weather(location, days=8):
     return "\n".join(lines)
 
 
-def fetch_url(url):
+def fetch_url(url, base_dir=None, allow_local_fallback=True):
     """Render a real webpage (JavaScript included) with a headless browser
     and return its visible text. Use this when web_search's snippets aren't
-    enough — e.g. to actually read a page a search result pointed at."""
+    enough — e.g. to actually read a page a search result pointed at.
+
+    allow_local_fallback exists so a restricted caller (one whose
+    allowed_tools excludes read_file — see agent/core.py's per-sender
+    tool tiers) can't use this as a back door to read local files anyway;
+    Agent._run_tool sets it based on whether read_file is actually
+    available to that caller, mirroring base_dir's injection."""
     if not re.match(r"^https?://", url):
+        # The model repeatedly reaches for fetch_url on local filenames
+        # despite being told not to, and — proven across many attempts —
+        # doesn't reliably retry with read_file after an error telling it
+        # to. Rather than keep erroring and hoping, transparently read it
+        # as a local file instead, so the outcome is correct regardless of
+        # which tool it picked — but only when this caller could have
+        # just called read_file directly anyway.
+        if allow_local_fallback:
+            local_path = re.sub(r"^file://", "", url)
+            try:
+                content = read_file(local_path, base_dir)
+                return f"[Note: '{url}' isn't a webpage — read as a local file instead.]\n\n{content}"
+            except Exception:
+                pass
         return (
             f"fetch_url only works on real http(s) webpages, not '{url}'. "
             f"For a local file, use read_file with its actual filesystem "
@@ -196,37 +566,359 @@ def fetch_url(url):
     )
 
 
+FREDPLAYER_MEDIA_URL = os.environ.get("FREDPLAYER_MEDIA_URL", "").rstrip("/")
+FREDPLAYER_MEDIA_TOKEN = os.environ.get("FREDPLAYER_MEDIA_TOKEN", "")
+
+
+def _fredplayer_headers():
+    return {"Authorization": f"Bearer {FREDPLAYER_MEDIA_TOKEN}"}
+
+
+def fredplayer_list_library(artist=None):
+    """Two-step by design: called with no artist, this returns just the
+    distinct artist names and track counts (~100+ entries for a real
+    library) instead of the full track list (thousands of tracks) —
+    dumping every track as text would be huge and mostly wasted, since
+    genre classification only needs artist names plus whatever's already
+    known/searchable about each one. Call again with a specific artist
+    (exact name as returned by the no-argument call) to get that artist's
+    actual track paths once it's been decided the artist belongs in the
+    playlist — those exact paths are what fredplayer_save_playlist needs,
+    not reconstructed or guessed ones."""
+    if not FREDPLAYER_MEDIA_URL or not FREDPLAYER_MEDIA_TOKEN:
+        return "FredPlayer isn't configured — set FREDPLAYER_MEDIA_URL and FREDPLAYER_MEDIA_TOKEN in .env."
+    try:
+        resp = requests.get(f"{FREDPLAYER_MEDIA_URL}/api/library", headers=_fredplayer_headers(), timeout=15)
+        resp.raise_for_status()
+        tracks = resp.json()
+    except Exception as exc:
+        return f"Could not reach the FredPlayer server: {exc}"
+
+    if artist:
+        matches = [t for t in tracks if (t.get("artist") or "").strip().lower() == artist.strip().lower()]
+        if not matches:
+            return (
+                f'No tracks found for artist "{artist}". Call fredplayer_list_library with no '
+                f"artist to see the exact artist names in this library."
+            )
+        lines = [f'{len(matches)} track(s) by "{artist}":']
+        for t in matches:
+            genre = f" [{t['genre']}]" if t.get("genre") else ""
+            lines.append(f"- {t['path']} — {t.get('title', '')}{genre}")
+        return "\n".join(lines)
+
+    counts = {}
+    for t in tracks:
+        name = (t.get("artist") or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        return "FredPlayer library is empty."
+    lines = [f"{len(counts)} artists, {len(tracks)} tracks total:"]
+    for name in sorted(counts, key=str.lower):
+        lines.append(f"- {name} ({counts[name]})")
+    return "\n".join(lines)
+
+
+def fredplayer_save_playlist(playlist_name, track_paths):
+    """Creates (or overwrites, if a playlist with this name already
+    exists) a named playlist on the FredPlayer server, built from exact
+    track paths returned by fredplayer_list_library(artist=...) — one
+    path per line. The FredPlayer Android app picks these up on its own
+    later through its "Import Liam's playlists" button — there's no way
+    for this tool to know when, or whether, that happens.
+
+    The parameter is playlist_name, not name — proven necessary, not
+    stylistic: a tool parameter literally called "name" silently breaks
+    this model's tool-calling entirely (empty response, no tool_calls at
+    all, no visible error), almost certainly colliding with the "name"
+    key already used for the function's own name in Ollama's tool_call
+    JSON shape. Isolated by testing minimal schemas directly against
+    Ollama — reproducible across unrelated tool names/domains, only
+    triggered by a parameter key of exactly "name". Never reuse "name" as
+    a parameter key on any tool."""
+    if not FREDPLAYER_MEDIA_URL or not FREDPLAYER_MEDIA_TOKEN:
+        return "FredPlayer isn't configured — set FREDPLAYER_MEDIA_URL and FREDPLAYER_MEDIA_TOKEN in .env."
+    if not playlist_name or not playlist_name.strip():
+        return "playlist_name is required."
+    # Accepts a newline-separated string; a real list is still accepted
+    # too, for any direct/programmatic caller.
+    paths = track_paths if isinstance(track_paths, list) else [
+        line.strip() for line in (track_paths or "").splitlines() if line.strip()
+    ]
+    if not paths:
+        return "track_paths must be a non-empty newline-separated list of exact paths from fredplayer_list_library."
+    try:
+        resp = requests.post(
+            f"{FREDPLAYER_MEDIA_URL}/api/playlists",
+            headers=_fredplayer_headers(),
+            json={"name": playlist_name.strip(), "tracks": paths},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        return f"Could not save playlist to FredPlayer: {exc}"
+    return f'Saved playlist "{playlist_name.strip()}" with {len(paths)} track(s) to FredPlayer.'
+
+
+# Playlists proposed via fredplayer_propose_playlist, keyed by session_id.
+# Deliberately in-memory only, never written to disk or the FredPlayer
+# server — the whole point of this tool (vs. fredplayer_save_playlist) is
+# a playlist that stays local to whichever single device asked for it,
+# handed back once through the /fredplayer-ask response and then gone.
+_PROPOSED_PLAYLISTS = {}
+
+_QUOTE_TRANSLATION = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+
+
+def _normalize_track_text(value):
+    value = (value or "").translate(_QUOTE_TRANSLATION).strip().lower()
+    return re.sub(r"\s+", " ", value)
+
+
+def _resolve_track(library, artist, title):
+    """Matches a model-supplied (artist, title) pair against the real
+    library, tolerant of small differences (curly vs straight quotes,
+    case, whitespace, minor typos) — this is what lets
+    fredplayer_propose_playlist accept plain artist/title names instead
+    of requiring the model to transcribe exact file paths, which is where
+    it used to fail. Prefers an exact normalized match; falls back to
+    fuzzy title matching, first within same-artist candidates, then
+    across the whole library in case the artist name itself was off."""
+    norm_title = _normalize_track_text(title)
+    if not norm_title:
+        return None
+    norm_artist = _normalize_track_text(artist)
+
+    candidates = [t for t in library if _normalize_track_text(t.get("artist")) == norm_artist]
+    if not candidates:
+        candidates = library
+
+    for t in candidates:
+        if _normalize_track_text(t.get("title")) == norm_title:
+            return t
+
+    by_title = {_normalize_track_text(t.get("title")): t for t in candidates}
+    close = difflib.get_close_matches(norm_title, by_title.keys(), n=1, cutoff=0.72)
+    return by_title[close[0]] if close else None
+
+
+def _parse_track_lines(tracks_text):
+    """One "Artist :: Title" pair per line -> [(artist, title), ...].
+    Falls back to " - " as a separator too, in case the model doesn't
+    follow the exact one asked for — this is post-hoc text parsing, so
+    being lenient here costs nothing the way a strict JSON schema would."""
+    items = []
+    for line in (tracks_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "::" in line:
+            artist, _, title = line.partition("::")
+        elif " - " in line:
+            artist, _, title = line.partition(" - ")
+        else:
+            continue
+        title = title.strip()
+        if title:
+            items.append((artist.strip(), title))
+    return items
+
+
+def fredplayer_propose_playlist(playlist_name, tracks, session_id=None):
+    """Use this — not fredplayer_save_playlist — when answering a
+    FredPlayer app's own in-app "Ask Liam" request (you'll know because
+    the conversation is happening through that path, not Matrix/GUI/CLI).
+    This hands the playlist back directly to the single device that
+    asked, as a new local playlist there — it is never written to the
+    shared FredPlayer server and no other device will ever see it.
+
+    tracks is a plain string, ONE TRACK PER LINE, formatted exactly as
+    "Artist :: Title" — e.g.:
+    *NSYNC :: Tearin' Up My Heart
+    Adele :: Someone Like You
+    Pick specific songs, not whole artists, since one artist's catalog
+    can span very different moods and genres; naming individual tracks is
+    what actually lets a request like a specific mood or occasion produce
+    a fitting playlist instead of "everything by X". Use the artist/title
+    text as shown by fredplayer_list_library — you do not need to fetch
+    or retype exact file paths, matching against the real library
+    (including small spelling/formatting differences) happens
+    automatically inside this tool.
+
+    The parameter is playlist_name, not name — see fredplayer_save_playlist's
+    docstring: a parameter literally called "name" silently breaks this
+    model's tool-calling entirely, proven by direct isolated testing
+    against Ollama. Never reuse "name" as a parameter key on any tool."""
+    if not FREDPLAYER_MEDIA_URL or not FREDPLAYER_MEDIA_TOKEN:
+        return "FredPlayer isn't configured — set FREDPLAYER_MEDIA_URL and FREDPLAYER_MEDIA_TOKEN in .env."
+    if not playlist_name or not playlist_name.strip():
+        return "playlist_name is required."
+    parsed = _parse_track_lines(tracks)
+    if not parsed:
+        return 'tracks must be a non-empty string, one "Artist :: Title" pair per line.'
+    if session_id is None:
+        return "This tool only works from the FredPlayer app's Ask Liam request, not this conversation."
+    try:
+        resp = requests.get(f"{FREDPLAYER_MEDIA_URL}/api/library", headers=_fredplayer_headers(), timeout=15)
+        resp.raise_for_status()
+        library = resp.json()
+    except Exception as exc:
+        return f"Could not reach the FredPlayer server to match tracks: {exc}"
+
+    resolved = []
+    missed = []
+    for artist, title in parsed:
+        match = _resolve_track(library, artist, title)
+        if match is not None:
+            resolved.append(match["path"])
+        else:
+            missed.append(f"{artist} - {title}")
+
+    if not resolved:
+        return (
+            "None of those tracks matched anything in the library — double-check the "
+            "artist/title spelling, or call fredplayer_list_library(artist=...) first to "
+            "see the real titles."
+        )
+
+    _PROPOSED_PLAYLISTS[session_id] = {"name": playlist_name.strip(), "tracks": resolved}
+    result = f'Proposed playlist "{playlist_name.strip()}" with {len(resolved)} track(s) — the app will create it locally.'
+    if missed:
+        result += f" Could not match {len(missed)}: {', '.join(missed)}."
+    return result
+
+
+def schedule_routine(prompt, schedule_kind, schedule_value, session_id=None):
+    """Create a real scheduled routine tied to this thread — a systemd
+    --user timer that runs `prompt` against this same thread at the given
+    time, whether or not Liam is even open. schedule_kind is 'daily'
+    (schedule_value = 'HH:MM', 24-hour) or 'hourly' (schedule_value = the
+    N in 'every N hours')."""
+    if schedule_kind not in ("daily", "hourly"):
+        return "schedule_kind must be 'daily' or 'hourly'."
+    routine_id = routines.create_routine(session_id, prompt, schedule_kind, schedule_value)
+    when = f"daily at {schedule_value}" if schedule_kind == "daily" else f"every {schedule_value} hour(s)"
+    return f'Scheduled routine #{routine_id}: "{prompt}" — runs {when}, in this thread.'
+
+
+def list_my_routines(session_id=None):
+    """List the routines scheduled in this thread specifically (not every
+    routine across every thread — this app also has a Routines dialog in
+    its own UI for that broader view)."""
+    mine = [r for r in routines.list_routines() if r["session_id"] == session_id]
+    if not mine:
+        return "No routines scheduled in this thread."
+    lines = []
+    for r in mine:
+        when = f"daily at {r['schedule_value']}" if r["schedule_kind"] == "daily" else f"every {r['schedule_value']}h"
+        status = "enabled" if r["enabled"] else "disabled"
+        lines.append(f"#{r['id']}: \"{r['prompt']}\" — {when}, {status}, last ran {r['last_run_at'] or 'never'}")
+    return "\n".join(lines)
+
+
+def cancel_routine(routine_id, session_id=None):
+    """Delete a routine by its id (from list_my_routines' #id output) —
+    only if it belongs to this thread, so one thread can't reach into
+    another's schedule."""
+    routine = routines.get_routine(routine_id)
+    if routine is None or routine["session_id"] != session_id:
+        return f"No routine #{routine_id} found in this thread."
+    routines.delete_routine(routine_id)
+    return f"Cancelled routine #{routine_id}."
+
+
+def propose_lesson(keywords, lesson, session_id=None):
+    """Save a human-reviewed lesson from a real mistake, so it's
+    available (via keyword match) in future conversations without
+    permanently bloating the system prompt for every conversation. The
+    confirmation gate in Agent._run_tool (this is a DANGEROUS_TOOLS
+    entry) is what actually gives the user a chance to review or rewrite
+    keywords/lesson before this function ever runs — by the time this
+    executes, whatever's in keywords/lesson is already the final,
+    reviewed text."""
+    lesson_id = memory.add_lesson(keywords, lesson, source_session_id=session_id)
+    if lesson_id is None:
+        return "Failed to save that lesson — see the server log for details."
+    return f'Saved lesson #{lesson_id}: "{lesson}" (triggers on: {keywords})'
+
+
 TOOL_IMPL = {
     "read_file": read_file,
     "write_file": write_file,
+    "edit_file": edit_file,
     "list_directory": list_directory,
+    "search_text": search_text,
+    "find_files": find_files,
+    "file_info": file_info,
+    "diff_files": diff_files,
+    "read_json": read_json,
+    "make_directory": make_directory,
+    "copy_path": copy_path,
+    "move_path": move_path,
+    "delete_path": delete_path,
+    "git_status": git_status,
+    "git_diff": git_diff,
+    "git_log": git_log,
+    "git_blame": git_blame,
+    "git_add": git_add,
     "run_shell_command": run_shell_command,
     "get_weather": get_weather,
     "web_search": web_search,
+    "image_search": image_search,
+    "generate_image": generate_image,
     "fetch_url": fetch_url,
     "query_memory": memory.query_memory,
     "remember": memory.remember,
     "recall_notes": memory.recall_notes,
     "forget": memory.forget,
     "search_usage": memory.get_search_usage,
+    "schedule_routine": schedule_routine,
+    "list_my_routines": list_my_routines,
+    "cancel_routine": cancel_routine,
+    "propose_lesson": propose_lesson,
+    "fredplayer_list_library": fredplayer_list_library,
+    "fredplayer_save_playlist": fredplayer_save_playlist,
+    "fredplayer_propose_playlist": fredplayer_propose_playlist,
 }
 
 # Tools that mutate the filesystem, execute arbitrary commands, or delete
 # data require confirmation from the user before running (unless --yes is
 # passed). remember is excluded — inserting a note can't destroy anything,
 # but forget deletes rows permanently, so it's gated like the others.
-DANGEROUS_TOOLS = {"write_file", "run_shell_command", "forget"}
+# schedule_routine creates a real systemd timer that keeps running
+# unattended afterward, and cancel_routine deletes one — both get the same
+# confirm-first treatment as forget for that reason. propose_lesson is
+# gated too, for a different reason: it's global, not thread-scoped — a
+# saved lesson permanently changes Liam's behavior in every future
+# conversation, everywhere, so it needs a human's review (and chance to
+# rewrite it) before it's actually saved, not a rubber-stamp confirm.
+# make_directory/copy_path/move_path/git_add mutate the filesystem/repo the
+# same way write_file does; delete_path is irreversible like forget. The
+# read-only inspection tools (search_text, find_files, file_info,
+# diff_files, read_json, git_status/diff/log/blame) are deliberately NOT
+# here — they can't change anything, same tier as read_file/list_directory.
+DANGEROUS_TOOLS = {
+    "write_file", "edit_file", "run_shell_command", "forget", "schedule_routine",
+    "cancel_routine", "propose_lesson", "make_directory", "copy_path", "move_path",
+    "delete_path", "git_add",
+    # Mutates the FredPlayer server the same way write_file mutates the
+    # filesystem — creates or overwrites a playlist file.
+    "fredplayer_save_playlist",
+}
 
 TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a text file from the local filesystem.",
+            "description": "Read the contents of a text file from the local filesystem, or a specific line range with offset/limit.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file to read."},
+                    "offset": {"type": "integer", "description": "First line to read, 1-indexed (optional — omit to read from the start)."},
+                    "limit": {"type": "integer", "description": "Number of lines to read from offset (optional — omit to read to the end)."},
                 },
                 "required": ["path"],
             },
@@ -236,7 +928,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write (or overwrite) a text file on the local filesystem.",
+            "description": (
+                "Write (or overwrite) a text file on the local filesystem — "
+                "for a brand-new file, or a genuine full rewrite. For fixing "
+                "or changing part of an existing file, use edit_file instead: "
+                "it can't accidentally touch anything you didn't mean to "
+                "change, the way retransmitting the whole file can."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -244,6 +942,36 @@ TOOL_SCHEMAS = [
                     "content": {"type": "string", "description": "Full text content to write."},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace one exact occurrence of old_string with new_string "
+                "in an existing file — the default choice for fixing or "
+                "changing part of a file. Call read_file first to see the "
+                "file's real current content — never guess old_string from "
+                "memory of what you wrote earlier or think it should say; "
+                "if it doesn't match verbatim (including whitespace), this "
+                "safely does nothing and returns an error instead of "
+                "guessing which part you meant, so an unread guess just "
+                "wastes a turn. old_string must also appear only once —  "
+                "include enough surrounding lines to make it unique. Only "
+                "use write_file instead for a brand-new file or when truly "
+                "replacing the whole thing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to edit."},
+                    "old_string": {"type": "string", "description": "Exact existing text to find (must be unique in the file, unless replace_all is used)."},
+                    "new_string": {"type": "string", "description": "Text to replace it with."},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one match (e.g. renaming a variable throughout the file)."},
+                },
+                "required": ["path", "old_string", "new_string"],
             },
         },
     },
@@ -258,6 +986,203 @@ TOOL_SCHEMAS = [
                     "path": {"type": "string", "description": "Directory path. Defaults to the current directory."},
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_text",
+            "description": "Recursively search for a regex pattern across text files under a directory, returning file:line:content for each match. Use this instead of read_file when you need to find something rather than already knowing which file/line it's in.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for (case-insensitive)."},
+                    "path": {"type": "string", "description": "Directory to search under. Defaults to the current directory."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Recursively find files by name using a glob pattern (e.g. \"*.cpp\"), when you don't already know the exact path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name_pattern": {"type": "string", "description": "Glob pattern to match filenames against, e.g. \"*.cpp\"."},
+                    "path": {"type": "string", "description": "Directory to search under. Defaults to the current directory."},
+                },
+                "required": ["name_pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_info",
+            "description": "Get a file or directory's size, line count, permissions, modified time, and fully resolved real path — for checking whether/how something exists without reading its full content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to inspect."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "diff_files",
+            "description": "Show a unified diff between two files — e.g. to compare a backup against the current version, or two revisions saved under different names.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path_a": {"type": "string", "description": "First file."},
+                    "path_b": {"type": "string", "description": "Second file."},
+                },
+                "required": ["path_a", "path_b"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_json",
+            "description": "Read and parse a JSON file, optionally extracting one value by dotted path (e.g. \"a.b.0.c\") instead of the whole thing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the JSON file."},
+                    "query": {"type": "string", "description": "Optional dotted path to extract a specific value, e.g. \"settings.model\"."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_directory",
+            "description": "Create a directory on the local filesystem (including any missing parent directories).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path to create."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "copy_path",
+            "description": "Copy a file or directory to a new location on the local filesystem.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Path to copy from."},
+                    "dst": {"type": "string", "description": "Path to copy to."},
+                },
+                "required": ["src", "dst"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_path",
+            "description": "Move or rename a file or directory on the local filesystem.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Path to move from."},
+                    "dst": {"type": "string", "description": "Path to move to."},
+                },
+                "required": ["src", "dst"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_path",
+            "description": "Permanently delete a file or directory (recursively, if a directory) from the local filesystem. There is no undo — this is as irreversible as the forget tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to delete."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": "Show git's working-tree status (modified/staged/untracked files) for the repo at the current working directory.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": "Show unstaged git changes, optionally limited to one file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Limit the diff to this file (optional)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_log",
+            "description": "Show recent git commit history, optionally limited to one file's history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Limit history to this file (optional)."},
+                    "limit": {"type": "integer", "description": "Number of commits to show (default 10)."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_blame",
+            "description": "Show who/when last changed each line of a file, via git blame.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to blame."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_add",
+            "description": "Stage a file's changes with git add (staging only — never commits).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File or path to stage."},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -290,6 +1215,57 @@ TOOL_SCHEMAS = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "image_search",
+            "description": (
+                "Search for real images on the web (Brave image search). "
+                "Use this whenever the user asks to see, find, or show a "
+                "picture of something. Each result includes the actual "
+                "image URL — to display one, put it in your final answer "
+                "as standard Markdown image syntax: ![description](that "
+                "image URL). It renders as a real embedded image, not "
+                "literal text, so don't also describe the URL separately."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for, e.g. 'golden retriever puppy'."},
+                    "num_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (default 5, max 10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate a brand-new image from a text description using "
+                "the local Stable Diffusion install on this machine's own "
+                "GPU. Use this when asked to draw, create, imagine, or "
+                "generate a picture — never image_search for this, since "
+                "that only finds existing real photos. Returns Markdown "
+                "image syntax pointing at the saved file — put that "
+                "directly in your final answer to display it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Description of the image to generate."},
+                    "negative_prompt": {"type": "string", "description": "Things to avoid in the image (optional)."},
+                    "width": {"type": "integer", "description": "Image width in pixels (default 1024)."},
+                    "height": {"type": "integer", "description": "Image height in pixels (default 1024)."},
+                },
+                "required": ["prompt"],
             },
         },
     },
@@ -433,6 +1409,164 @@ TOOL_SCHEMAS = [
                 "telling them to check Brave's dashboard themselves."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_routine",
+            "description": (
+                "Schedule a prompt to run automatically and repeatedly in "
+                "this thread, at a given time — a real systemd timer, not "
+                "just a note, so it actually fires later even if Liam "
+                "isn't open. Use this whenever the user asks you to do "
+                "something 'every day at HH', 'every morning', 'every N "
+                "hours', or similar recurring requests — never tell the "
+                "user you can't schedule things or suggest an OS-level "
+                "task scheduler instead; this app already has one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The exact prompt to run each time, as if the user typed it."},
+                    "schedule_kind": {"type": "string", "enum": ["daily", "hourly"], "description": "'daily' for a specific time each day, 'hourly' for every N hours."},
+                    "schedule_value": {"type": "string", "description": "For 'daily': 24-hour 'HH:MM' (e.g. '20:05' for 8:05pm). For 'hourly': the N in 'every N hours' (e.g. '4')."},
+                },
+                "required": ["prompt", "schedule_kind", "schedule_value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_my_routines",
+            "description": "List the routines scheduled in this thread (id, prompt, schedule, enabled/disabled, last run time).",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_routine",
+            "description": "Cancel (delete) a routine scheduled in this thread, by its id from list_my_routines.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "routine_id": {"type": "integer", "description": "The routine's id, from list_my_routines' #id output."},
+                },
+                "required": ["routine_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_lesson",
+            "description": (
+                "Call this when the user tells you that you did something "
+                "wrong and wants it remembered for next time. First briefly "
+                "explain in your own words what you think went wrong, then "
+                "call this tool. The user reviews (and can rewrite) your "
+                "proposal before anything is actually saved — don't say "
+                "it's saved until the tool result confirms it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keywords": {
+                        "type": "string",
+                        "description": "Short comma-separated list of words that should trigger this lesson in a similar future situation, e.g. \"compile,g++,gtk\".",
+                    },
+                    "lesson": {
+                        "type": "string",
+                        "description": "Concise description of the correct behavior — what should happen instead, next time.",
+                    },
+                },
+                "required": ["keywords", "lesson"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fredplayer_list_library",
+            "description": (
+                "Look at the FredPlayer music library to help build a playlist. Call with no "
+                "artist first — it returns just the distinct artist names and track counts, not "
+                "the full (thousands-of-tracks) library, since that's all that's needed to figure "
+                "out which artists fit a request like \"country\" or \"classical\" (use your own "
+                "knowledge and web_search on the artist names for genre, don't guess blindly). "
+                "Once specific artists are chosen, call again once per artist (exact name as "
+                "returned) to get that artist's real track paths — those exact paths are what "
+                "fredplayer_save_playlist needs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artist": {
+                        "type": "string",
+                        "description": "Exact artist name (from a prior no-argument call) to list that artist's tracks. Omit to list all artists instead.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fredplayer_save_playlist",
+            "description": (
+                "Save a named playlist to the shared FredPlayer server, built from exact track "
+                "paths returned by fredplayer_list_library(artist=...). Overwrites any existing "
+                "playlist with the same name. Visible to every FredPlayer device, indefinitely — "
+                "do NOT use this for an in-app \"Ask Liam\" request (that path is "
+                "fredplayer_propose_playlist instead); this is only for when you're explicitly "
+                "asked to make something available to everyone via Matrix/GUI/CLI."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "playlist_name": {"type": "string", "description": "Playlist name, e.g. \"Country\" or \"Classical Piano\"."},
+                    "track_paths": {
+                        "type": "string",
+                        "description": "Exact track 'path' values from fredplayer_list_library, one per line — not reconstructed or guessed paths.",
+                    },
+                },
+                "required": ["playlist_name", "track_paths"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fredplayer_propose_playlist",
+            "description": (
+                "Use this for an in-app FredPlayer \"Ask Liam\" request (you'll be able to tell "
+                "because that's the entire conversation you're in). Hands the playlist back to "
+                "just the one device that asked, as a brand-new local playlist there — never "
+                "written to the shared server, never visible to any other device. Pick "
+                "individual songs, not whole artists — one artist's catalog can span very "
+                "different moods or genres, so naming specific tracks gives a far more fitting "
+                "playlist than \"everything by X\". Use the artist/title text as shown by "
+                "fredplayer_list_library; you do not need exact file paths, matching against "
+                "the real library happens automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "playlist_name": {"type": "string", "description": "Playlist name, e.g. \"Rainy Day Drive\"."},
+                    "tracks": {
+                        "type": "string",
+                        "description": (
+                            "One song per line, formatted exactly as 'Artist :: Title' — e.g.:\n"
+                            "*NSYNC :: Tearin' Up My Heart\nAdele :: Someone Like You\n"
+                            "Individual songs, not whole artists."
+                        ),
+                    },
+                },
+                "required": ["playlist_name", "tracks"],
+            },
         },
     },
 ]

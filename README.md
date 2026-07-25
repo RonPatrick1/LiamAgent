@@ -1,11 +1,13 @@
 # Liam Agent
 
-A minimal CLI agent harness on top of `qwen2.5:32b-instruct`, served locally
+A minimal CLI agent harness on top of `mistral-small3.2:24b`, served locally
 via Ollama.
 
 ## Requirements
 
-- Ollama running locally with `qwen2.5:32b-instruct` pulled.
+- Ollama running locally with `mistral-small3.2:24b` pulled (requires Ollama
+  0.7+ for the `mistral3` architecture — this model won't load on older
+  versions).
 - `pip install -r requirements.txt`
 
 ## Run
@@ -17,6 +19,20 @@ python3 LiamAgent.py
 Tool calls run without asking by default. Pass `--confirm` if you want to be
 prompted before write_file/run_shell_command calls. Use `--model` to point at
 a different Ollama model.
+
+## GUI
+
+`LiamGUI.py` is a native GTK4/libadwaita desktop app — same `Agent` class,
+same tools, same memory, just a window instead of a terminal. Requires
+`python3-gi` with GTK4 and libadwaita bindings (already present on a stock
+Ubuntu GNOME desktop; not installable via pip).
+
+```
+python3 LiamGUI.py
+```
+
+Same `--model`/`--confirm` flags as the CLI. With `--confirm`, tool
+confirmations show as a native dialog instead of a terminal prompt.
 
 ## Web search
 
@@ -57,10 +73,14 @@ agent — search and file tools still work fine without it.
 
 ## Layout
 
-- `LiamAgent.py` — REPL entry point.
+- `LiamAgent.py` — CLI entry point.
+- `LiamGUI.py` — GTK4/libadwaita desktop entry point.
 - `agent/llm.py` — thin client for Ollama's `/api/chat` endpoint.
 - `agent/tools.py` — tool schemas and implementations (`read_file`,
   `write_file`, `list_directory`, `run_shell_command`, `web_search`).
 - `agent/memory.py` — persistent conversation history backed by MySQL.
 - `agent/core.py` — the agent loop: sends messages, executes tool calls the
-  model requests, feeds results back, repeats until a final answer.
+  model requests, feeds results back, repeats until a final answer. UI-
+  agnostic — `on_tool_call`/`on_confirm`/`on_status` callbacks let any
+  frontend (CLI, GUI) hook into progress and confirmations without the
+  agent itself depending on print()/input().

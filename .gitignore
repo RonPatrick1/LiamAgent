@@ -6,3 +6,9 @@ backup/
 __pycache__/
 *.pyc
 .liam_history
+.liam_window_state.json
+.liam_settings.json
+.liam_pastes/
+.liam_downloads/
+.liam_generated/
+sd-webui/
