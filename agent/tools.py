@@ -725,7 +725,7 @@ def _parse_track_lines(tracks_text):
     return items
 
 
-def fredplayer_propose_playlist(playlist_name, tracks, session_id=None):
+def fredplayer_propose_playlist(playlist_name, tracks=None, artist=None, session_id=None):
     """Use this — not fredplayer_save_playlist — when answering a
     FredPlayer app's own in-app "Ask Liam" request (you'll know because
     the conversation is happening through that path, not Matrix/GUI/CLI).
@@ -733,18 +733,29 @@ def fredplayer_propose_playlist(playlist_name, tracks, session_id=None):
     asked, as a new local playlist there — it is never written to the
     shared FredPlayer server and no other device will ever see it.
 
-    tracks is a plain string, ONE TRACK PER LINE, formatted exactly as
-    "Artist :: Title" — e.g.:
+    Two ways to populate it — use whichever actually matches the request:
+
+    1. artist: for a literal "all songs by X" / "every track by X"
+    request. Pass the artist's name (as shown by fredplayer_list_library)
+    and every one of their tracks in the library is pulled in directly —
+    no transcription involved, so it can't truncate or miss anything the
+    way retyping 50+ lines by hand could. Call fredplayer_list_library
+    (artist=X) first if you want to see the real count/titles, but the
+    actual playlist should come from this artist= call, not from typing
+    tracks out.
+
+    2. tracks: for anything else — a mood, occasion, or curated
+    selection — pick specific songs, not whole artists, since one
+    artist's catalog can span very different moods and genres and naming
+    individual tracks is what makes a request like a specific mood or
+    occasion produce a fitting playlist. A plain string, ONE TRACK PER
+    LINE, formatted exactly as "Artist :: Title" — e.g.:
     *NSYNC :: Tearin' Up My Heart
     Adele :: Someone Like You
-    Pick specific songs, not whole artists, since one artist's catalog
-    can span very different moods and genres; naming individual tracks is
-    what actually lets a request like a specific mood or occasion produce
-    a fitting playlist instead of "everything by X". Use the artist/title
-    text as shown by fredplayer_list_library — you do not need to fetch
-    or retype exact file paths, matching against the real library
-    (including small spelling/formatting differences) happens
-    automatically inside this tool.
+    Use the artist/title text as shown by fredplayer_list_library — you
+    do not need to fetch or retype exact file paths, matching against the
+    real library (including small spelling/formatting differences)
+    happens automatically inside this tool.
 
     The parameter is playlist_name, not name — see fredplayer_save_playlist's
     docstring: a parameter literally called "name" silently breaks this
@@ -754,11 +765,40 @@ def fredplayer_propose_playlist(playlist_name, tracks, session_id=None):
         return "FredPlayer isn't configured — set FREDPLAYER_MEDIA_URL and FREDPLAYER_MEDIA_TOKEN in .env."
     if not playlist_name or not playlist_name.strip():
         return "playlist_name is required."
-    parsed = _parse_track_lines(tracks)
-    if not parsed:
-        return 'tracks must be a non-empty string, one "Artist :: Title" pair per line.'
     if session_id is None:
         return "This tool only works from the FredPlayer app's Ask Liam request, not this conversation."
+
+    if artist and artist.strip():
+        try:
+            resp = requests.get(f"{FREDPLAYER_MEDIA_URL}/api/library", headers=_fredplayer_headers(), timeout=15)
+            resp.raise_for_status()
+            library = resp.json()
+        except Exception as exc:
+            return f"Could not reach the FredPlayer server to fetch the library: {exc}"
+        # Same exact-match-on-artist-field lookup fredplayer_list_library
+        # already uses, so "all songs by X" gets literally every track
+        # that a fredplayer_list_library(artist=X) call would have shown,
+        # not a hand-picked subset.
+        norm_artist = artist.strip().lower()
+        matches = [t for t in library if (t.get("artist") or "").strip().lower() == norm_artist]
+        if not matches:
+            return (
+                f'No tracks found for artist "{artist}". Call fredplayer_list_library with no '
+                f"artist to see the exact artist names in this library."
+            )
+        resolved = [t["path"] for t in matches]
+        _PROPOSED_PLAYLISTS[session_id] = {"name": playlist_name.strip(), "tracks": resolved}
+        return (
+            f'Proposed playlist "{playlist_name.strip()}" with all {len(resolved)} track(s) '
+            f'by "{artist.strip()}" — the app will create it locally.'
+        )
+
+    parsed = _parse_track_lines(tracks)
+    if not parsed:
+        return (
+            'tracks must be a non-empty string, one "Artist :: Title" pair per line — or, for a '
+            'literal "all songs by X" request, call this with artist="X" instead.'
+        )
     try:
         resp = requests.get(f"{FREDPLAYER_MEDIA_URL}/api/library", headers=_fredplayer_headers(), timeout=15)
         resp.raise_for_status()
@@ -768,12 +808,12 @@ def fredplayer_propose_playlist(playlist_name, tracks, session_id=None):
 
     resolved = []
     missed = []
-    for artist, title in parsed:
-        match = _resolve_track(library, artist, title)
+    for track_artist, title in parsed:
+        match = _resolve_track(library, track_artist, title)
         if match is not None:
             resolved.append(match["path"])
         else:
-            missed.append(f"{artist} - {title}")
+            missed.append(f"{track_artist} - {title}")
 
     if not resolved:
         return (
@@ -1545,27 +1585,35 @@ TOOL_SCHEMAS = [
                 "Use this for an in-app FredPlayer \"Ask Liam\" request (you'll be able to tell "
                 "because that's the entire conversation you're in). Hands the playlist back to "
                 "just the one device that asked, as a brand-new local playlist there — never "
-                "written to the shared server, never visible to any other device. Pick "
-                "individual songs, not whole artists — one artist's catalog can span very "
-                "different moods or genres, so naming specific tracks gives a far more fitting "
-                "playlist than \"everything by X\". Use the artist/title text as shown by "
-                "fredplayer_list_library; you do not need exact file paths, matching against "
-                "the real library happens automatically."
+                "written to the shared server, never visible to any other device. For a literal "
+                "\"all songs by X\" / \"every track by X\" request, pass artist instead of tracks — "
+                "it pulls every matching track directly from the library, so nothing gets missed "
+                "or truncated the way retyping a long list by hand could. For anything else (a "
+                "mood, occasion, or curated selection), use tracks and pick individual songs, not "
+                "whole artists — one artist's catalog can span very different moods or genres, so "
+                "naming specific tracks gives a far more fitting playlist. Use the artist/title "
+                "text as shown by fredplayer_list_library; you do not need exact file paths, "
+                "matching against the real library happens automatically."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "playlist_name": {"type": "string", "description": "Playlist name, e.g. \"Rainy Day Drive\"."},
+                    "artist": {
+                        "type": "string",
+                        "description": "Exact artist name (as shown by fredplayer_list_library) for a literal \"all songs by X\" request — pulls every matching track directly, no tracks needed.",
+                    },
                     "tracks": {
                         "type": "string",
                         "description": (
                             "One song per line, formatted exactly as 'Artist :: Title' — e.g.:\n"
                             "*NSYNC :: Tearin' Up My Heart\nAdele :: Someone Like You\n"
-                            "Individual songs, not whole artists."
+                            "For a mood/occasion/curated request — individual songs, not whole "
+                            "artists. Omit this if using artist instead."
                         ),
                     },
                 },
-                "required": ["playlist_name", "tracks"],
+                "required": ["playlist_name"],
             },
         },
     },
