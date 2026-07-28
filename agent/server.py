@@ -45,12 +45,9 @@ MODEL = os.environ.get("LIAM_MESSENGER_MODEL") or DEFAULT_MODEL
 # tool registry rather than a hand-copied list, so a new tool added to
 # tools.py later is excluded here by default instead of silently getting
 # full access to every sender until someone remembers to update this too.
-# propose_lesson is restricted for a different reason than the filesystem/
-# shell tools: it's global, not thread-scoped — a saved lesson changes
-# Liam's behavior in every future conversation, everywhere, for every
-# sender. This bridge has no confirm dialog at all (auto_confirm=True
-# below), so a non-owner's "mistake report" would otherwise get saved
-# completely unreviewed.
+# propose_lesson remains restricted for defense-in-depth compatibility,
+# though Agent no longer advertises it. Chat feedback now flows through
+# the provenance-aware host classifier below instead.
 RESTRICTED_TOOLS = {
     "read_file", "write_file", "edit_file", "list_directory", "run_shell_command", "propose_lesson",
     # Same filesystem/repo access tier as read_file/write_file above —
@@ -86,14 +83,15 @@ def handle_chat(room_id, sender_id, message):
         # No UI exists to show a confirmation dialog from a Matrix
         # message — same tradeoff already accepted for scheduled
         # routines, just reachable from chat instead of a timer. Applies
-        # to propose_lesson too now (tier 2: no forced review), same as
-        # every other dangerous tool here. Only reachable by the owner
-        # anyway — propose_lesson is in RESTRICTED_TOOLS above.
+        # to every offered mutating tool. Lessons are handled separately
+        # by the host-side feedback and evidence pipeline.
         auto_confirm=True,
         workdir=MESSENGER_WORKDIR,
         session_id=session_id,
         notes_session_id=notes_session_id,
         allowed_tools=None if is_owner else SAFE_TOOLS,
+        channel="matrix", actor_id=sender_id, is_owner=is_owner,
+        learning_enabled=True,
     )
     return agent.step(message)
 
@@ -132,6 +130,8 @@ def handle_fredplayer_ask(device_id, message):
         session_id=session_id,
         notes_session_id=session_id,
         allowed_tools=SAFE_TOOLS,
+        channel="fredplayer", actor_id=device_id, is_owner=False,
+        learning_enabled=False,
         # Proven necessary: the local model would sometimes end its turn
         # with confident prose ("I've created a playlist called...")
         # without ever calling fredplayer_propose_playlist — the app then

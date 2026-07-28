@@ -89,6 +89,8 @@ DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".liam_d
 # Markdown image syntax for anything found via image_search.
 IMAGE_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
+EXTERNAL_SESSION_PREFIXES = ("/matrix-room/", "/fredplayer-device/")
+
 SAVE_DELAY_MS = 350
 RESTORE_SETTLE_MS = 500
 
@@ -118,6 +120,17 @@ def _monitor_index_at_point(display, x, y):
         if geo.x <= x < geo.x + geo.width and geo.y <= y < geo.y + geo.height:
             return i
     return -1
+
+
+def _is_external_session(session):
+    """Whether a session belongs to one of Liam's external chat bridges.
+
+    Use the server-owned folder namespace rather than the display title so
+    an ordinary desktop thread named "Matrix" or "FredPlayer" is never
+    hidden accidentally.
+    """
+    folder_path = session.get("folder_path", "")
+    return any(folder_path.startswith(prefix) for prefix in EXTERNAL_SESSION_PREFIXES)
 
 
 def _move_window(window, x, y):
@@ -229,6 +242,11 @@ class LiamWindow(Gtk.ApplicationWindow):
         routines_button.connect("clicked", self._open_routines_dialog)
         headerbar.pack_end(routines_button)
 
+        lessons_button = Gtk.Button.new_from_icon_name("document-properties-symbolic", Gtk.IconSize.BUTTON)
+        lessons_button.set_tooltip_text("Lessons")
+        lessons_button.connect("clicked", self._open_lessons_dialog)
+        headerbar.pack_end(lessons_button)
+
         self.artifacts_toggle = Gtk.ToggleButton()
         self.artifacts_toggle.set_image(
             Gtk.Image.new_from_icon_name("view-paged-symbolic", Gtk.IconSize.BUTTON)
@@ -256,7 +274,21 @@ class LiamWindow(Gtk.ApplicationWindow):
         session_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         session_scroller.set_vexpand(True)
         session_scroller.add(self.session_list)
-        paned.pack1(session_scroller, resize=False, shrink=False)
+
+        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.external_sessions_toggle = Gtk.CheckButton(label="Show Matrix / FredPlayer")
+        self.external_sessions_toggle.set_tooltip_text(
+            "Show conversations created by Matrix and FredPlayer"
+        )
+        self.external_sessions_toggle.set_active(self.settings["show_external_sessions"])
+        self.external_sessions_toggle.set_margin_start(10)
+        self.external_sessions_toggle.set_margin_end(10)
+        self.external_sessions_toggle.set_margin_top(6)
+        self.external_sessions_toggle.set_margin_bottom(4)
+        self.external_sessions_toggle.connect("toggled", self._on_external_sessions_toggled)
+        sidebar_box.pack_start(self.external_sessions_toggle, False, False, 0)
+        sidebar_box.pack_start(session_scroller, True, True, 0)
+        paned.pack1(sidebar_box, resize=False, shrink=False)
 
         # --- content: the chat view ---
         content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -591,7 +623,10 @@ class LiamWindow(Gtk.ApplicationWindow):
         )
 
     def _refresh_session_list(self):
-        self.sessions = memory.list_sessions()
+        sessions = memory.list_sessions()
+        if not self.settings["show_external_sessions"]:
+            sessions = [session for session in sessions if not _is_external_session(session)]
+        self.sessions = sessions
         for child in list(self.session_list.get_children()):
             self.session_list.remove(child)
 
@@ -653,6 +688,37 @@ class LiamWindow(Gtk.ApplicationWindow):
             self.session_list.add(row)
         self.session_list.show_all()
 
+    def _on_external_sessions_toggled(self, toggle):
+        show_external = toggle.get_active()
+        self.settings["show_external_sessions"] = show_external
+        liam_settings.save(self.settings)
+
+        current_session = memory.get_session(self.session_id) if self.session_id else None
+        current_will_be_hidden = (
+            not show_external
+            and current_session is not None
+            and _is_external_session(current_session)
+        )
+
+        self._refresh_session_list()
+        if not current_will_be_hidden:
+            if self.session_id is not None:
+                self._select_row_for_session(self.session_id)
+            return
+
+        # Keep an actual thread selected when the filter hides the one that
+        # was on screen. If every normal thread was archived, revive Liam's
+        # own working-directory thread rather than leaving an empty sidebar.
+        if not self.sessions:
+            fallback_id = memory.get_or_create_session(os.getcwd())
+            memory.set_archived(fallback_id, False)
+            self._refresh_session_list()
+        if not self.sessions:
+            return
+        next_session = self.sessions[0]
+        self._switch_to(next_session["folder_path"], next_session["title"])
+        self._select_row_for_session(next_session["id"])
+
     def _select_row_for_session(self, session_id):
         for row in self.session_list.get_children():
             if getattr(row, "session_data", {}).get("id") == session_id:
@@ -662,7 +728,8 @@ class LiamWindow(Gtk.ApplicationWindow):
     def _bootstrap_sessions(self):
         self._refresh_session_list()
         if not self.sessions:
-            memory.get_or_create_session(os.getcwd())
+            fallback_id = memory.get_or_create_session(os.getcwd())
+            memory.set_archived(fallback_id, False)
             self._refresh_session_list()
         session = self.sessions[0]
         agent, history = self._build_agent_and_history(session["id"], session["folder_path"])
@@ -675,6 +742,8 @@ class LiamWindow(Gtk.ApplicationWindow):
             model=self.model, auto_confirm=self.auto_confirm,
             workdir=folder_path, session_id=session_id, extra_folders=extra_folders,
             custom_instructions=self.settings["custom_instructions"],
+            channel="gui", actor_id="local-owner", is_owner=True,
+            learning_enabled=True,
         )
         history = memory.load_recent_messages(limit=REPLAY_LIMIT, session_id=session_id)
         return agent, history
@@ -1100,6 +1169,327 @@ class LiamWindow(Gtk.ApplicationWindow):
         agent.on_status = self._on_status
         agent.on_confirm = self._on_confirm
 
+    # --- lessons ---
+
+    def _open_lessons_dialog(self, _button):
+        dialog = Gtk.Dialog(title="Lessons", transient_for=self)
+        dialog.set_position(Gtk.WindowPosition.CENTER)
+        dialog.set_default_size(820, 620)
+        dialog.add_button(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
+
+        content = dialog.get_content_area()
+        content.set_margin_top(10)
+        content.set_margin_bottom(10)
+        content.set_margin_start(10)
+        content.set_margin_end(10)
+        content.set_spacing(8)
+
+        filter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        filter_row.pack_start(Gtk.Label(label="View", xalign=0), False, False, 0)
+        status_combo = Gtk.ComboBoxText()
+        for status, label in (
+            ("pending", "Pending"),
+            ("active", "Active"),
+            ("disabled", "Disabled"),
+            ("quarantined", "Quarantined"),
+        ):
+            status_combo.append(status, label)
+        status_combo.set_active_id("pending")
+        filter_row.pack_start(status_combo, False, False, 0)
+        content.pack_start(filter_row, False, False, 0)
+
+        main = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        main.set_position(290)
+        content.pack_start(main, True, True, 0)
+
+        lesson_list = Gtk.ListBox()
+        lesson_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        list_scroller = Gtk.ScrolledWindow()
+        list_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        list_scroller.add(lesson_list)
+        main.pack1(list_scroller, resize=False, shrink=False)
+
+        editor = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+        editor.set_margin_start(10)
+        main.pack2(editor, resize=True, shrink=False)
+
+        provenance_label = Gtk.Label(xalign=0)
+        provenance_label.set_line_wrap(True)
+        provenance_label.get_style_context().add_class("dim-label")
+        editor.pack_start(provenance_label, False, False, 0)
+
+        editor.pack_start(Gtk.Label(label="Trigger keywords or phrases", xalign=0), False, False, 0)
+        keywords_entry = Gtk.Entry()
+        editor.pack_start(keywords_entry, False, False, 0)
+
+        editor.pack_start(Gtk.Label(label="Correct behavior", xalign=0), False, False, 0)
+        lesson_buffer = Gtk.TextBuffer()
+        lesson_view = Gtk.TextView(buffer=lesson_buffer)
+        lesson_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        lesson_scroller = Gtk.ScrolledWindow()
+        lesson_scroller.set_min_content_height(90)
+        lesson_scroller.add(lesson_view)
+        editor.pack_start(lesson_scroller, False, False, 0)
+
+        scope_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        scope_row.pack_start(Gtk.Label(label="Scope", xalign=0), False, False, 0)
+        scope_combo = Gtk.ComboBoxText()
+        for scope in ("global", "workspace", "channel", "tool"):
+            scope_combo.append(scope, scope.capitalize())
+        scope_row.pack_start(scope_combo, False, False, 0)
+        scope_value_entry = Gtk.Entry()
+        scope_value_entry.set_placeholder_text("Workspace path, channel, or tool")
+        scope_row.pack_start(scope_value_entry, True, True, 0)
+        editor.pack_start(scope_row, False, False, 0)
+
+        stats_label = Gtk.Label(xalign=0)
+        stats_label.get_style_context().add_class("dim-label")
+        editor.pack_start(stats_label, False, False, 0)
+
+        editor.pack_start(Gtk.Label(label="Evidence and provenance", xalign=0), False, False, 0)
+        evidence_buffer = Gtk.TextBuffer()
+        evidence_view = Gtk.TextView(buffer=evidence_buffer)
+        evidence_view.set_editable(False)
+        evidence_view.set_cursor_visible(False)
+        evidence_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        evidence_scroller = Gtk.ScrolledWindow()
+        evidence_scroller.set_vexpand(True)
+        evidence_scroller.add(evidence_view)
+        editor.pack_start(evidence_scroller, True, True, 0)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        save_button = Gtk.Button(label="Approve and activate")
+        toggle_button = Gtk.Button(label="Disable")
+        merge_button = Gtk.Button(label="Merge…")
+        reject_button = Gtk.Button(label="Reject")
+        delete_button = Gtk.Button(label="Delete")
+        actions.pack_start(save_button, False, False, 0)
+        actions.pack_start(toggle_button, False, False, 0)
+        actions.pack_start(merge_button, False, False, 0)
+        actions.pack_end(delete_button, False, False, 0)
+        actions.pack_end(reject_button, False, False, 0)
+        editor.pack_start(actions, False, False, 0)
+
+        state = {"lesson": None}
+
+        def show_error(message):
+            error = Gtk.MessageDialog(
+                transient_for=dialog,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.CLOSE,
+                text="Could not update lesson",
+                secondary_text=str(message),
+            )
+            error.connect("response", lambda widget, _response: widget.destroy())
+            error.show_all()
+
+        def set_editor_sensitive(enabled):
+            for widget in (
+                keywords_entry, lesson_view, scope_combo, scope_value_entry,
+                save_button, toggle_button, merge_button, reject_button, delete_button,
+            ):
+                widget.set_sensitive(enabled)
+
+        def populate_editor(record):
+            state["lesson"] = record
+            if record is None:
+                provenance_label.set_text("Select a lesson to inspect or edit it.")
+                keywords_entry.set_text("")
+                lesson_buffer.set_text("")
+                scope_combo.set_active_id("global")
+                scope_value_entry.set_text("")
+                stats_label.set_text("")
+                evidence_buffer.set_text("")
+                set_editor_sensitive(False)
+                return
+            set_editor_sensitive(True)
+            provenance_label.set_text(
+                f"#{record['id']} · {record['origin']} · {record.get('detector') or 'no detector'}"
+            )
+            keywords_entry.set_text(record["keywords"])
+            lesson_buffer.set_text(record["lesson"])
+            scope_combo.set_active_id(record["scope_kind"])
+            scope_value_entry.set_text(record.get("scope_value") or "")
+            scope_value_entry.set_sensitive(record["scope_kind"] != "global")
+            stats_label.set_text(
+                f"Observed {record['occurrence_count']} · used {record['hit_count']} · "
+                f"verified success {record['success_count']} · failure {record['failure_count']}"
+            )
+            events = memory.list_lesson_events(record["id"], limit=12)
+            event_text = []
+            for event in events:
+                source = " / ".join(
+                    value for value in (
+                        event.get("source_channel"), event.get("source_actor")
+                    ) if value
+                ) or "system"
+                event_text.append(
+                    f"{event['created_at']} · {event['event_kind']} · {source}\n"
+                    f"{event.get('evidence') or '(no excerpt retained)'}"
+                )
+            evidence_buffer.set_text("\n\n———\n\n".join(event_text))
+            status = record["status"]
+            save_button.set_label(
+                "Save" if status == "active" else "Approve and activate"
+            )
+            toggle_button.set_label("Disable" if status == "active" else "Reactivate")
+            toggle_button.set_sensitive(status in {"active", "disabled", "quarantined"})
+            reject_button.set_sensitive(status in {"pending", "quarantined"})
+
+        def refresh(preferred_id=None):
+            status = status_combo.get_active_id() or "pending"
+            records = memory.list_lessons(status=status)
+            for child in list(lesson_list.get_children()):
+                lesson_list.remove(child)
+            selected_row = None
+            for record in records:
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                box.set_margin_top(6)
+                box.set_margin_bottom(6)
+                box.set_margin_start(8)
+                box.set_margin_end(8)
+                title = record["lesson"] or "(redacted)"
+                title_label = Gtk.Label(label=f"#{record['id']}  {title}", xalign=0)
+                title_label.set_ellipsize(Pango.EllipsizeMode.END)
+                subtitle = Gtk.Label(
+                    label=f"{record['origin']} · {record['scope_kind']}", xalign=0,
+                )
+                subtitle.get_style_context().add_class("dim-label")
+                box.pack_start(title_label, False, False, 0)
+                box.pack_start(subtitle, False, False, 0)
+                row = Gtk.ListBoxRow()
+                row.lesson_data = record
+                row.add(box)
+                lesson_list.add(row)
+                if preferred_id == record["id"]:
+                    selected_row = row
+            lesson_list.show_all()
+            rows = lesson_list.get_children()
+            selected_row = selected_row or (rows[0] if rows else None)
+            if selected_row:
+                lesson_list.select_row(selected_row)
+            else:
+                populate_editor(None)
+
+        def on_selected(_listbox, row):
+            populate_editor(getattr(row, "lesson_data", None) if row else None)
+
+        def on_scope_changed(_combo):
+            scope_value_entry.set_sensitive(scope_combo.get_active_id() != "global")
+
+        def on_save(_widget):
+            record = state["lesson"]
+            if record is None:
+                return
+            start, end = lesson_buffer.get_bounds()
+            next_status = "active"
+            try:
+                updated = memory.update_lesson(
+                    record["id"], keywords=keywords_entry.get_text(),
+                    lesson=lesson_buffer.get_text(start, end, False),
+                    status=next_status,
+                    scope_kind=scope_combo.get_active_id(),
+                    scope_value=scope_value_entry.get_text(),
+                )
+                if updated is None:
+                    raise RuntimeError("The database did not update the lesson.")
+                status_combo.set_active_id("active")
+                refresh(updated["id"])
+            except Exception as exc:
+                show_error(exc)
+
+        def on_toggle(_widget):
+            record = state["lesson"]
+            if record is None:
+                return
+            next_status = "disabled" if record["status"] == "active" else "active"
+            updated = memory.update_lesson(record["id"], status=next_status)
+            if updated is None:
+                show_error("The database did not update the lesson.")
+                return
+            status_combo.set_active_id(next_status)
+            refresh(updated["id"])
+
+        def on_reject(_widget):
+            record = state["lesson"]
+            if record and memory.reject_lesson(record["id"]):
+                refresh()
+
+        def on_delete(_widget):
+            record = state["lesson"]
+            if record is None:
+                return
+            confirm = Gtk.MessageDialog(
+                transient_for=dialog,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.NONE,
+                text=f"Delete lesson #{record['id']}?",
+                secondary_text="This also removes its provenance and effectiveness history.",
+            )
+            confirm.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Delete", Gtk.ResponseType.YES)
+
+            def on_response(widget, response):
+                widget.destroy()
+                if response == Gtk.ResponseType.YES:
+                    memory.delete_lesson(record["id"])
+                    refresh()
+
+            confirm.connect("response", on_response)
+            confirm.show_all()
+
+        def on_merge(_widget):
+            record = state["lesson"]
+            if record is None:
+                return
+            candidates = [
+                item for item in memory.list_lessons()
+                if item["id"] != record["id"]
+            ]
+            if not candidates:
+                show_error("There are no other lessons to merge into.")
+                return
+            merge = Gtk.Dialog(title="Merge lesson", transient_for=dialog)
+            merge.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Merge", Gtk.ResponseType.OK)
+            box = merge.get_content_area()
+            box.set_margin_top(10)
+            box.set_margin_bottom(10)
+            box.set_margin_start(10)
+            box.set_margin_end(10)
+            box.set_spacing(6)
+            box.add(Gtk.Label(label=f"Merge lesson #{record['id']} into:", xalign=0))
+            target_combo = Gtk.ComboBoxText()
+            for candidate in candidates:
+                target_combo.append(str(candidate["id"]), f"#{candidate['id']}  {candidate['lesson'][:80]}")
+            target_combo.set_active(0)
+            box.add(target_combo)
+
+            def on_response(widget, response):
+                target_id = target_combo.get_active_id()
+                widget.destroy()
+                if response == Gtk.ResponseType.OK and target_id:
+                    if memory.merge_lessons(record["id"], int(target_id)):
+                        refresh()
+                    else:
+                        show_error("The lessons could not be merged.")
+
+            merge.connect("response", on_response)
+            merge.show_all()
+
+        lesson_list.connect("row-selected", on_selected)
+        status_combo.connect("changed", lambda _combo: refresh())
+        scope_combo.connect("changed", on_scope_changed)
+        save_button.connect("clicked", on_save)
+        toggle_button.connect("clicked", on_toggle)
+        reject_button.connect("clicked", on_reject)
+        delete_button.connect("clicked", on_delete)
+        merge_button.connect("clicked", on_merge)
+        dialog.connect("response", lambda widget, _response: widget.destroy())
+
+        refresh()
+        dialog.show_all()
+        # show_all() re-enables the value field even for global scope.
+        on_scope_changed(scope_combo)
+
     # --- routines ---
 
     def _open_routines_dialog(self, _button):
@@ -1507,6 +1897,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.entry.set_sensitive(not busy)
         self.send_button.set_sensitive(not busy)
         self.session_list.set_sensitive(not busy)
+        self.external_sessions_toggle.set_sensitive(not busy)
         if not busy:
             # Re-enabling the entry doesn't give it back keyboard focus by
             # itself — without this, every reply leaves focus nowhere in

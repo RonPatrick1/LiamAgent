@@ -3,7 +3,7 @@
 import requests
 
 DEFAULT_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "mistral-small3.2:24b"
+DEFAULT_MODEL = "liam-mistral-small3.2:latest"
 
 
 class OllamaClient:

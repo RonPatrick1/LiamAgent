@@ -80,6 +80,8 @@ def _run_routine(routine_id):
         model=saved["model"] or DEFAULT_MODEL, auto_confirm=True,
         workdir=session["folder_path"], session_id=session["id"],
         extra_folders=extra_folders, custom_instructions=saved["custom_instructions"],
+        channel="routine", actor_id="system-routine", is_owner=True,
+        learning_enabled=False,
     )
     reply = agent.step(routine["prompt"])
     routines.mark_ran(routine_id)
@@ -127,6 +129,8 @@ def main():
     agent = Agent(
         model=args.model, auto_confirm=not args.confirm, workdir=workdir, session_id=session_id,
         extra_folders=extra_folders, custom_instructions=saved["custom_instructions"],
+        channel="cli", actor_id="local-owner", is_owner=True,
+        learning_enabled=True,
     )
     print(f"Liam agent ready (model: {args.model}). Type 'help' for commands, 'exit' to quit.\n")
 

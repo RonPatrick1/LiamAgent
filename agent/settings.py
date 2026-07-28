@@ -18,6 +18,7 @@ DEFAULTS = {
     "model": None,
     "auto_confirm": True,
     "custom_instructions": "",
+    "show_external_sessions": True,
 }
 
 

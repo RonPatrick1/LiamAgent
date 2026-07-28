@@ -5,6 +5,7 @@ something the agent should rediscover or guess at each run. Only the
 credentials come from the environment (.env).
 """
 
+import hashlib
 import os
 import re
 
@@ -144,6 +145,104 @@ def _ensure_schema(conn):
                 hit_count INT NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+            """
+        )
+        # Kept only as an upgrade source for installations that used the
+        # first auto-learning prototype. New observations go into lessons +
+        # lesson_events below, with a shared lifecycle and provenance model.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_lessons (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                keywords VARCHAR(512) NOT NULL,
+                lesson MEDIUMTEXT NOT NULL,
+                detector VARCHAR(64) NOT NULL,
+                source_session_id INT NULL,
+                hit_count INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Lessons now share one lifecycle regardless of where they came
+        # from.  Keep ALTERs idempotent because _ensure_schema runs from
+        # every frontend and existing installations may be at any older
+        # schema revision.
+        lesson_columns = {
+            "status": "VARCHAR(16) NOT NULL DEFAULT 'active'",
+            "origin": "VARCHAR(32) NOT NULL DEFAULT 'legacy'",
+            "scope_kind": "VARCHAR(16) NOT NULL DEFAULT 'global'",
+            "scope_value": "VARCHAR(1024) NULL",
+            "detector": "VARCHAR(64) NULL",
+            "fingerprint": "CHAR(64) NULL",
+            "occurrence_count": "INT NOT NULL DEFAULT 1",
+            "success_count": "INT NOT NULL DEFAULT 0",
+            "failure_count": "INT NOT NULL DEFAULT 0",
+            "consecutive_failure_count": "INT NOT NULL DEFAULT 0",
+            "last_seen_at": "TIMESTAMP NULL",
+            "last_used_at": "TIMESTAMP NULL",
+            "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+            "merged_into_id": "INT NULL",
+        }
+        for column, definition in lesson_columns.items():
+            cur.execute(f"SHOW COLUMNS FROM lessons LIKE '{column}'")
+            if not cur.fetchone():
+                cur.execute(f"ALTER TABLE lessons ADD COLUMN {column} {definition}")
+        cur.execute("SHOW INDEX FROM lessons WHERE Key_name = 'lesson_fingerprint_unique'")
+        if not cur.fetchone():
+            cur.execute(
+                "ALTER TABLE lessons ADD UNIQUE KEY lesson_fingerprint_unique (fingerprint)"
+            )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lesson_events (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lesson_id INT NOT NULL,
+                event_kind VARCHAR(32) NOT NULL,
+                detector VARCHAR(64) NULL,
+                source_session_id INT NULL,
+                source_channel VARCHAR(32) NULL,
+                source_actor VARCHAR(255) NULL,
+                evidence MEDIUMTEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX lesson_events_lesson (lesson_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lesson_uses (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lesson_id INT NOT NULL,
+                session_id INT NULL,
+                channel VARCHAR(32) NULL,
+                outcome VARCHAR(16) NOT NULL DEFAULT 'unknown',
+                detector VARCHAR(64) NULL,
+                failure_signature VARCHAR(255) NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TIMESTAMP NULL,
+                INDEX lesson_uses_lesson (lesson_id)
+            )
+            """
+        )
+        # Older auto_lessons were synthesized from a failure alone, before
+        # Liam required an observed successful recovery. Preserve them for
+        # review, but never silently promote that legacy evidence to active.
+        cur.execute(
+            """
+            INSERT INTO lessons (
+                keywords, lesson, source_session_id, hit_count, created_at,
+                status, origin, scope_kind, detector, fingerprint,
+                scope_value, occurrence_count, last_seen_at
+            )
+            SELECT
+                a.keywords, a.lesson, a.source_session_id, a.hit_count,
+                a.created_at, 'pending', 'legacy_auto', 'tool', a.detector,
+                SHA2(CONCAT('legacy-auto:', a.id), 256),
+                'run_shell_command', 1, a.created_at
+            FROM auto_lessons a
+            LEFT JOIN lessons l
+              ON l.fingerprint = SHA2(CONCAT('legacy-auto:', a.id), 256)
+            WHERE l.id IS NULL
             """
         )
         cur.execute("SHOW COLUMNS FROM messages LIKE 'session_id'")
@@ -829,59 +928,585 @@ def list_artifacts(session_id, limit=50):
         return []
 
 
-def add_lesson(keywords, lesson, source_session_id=None):
-    """Save a human-reviewed lesson learned from a real mistake. Global
-    on purpose — unlike notes, a lesson like "g++ wants the source file
-    before the pkg-config flags" is true regardless of which thread
-    taught it. source_session_id is just provenance, never used to
-    filter matches."""
+LESSON_STATUSES = {"pending", "active", "disabled", "quarantined", "rejected"}
+LESSON_ORIGINS = {
+    "owner_feedback", "participant_feedback", "verified_recovery",
+    "contract_violation", "legacy", "legacy_auto",
+}
+LESSON_SCOPE_KINDS = {"global", "workspace", "channel", "tool"}
+
+_LESSON_SELECT = (
+    "id, keywords, lesson, source_session_id, hit_count, created_at, "
+    "status, origin, scope_kind, scope_value, detector, fingerprint, "
+    "occurrence_count, success_count, failure_count, "
+    "consecutive_failure_count, last_seen_at, last_used_at, updated_at, "
+    "merged_into_id"
+)
+
+
+def _lesson_dict(row):
+    if not row:
+        return None
+    keys = (
+        "id", "keywords", "lesson", "source_session_id", "hit_count",
+        "created_at", "status", "origin", "scope_kind", "scope_value",
+        "detector", "fingerprint", "occurrence_count", "success_count",
+        "failure_count", "consecutive_failure_count", "last_seen_at",
+        "last_used_at", "updated_at", "merged_into_id",
+    )
+    return dict(zip(keys, row))
+
+
+def _normalize_lesson_fields(keywords, lesson):
+    terms = []
+    seen = set()
+    for raw in (keywords or "").split(","):
+        term = re.sub(r"\s+", " ", raw.strip().lower())
+        if not term or term in seen:
+            continue
+        if len(term) > 64:
+            term = term[:64].rstrip()
+        terms.append(term)
+        seen.add(term)
+        if len(terms) == 8:
+            break
+    normalized_lesson = re.sub(r"\s+", " ", (lesson or "").strip())
+    if not terms:
+        raise ValueError("A lesson needs at least one trigger keyword or phrase.")
+    if len(normalized_lesson) < 12:
+        raise ValueError("A lesson must describe the corrected behavior.")
+    return ",".join(terms), normalized_lesson[:2000]
+
+
+def lesson_fingerprint(kind, signature):
+    normalized = re.sub(r"\s+", " ", (signature or "").strip().lower())
+    return hashlib.sha256(f"{kind}:{normalized}".encode("utf-8")).hexdigest()
+
+
+def _insert_lesson_event(cur, lesson_id, event_kind, detector=None,
+                         source_session_id=None, source_channel=None,
+                         source_actor=None, evidence=None):
+    cur.execute(
+        "INSERT INTO lesson_events (lesson_id, event_kind, detector, "
+        "source_session_id, source_channel, source_actor, evidence) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (
+            lesson_id, event_kind, detector, source_session_id,
+            source_channel, (source_actor or "")[:255] or None,
+            (evidence or "")[:8000] or None,
+        ),
+    )
+
+
+def upsert_lesson(keywords, lesson, *, status="pending", origin="owner_feedback",
+                  scope_kind="global", scope_value=None, detector=None,
+                  fingerprint=None, source_session_id=None,
+                  source_channel=None, source_actor=None, evidence=None,
+                  event_kind="observed"):
+    """Create or reinforce one learning item and return its current record.
+
+    A rejected/disabled/quarantined fingerprint is deliberately never
+    reactivated by observation alone. A later explicit owner review can do
+    that through update_lesson().
+    """
+    if status not in LESSON_STATUSES:
+        raise ValueError(f"Invalid lesson status: {status}")
+    if origin not in LESSON_ORIGINS:
+        raise ValueError(f"Invalid lesson origin: {origin}")
+    if scope_kind not in LESSON_SCOPE_KINDS:
+        raise ValueError(f"Invalid lesson scope: {scope_kind}")
+    keywords, lesson = _normalize_lesson_fields(keywords, lesson)
+    if scope_kind == "global":
+        scope_value = None
+    elif not (scope_value or "").strip():
+        raise ValueError(f"{scope_kind} lessons require a scope value")
+    scope_value = (scope_value or "").strip() or None
+    fingerprint = fingerprint or lesson_fingerprint(
+        "lesson", f"{scope_kind}|{scope_value or ''}|{keywords}|{lesson}"
+    )
+
     try:
         conn = _connect()
         try:
             _ensure_schema(conn)
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO lessons (keywords, lesson, source_session_id) VALUES (%s, %s, %s)",
-                    (keywords, lesson, source_session_id),
+                    f"SELECT {_LESSON_SELECT} FROM lessons WHERE fingerprint = %s",
+                    (fingerprint,),
                 )
-                return cur.lastrowid
+                existing = _lesson_dict(cur.fetchone())
+                if existing:
+                    # A rejected source row can remain as a fingerprint
+                    # alias after a reviewer merges duplicates. Route new
+                    # observations to the surviving canonical lesson so the
+                    # merge remains effective instead of splitting again.
+                    if existing.get("merged_into_id"):
+                        cur.execute(
+                            f"SELECT {_LESSON_SELECT} FROM lessons WHERE id = %s",
+                            (existing["merged_into_id"],),
+                        )
+                        canonical = _lesson_dict(cur.fetchone())
+                        if canonical:
+                            existing = canonical
+                    promote = existing["status"] == "pending" and status == "active"
+                    cur.execute(
+                        "UPDATE lessons SET occurrence_count = occurrence_count + 1, "
+                        "last_seen_at = CURRENT_TIMESTAMP, status = %s WHERE id = %s",
+                        ("active" if promote else existing["status"], existing["id"]),
+                    )
+                    if existing["status"] != "rejected":
+                        _insert_lesson_event(
+                            cur, existing["id"], event_kind, detector,
+                            source_session_id, source_channel, source_actor, evidence,
+                        )
+                    cur.execute(
+                        f"SELECT {_LESSON_SELECT} FROM lessons WHERE id = %s",
+                        (existing["id"],),
+                    )
+                    record = _lesson_dict(cur.fetchone())
+                    record["created_new"] = False
+                    return record
+
+                cur.execute(
+                    "INSERT INTO lessons (keywords, lesson, source_session_id, "
+                    "status, origin, scope_kind, scope_value, detector, "
+                    "fingerprint, last_seen_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)",
+                    (
+                        keywords, lesson, source_session_id, status, origin,
+                        scope_kind, scope_value, detector, fingerprint,
+                    ),
+                )
+                lesson_id = cur.lastrowid
+                _insert_lesson_event(
+                    cur, lesson_id, event_kind, detector, source_session_id,
+                    source_channel, source_actor, evidence,
+                )
+                cur.execute(
+                    f"SELECT {_LESSON_SELECT} FROM lessons WHERE id = %s",
+                    (lesson_id,),
+                )
+                record = _lesson_dict(cur.fetchone())
+                record["created_new"] = True
+                return record
         finally:
             conn.close()
     except Exception as exc:
-        print(f"[memory] failed to save lesson: {exc}")
+        print(f"[memory] failed to upsert lesson: {exc}")
         return None
 
 
-def match_lessons(text):
-    """Case-insensitive substring match of each row's comma-separated
-    keywords against text. Returns matched lesson strings only — the
-    caller folds them into that turn's context, never into persisted
-    history. A DB hiccup here should never block a turn, same as
-    save_message's own failure handling."""
+def get_lesson(lesson_id):
     try:
-        text_lower = text.lower()
         conn = _connect()
         try:
             _ensure_schema(conn)
             with conn.cursor() as cur:
-                cur.execute("SELECT id, keywords, lesson FROM lessons")
-                rows = cur.fetchall()
-            matched_lessons = []
-            matched_ids = []
-            for lesson_id, keywords, lesson in rows:
-                terms = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-                if any(term in text_lower for term in terms):
-                    matched_lessons.append(lesson)
-                    matched_ids.append(lesson_id)
-            if matched_ids:
-                with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_LESSON_SELECT} FROM lessons WHERE id = %s",
+                    (lesson_id,),
+                )
+                return _lesson_dict(cur.fetchone())
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to get lesson: {exc}")
+        return None
+
+
+def list_lessons(status=None, include_rejected=False):
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                clauses = []
+                params = []
+                if status:
+                    clauses.append("status = %s")
+                    params.append(status)
+                elif not include_rejected:
+                    clauses.append("status <> 'rejected'")
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                cur.execute(
+                    f"SELECT {_LESSON_SELECT} FROM lessons {where} "
+                    "ORDER BY FIELD(status, 'pending', 'quarantined', 'active', 'disabled', 'rejected'), "
+                    "updated_at DESC, id DESC",
+                    params,
+                )
+                return [_lesson_dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to list lessons: {exc}")
+        return []
+
+
+def list_lesson_events(lesson_id, limit=25):
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, event_kind, detector, source_session_id, "
+                    "source_channel, source_actor, evidence, created_at "
+                    "FROM lesson_events WHERE lesson_id = %s "
+                    "ORDER BY id DESC LIMIT %s",
+                    (lesson_id, limit),
+                )
+                keys = (
+                    "id", "event_kind", "detector", "source_session_id",
+                    "source_channel", "source_actor", "evidence", "created_at",
+                )
+                return [dict(zip(keys, row)) for row in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to list lesson events: {exc}")
+        return []
+
+
+def update_lesson(lesson_id, *, keywords=None, lesson=None, status=None,
+                  scope_kind=None, scope_value=None):
+    current = get_lesson(lesson_id)
+    if current is None:
+        return None
+    next_keywords = current["keywords"] if keywords is None else keywords
+    next_lesson = current["lesson"] if lesson is None else lesson
+    next_keywords, next_lesson = _normalize_lesson_fields(next_keywords, next_lesson)
+    next_status = current["status"] if status is None else status
+    next_scope_kind = current["scope_kind"] if scope_kind is None else scope_kind
+    next_scope_value = current["scope_value"] if scope_kind is None and scope_value is None else scope_value
+    if next_status not in LESSON_STATUSES or next_status == "rejected":
+        raise ValueError("Use reject_lesson() for rejection; otherwise choose a valid status.")
+    if next_scope_kind not in LESSON_SCOPE_KINDS:
+        raise ValueError(f"Invalid lesson scope: {next_scope_kind}")
+    if next_scope_kind == "global":
+        next_scope_value = None
+    elif not (next_scope_value or "").strip():
+        raise ValueError(f"{next_scope_kind} lessons require a scope value")
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE lessons SET keywords = %s, lesson = %s, status = %s, "
+                    "scope_kind = %s, scope_value = %s, "
+                    "consecutive_failure_count = CASE WHEN %s = 'active' THEN 0 "
+                    "ELSE consecutive_failure_count END WHERE id = %s",
+                    (
+                        next_keywords, next_lesson, next_status,
+                        next_scope_kind, next_scope_value, next_status, lesson_id,
+                    ),
+                )
+                _insert_lesson_event(cur, lesson_id, "reviewed")
+        finally:
+            conn.close()
+        return get_lesson(lesson_id)
+    except Exception as exc:
+        print(f"[memory] failed to update lesson: {exc}")
+        return None
+
+
+def reject_lesson(lesson_id):
+    """Retain the fingerprint while removing the proposal and evidence."""
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE lessons SET merged_into_id = NULL WHERE merged_into_id = %s",
+                    (lesson_id,),
+                )
+                cur.execute("DELETE FROM lesson_events WHERE lesson_id = %s", (lesson_id,))
+                cur.execute("DELETE FROM lesson_uses WHERE lesson_id = %s", (lesson_id,))
+                cur.execute(
+                    "UPDATE lessons SET status = 'rejected', keywords = '', "
+                    "lesson = '', source_session_id = NULL, scope_value = NULL, "
+                    "merged_into_id = NULL "
+                    "WHERE id = %s",
+                    (lesson_id,),
+                )
+        finally:
+            conn.close()
+        return True
+    except Exception as exc:
+        print(f"[memory] failed to reject lesson: {exc}")
+        return False
+
+
+def delete_lesson(lesson_id):
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE lessons SET merged_into_id = NULL WHERE merged_into_id = %s",
+                    (lesson_id,),
+                )
+                cur.execute("DELETE FROM lesson_events WHERE lesson_id = %s", (lesson_id,))
+                cur.execute("DELETE FROM lesson_uses WHERE lesson_id = %s", (lesson_id,))
+                cur.execute("DELETE FROM lessons WHERE id = %s", (lesson_id,))
+                return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to delete lesson: {exc}")
+        return False
+
+
+def merge_lessons(source_id, target_id):
+    if source_id == target_id:
+        return False
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT occurrence_count, hit_count, success_count, failure_count "
+                    "FROM lessons WHERE id = %s",
+                    (source_id,),
+                )
+                source = cur.fetchone()
+                cur.execute("SELECT id FROM lessons WHERE id = %s", (target_id,))
+                if not source or not cur.fetchone():
+                    return False
+                cur.execute(
+                    "UPDATE lessons SET occurrence_count = occurrence_count + %s, "
+                    "hit_count = hit_count + %s, success_count = success_count + %s, "
+                    "failure_count = failure_count + %s WHERE id = %s",
+                    (*source, target_id),
+                )
+                cur.execute(
+                    "UPDATE lesson_events SET lesson_id = %s WHERE lesson_id = %s",
+                    (target_id, source_id),
+                )
+                cur.execute(
+                    "UPDATE lesson_uses SET lesson_id = %s WHERE lesson_id = %s",
+                    (target_id, source_id),
+                )
+                cur.execute(
+                    "UPDATE lessons SET merged_into_id = %s WHERE merged_into_id = %s",
+                    (target_id, source_id),
+                )
+                cur.execute(
+                    "UPDATE lessons SET status = 'rejected', keywords = '', lesson = '', "
+                    "source_session_id = NULL, scope_value = NULL, merged_into_id = %s "
+                    "WHERE id = %s",
+                    (target_id, source_id),
+                )
+                _insert_lesson_event(cur, target_id, "merged")
+                return True
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to merge lessons: {exc}")
+        return False
+
+
+def quarantine_latest_feedback_lesson(session_id):
+    """Undo the newest chat-taught lesson from this same conversation."""
+    if session_id is None:
+        return None
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT l.id FROM lessons l "
+                    "JOIN lesson_events e ON e.lesson_id = l.id "
+                    "WHERE e.source_session_id = %s "
+                    "AND l.origin IN ('owner_feedback', 'participant_feedback') "
+                    "AND l.status IN ('active', 'pending') "
+                    "ORDER BY l.id DESC LIMIT 1",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                lesson_id = row[0]
+                cur.execute(
+                    "UPDATE lessons SET status = 'quarantined' WHERE id = %s",
+                    (lesson_id,),
+                )
+                _insert_lesson_event(
+                    cur, lesson_id, "owner_rollback",
+                    source_session_id=session_id,
+                )
+                return lesson_id
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to quarantine latest feedback lesson: {exc}")
+        return None
+
+
+def _lesson_term_matches(text_lower, term):
+    return bool(re.search(rf"(?<!\w){re.escape(term.lower())}(?!\w)", text_lower))
+
+
+def select_matching_lesson_records(records, text, *, workspace=None,
+                                   channel=None, available_tools=None,
+                                   limit=3):
+    """Pure filtering/ranking half of match_lesson_records()."""
+    workspace = os.path.abspath(workspace) if workspace else None
+    available_tools = set(available_tools or [])
+    text_lower = text.lower()
+    scored = []
+    for record in records:
+        if record.get("status") != "active":
+            continue
+        scope_kind = record["scope_kind"]
+        scope_value = record["scope_value"]
+        if scope_kind == "workspace" and (
+            not workspace or os.path.abspath(scope_value or "") != workspace
+        ):
+            continue
+        if scope_kind == "channel" and scope_value != channel:
+            continue
+        if scope_kind == "tool" and scope_value not in available_tools:
+            continue
+        terms = [term.strip() for term in record["keywords"].split(",") if term.strip()]
+        matched = [term for term in terms if _lesson_term_matches(text_lower, term)]
+        if not matched:
+            continue
+        score = len(matched) * 100 + sum(min(len(term), 40) for term in matched)
+        if scope_kind != "global":
+            score += 20
+        scored.append((score, record))
+
+    return [record for _score, record in sorted(
+        scored,
+        key=lambda item: (item[0], item[1].get("updated_at") or item[1].get("id", 0)),
+        reverse=True,
+    )[:max(0, limit)]]
+
+
+def match_lesson_records(text, *, workspace=None, channel=None,
+                         available_tools=None, limit=3):
+    """Return the highest-specificity active lessons valid in this context."""
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {_LESSON_SELECT} FROM lessons WHERE status = 'active'")
+                rows = [_lesson_dict(row) for row in cur.fetchall()]
+
+                selected = select_matching_lesson_records(
+                    rows, text, workspace=workspace, channel=channel,
+                    available_tools=available_tools, limit=limit,
+                )
+                if selected:
                     cur.executemany(
-                        "UPDATE lessons SET hit_count = hit_count + 1 WHERE id = %s",
-                        [(i,) for i in matched_ids],
+                        "UPDATE lessons SET hit_count = hit_count + 1, "
+                        "last_used_at = CURRENT_TIMESTAMP WHERE id = %s",
+                        [(record["id"],) for record in selected],
                     )
-            return matched_lessons
+                return selected
         finally:
             conn.close()
     except Exception as exc:
         print(f"[memory] failed to match lessons: {exc}")
         return []
+
+
+def record_lesson_use(lesson_id, session_id=None, channel=None, detector=None):
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO lesson_uses (lesson_id, session_id, channel, detector) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (lesson_id, session_id, channel, detector),
+                )
+                return cur.lastrowid
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to record lesson use: {exc}")
+        return None
+
+
+def resolve_lesson_use(use_id, outcome, failure_signature=None):
+    if outcome not in {"success", "failure", "unknown"}:
+        raise ValueError(f"Invalid lesson outcome: {outcome}")
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT lesson_id FROM lesson_uses WHERE id = %s", (use_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                lesson_id = row[0]
+                cur.execute(
+                    "UPDATE lesson_uses SET outcome = %s, failure_signature = %s, "
+                    "resolved_at = CURRENT_TIMESTAMP WHERE id = %s",
+                    (outcome, (failure_signature or "")[:255] or None, use_id),
+                )
+                if outcome == "success":
+                    cur.execute(
+                        "UPDATE lessons SET success_count = success_count + 1, "
+                        "consecutive_failure_count = 0 WHERE id = %s",
+                        (lesson_id,),
+                    )
+                elif outcome == "failure":
+                    cur.execute(
+                        "UPDATE lessons SET failure_count = failure_count + 1, "
+                        "consecutive_failure_count = consecutive_failure_count + 1 "
+                        "WHERE id = %s",
+                        (lesson_id,),
+                    )
+                    cur.execute(
+                        "UPDATE lessons SET status = 'quarantined' "
+                        "WHERE id = %s AND origin IN ('verified_recovery', 'contract_violation') "
+                        "AND consecutive_failure_count >= 2",
+                        (lesson_id,),
+                    )
+                return get_lesson(lesson_id)
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to resolve lesson use: {exc}")
+        return None
+
+
+def add_lesson(keywords, lesson, source_session_id=None):
+    """Backward-compatible reviewed/global lesson entry point."""
+    record = upsert_lesson(
+        keywords, lesson, status="active", origin="legacy",
+        source_session_id=source_session_id, source_channel="legacy",
+        event_kind="legacy_add",
+    )
+    return record["id"] if record else None
+
+
+def match_lessons(text, **context):
+    return [record["lesson"] for record in match_lesson_records(text, **context)]
+
+
+def add_auto_lesson(keywords, lesson, detector, source_session_id=None):
+    """Compatibility shim: unresolved legacy auto-lessons require review."""
+    record = upsert_lesson(
+        keywords, lesson, status="pending", origin="legacy_auto",
+        scope_kind="tool", scope_value="run_shell_command", detector=detector,
+        fingerprint=lesson_fingerprint("legacy-auto", f"{detector}|{keywords}|{lesson}"),
+        source_session_id=source_session_id, source_channel="legacy",
+        event_kind="legacy_auto",
+    )
+    return record["id"] if record else None
+
+
+def match_auto_lessons(_text):
+    """Legacy compatibility; migrated records are matched through lessons."""
+    return []

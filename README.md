@@ -1,7 +1,7 @@
 # Liam Agent
 
-A minimal CLI agent harness on top of `mistral-small3.2:24b`, served locally
-via Ollama.
+A minimal CLI agent harness on top of a local Liam-specific Ollama variant of
+`mistral-small3.2:24b`.
 
 ## Requirements
 
@@ -9,6 +9,15 @@ via Ollama.
   0.7+ for the `mistral3` architecture — this model won't load on older
   versions).
 - `pip install -r requirements.txt`
+
+Create Liam's model once after pulling the upstream weights. This replaces
+Mistral's bundled Le Chat capability prompt—which incorrectly says image
+generation and web access are unavailable—while reusing the same local model
+weights:
+
+```
+ollama create liam-mistral-small3.2:latest -f Modelfile.liam
+```
 
 ## Run
 
@@ -70,6 +79,37 @@ message and Liam's final reply get saved; on startup, the last 20 messages
 are loaded back into context. If the database is unreachable, memory calls
 fail quietly (a `[memory] ...` warning is printed) rather than crashing the
 agent — search and file tools still work fine without it.
+
+## Learning from corrections and failures
+
+Lessons are separate from remembered user notes. Liam can activate a lesson
+automatically only when the host has evidence it can check independently:
+
+- a failed or no-op tool call is followed by a changed attempt that succeeds;
+- a build, test, or lint command fails and a later run of the same validator
+  exits successfully; or
+- a fixed contract is violated, such as claiming an image was generated
+  without calling the image tool, repeating an identical failed call, or
+  reporting a failed action as successful.
+
+Temporary service outages and denied tool calls do not produce lessons.
+Duplicate observations reinforce one fingerprinted lesson instead of growing
+the prompt indefinitely. Active lessons are keyword- and scope-matched, with
+at most three injected into a turn. Their later outcomes are tracked; an
+automatically created lesson is quarantined after two consecutive observed
+failures.
+
+Normal GUI, CLI, and Matrix chats can also provide corrective feedback. An
+explicit, high-confidence correction from the configured owner becomes active
+immediately. Ambiguous owner feedback and all non-owner feedback are queued as
+pending candidates. Scheduled routines and FredPlayer device chats cannot
+teach Liam. In an owner chat, `don't learn that` quarantines the newest lesson
+taught from that conversation.
+
+The desktop header's **Lessons** button opens the review queue. From there you
+can inspect provenance/evidence and effectiveness counts, edit and approve a
+candidate, disable/reactivate it, merge duplicates, reject it while retaining
+its deduplication fingerprint, or delete it completely.
 
 ## Layout
 

@@ -257,7 +257,11 @@ def _run_git(args, base_dir=None):
         ["git"] + args, capture_output=True, text=True, timeout=30, cwd=base_dir or os.getcwd(),
     )
     output = result.stdout or result.stderr
-    return output[:20_000] or "(no output)"
+    output = output[:20_000] or "(no output)"
+    # Preserve git's real process status just like run_shell_command does.
+    # Without it, a fatal git error and a successful command with ordinary
+    # text are indistinguishable to the host-side outcome classifier.
+    return f"{output}\n[exit code: {result.returncode}]"
 
 
 def git_status(base_dir=None):
@@ -869,18 +873,21 @@ def cancel_routine(routine_id, session_id=None):
 
 
 def propose_lesson(keywords, lesson, session_id=None):
-    """Save a human-reviewed lesson from a real mistake, so it's
-    available (via keyword match) in future conversations without
-    permanently bloating the system prompt for every conversation. The
-    confirmation gate in Agent._run_tool (this is a DANGEROUS_TOOLS
-    entry) is what actually gives the user a chance to review or rewrite
-    keywords/lesson before this function ever runs — by the time this
-    executes, whatever's in keywords/lesson is already the final,
-    reviewed text."""
-    lesson_id = memory.add_lesson(keywords, lesson, source_session_id=session_id)
-    if lesson_id is None:
-        return "Failed to save that lesson — see the server log for details."
-    return f'Saved lesson #{lesson_id}: "{lesson}" (triggers on: {keywords})'
+    """Legacy compatibility path for older model/tool transcripts.
+
+    New feedback is captured by Agent's evidence-based learning pipeline,
+    not by trusting the model to decide that it taught itself something.
+    A stray legacy call therefore creates a review candidate, never an
+    immediately active global instruction.
+    """
+    record = memory.upsert_lesson(
+        keywords, lesson, status="pending", origin="legacy",
+        source_session_id=session_id, source_channel="legacy-tool",
+        event_kind="legacy_proposal",
+    )
+    if record is None:
+        return "Failed to queue that lesson — see the server log for details."
+    return f'Queued lesson candidate #{record["id"]} for review.'
 
 
 TOOL_IMPL = {
@@ -928,11 +935,9 @@ TOOL_IMPL = {
 # but forget deletes rows permanently, so it's gated like the others.
 # schedule_routine creates a real systemd timer that keeps running
 # unattended afterward, and cancel_routine deletes one — both get the same
-# confirm-first treatment as forget for that reason. propose_lesson is
-# gated too, for a different reason: it's global, not thread-scoped — a
-# saved lesson permanently changes Liam's behavior in every future
-# conversation, everywhere, so it needs a human's review (and chance to
-# rewrite it) before it's actually saved, not a rubber-stamp confirm.
+# confirm-first treatment as forget for that reason. propose_lesson remains
+# here only for compatibility with old transcripts; Agent no longer offers
+# it to the model, and a legacy call can create only a pending candidate.
 # make_directory/copy_path/move_path/git_add mutate the filesystem/repo the
 # same way write_file does; delete_path is irreversible like forget. The
 # read-only inspection tools (search_text, find_files, file_info,
@@ -1503,12 +1508,9 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "propose_lesson",
             "description": (
-                "Call this when the user tells you that you did something "
-                "wrong and wants it remembered for next time. First briefly "
-                "explain in your own words what you think went wrong, then "
-                "call this tool. The user reviews (and can rewrite) your "
-                "proposal before anything is actually saved — don't say "
-                "it's saved until the tool result confirms it."
+                "Legacy compatibility only. Liam's host captures corrective "
+                "feedback and verified failures automatically; do not call "
+                "this in new conversations."
             ),
             "parameters": {
                 "type": "object",
