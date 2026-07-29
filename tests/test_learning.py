@@ -168,6 +168,118 @@ class ImageRoutingTests(unittest.TestCase):
 
 
 class MemoryTruthTests(unittest.TestCase):
+    def test_explicit_remember_text_is_extracted_without_requiring_copy_paste(self):
+        self.assertEqual(
+            core._parse_remember_content(
+                "Liam, remember to ask Codex about shared playlists."
+            ),
+            "ask Codex about shared playlists.",
+        )
+        self.assertEqual(
+            core._parse_remember_content(
+                "Add the FredPlayer search feature to my notes."
+            ),
+            "the FredPlayer search feature",
+        )
+
+    def test_forget_description_resolves_one_match_but_not_ambiguous_matches(self):
+        records = [
+            {"id": 7, "content": "Update FredPlayer for Apple Watches"},
+            {"id": 8, "content": "Ask Codex about shared playlists"},
+        ]
+        matched, choices = core._rank_note_matches("FredPlayer update", records)
+        self.assertEqual(matched["id"], 7)
+        self.assertEqual(choices, [])
+
+        records.append({"id": 9, "content": "Add FredPlayer playlist search"})
+        matched, choices = core._rank_note_matches("FredPlayer", records)
+        self.assertIsNone(matched)
+        self.assertEqual({record["id"] for record in choices}, {7, 9})
+
+    def test_keyword_forget_cannot_bulk_delete_multiple_matches(self):
+        connection = mock.MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = [
+            (7, "Update FredPlayer for Apple Watches"),
+            (9, "Add FredPlayer playlist search"),
+        ]
+        with mock.patch.object(memory, "_connect", return_value=connection), \
+             mock.patch.object(memory, "_ensure_schema"):
+            result = memory.forget(keyword="FredPlayer")
+
+        self.assertIn("Multiple notes matched", result)
+        self.assertIn("nothing was deleted", result)
+        sql_statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertFalse(any(sql.lstrip().upper().startswith("DELETE") for sql in sql_statements))
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_explicit_remember_bypasses_chat_model(self, _match, _save):
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "remember"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="Remembered as #42.")
+
+        reply = agent.step("Remember to ask Codex about shared playlists.")
+
+        self.assertEqual(reply, "Remembered as #42.")
+        agent._execute_tool.assert_called_once_with(
+            "remember", {"content": "ask Codex about shared playlists."}
+        )
+        self.assertEqual(agent.client.calls, 0)
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.memory, "list_note_records")
+    def test_forget_description_deletes_only_resolved_id(self, list_notes, _match, _save):
+        list_notes.return_value = [
+            {"id": 7, "content": "Update FredPlayer for Apple Watches"},
+            {"id": 8, "content": "Ask Codex about shared playlists"},
+        ]
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "forget"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="Deleted 1 note(s).")
+
+        reply = agent.step("Forget the FredPlayer update note.")
+
+        self.assertEqual(reply, "Deleted 1 note(s).")
+        agent._execute_tool.assert_called_once_with("forget", {"note_id": 7})
+        self.assertEqual(agent.client.calls, 0)
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.memory, "list_note_records")
+    def test_ambiguous_forget_lists_ids_and_deletes_nothing(self, list_notes, _match, _save):
+        list_notes.return_value = [
+            {"id": 7, "content": "Update FredPlayer for Apple Watches"},
+            {"id": 9, "content": "Add FredPlayer playlist search"},
+        ]
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "forget"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock()
+
+        reply = agent.step("Forget the FredPlayer note.")
+
+        self.assertIn("did not delete any", reply)
+        self.assertIn("#7", reply)
+        self.assertIn("#9", reply)
+        agent._execute_tool.assert_not_called()
+        self.assertEqual(agent.client.calls, 0)
+
     def test_only_current_explicit_commands_authorize_note_mutation(self):
         self.assertTrue(core.Agent._explicit_note_action_requested(
             "forget", "Liam: please forget the note that says update FredPlayer."
@@ -214,6 +326,20 @@ class MemoryTruthTests(unittest.TestCase):
             "memory_claim_without_tool", "forget",
             "The model claimed saved notes were deleted, but no forget call succeeded this turn.",
         )
+
+    def test_echoed_memory_warning_is_replaced_instead_of_duplicated(self):
+        agent = bare_agent()
+        agent._record_intervention = mock.Mock()
+        stale = (
+            "I have now forgotten the note.\n\n"
+            "[Note: no forget tool successfully deleted a saved note this turn; "
+            "any claimed deletion is not authoritative.]"
+        )
+
+        result = agent._note_unperformed_memory_actions(stale, [])
+
+        self.assertEqual(result.count("[Note:"), 1)
+        self.assertEqual(result.lower().count("no forget tool successfully"), 1)
 
     def test_successful_memory_tool_makes_matching_claim_authoritative(self):
         agent = bare_agent()
@@ -298,12 +424,26 @@ class RoutineRoutingTests(unittest.TestCase):
         hourly = core.Agent._parse_schedule_request(
             "Schedule a routine every 4 hours to check the server.", now=self.NOW,
         )
+        minutely = core.Agent._parse_schedule_request(
+            "Send me a test message every 5 minutes.", now=self.NOW,
+        )
+        abbreviated = core.Agent._parse_schedule_request(
+            "Send me a test message every 15 mins.", now=self.NOW,
+        )
 
         self.assertEqual(
             (daily["schedule_kind"], daily["schedule_value"]), ("daily", "20:05")
         )
         self.assertEqual(
             (hourly["schedule_kind"], hourly["schedule_value"]), ("hourly", "4")
+        )
+        self.assertEqual(
+            (minutely["schedule_kind"], minutely["schedule_value"]),
+            ("minutely", "5"),
+        )
+        self.assertEqual(
+            (abbreviated["schedule_kind"], abbreviated["schedule_value"]),
+            ("minutely", "15"),
         )
 
     def test_schedule_complaint_or_quote_is_not_a_new_schedule(self):
@@ -345,6 +485,20 @@ class RoutineRoutingTests(unittest.TestCase):
 
         self.assertIn("any scheduling claim above is false", reply)
         agent._record_intervention.assert_called_once()
+
+    def test_echoed_schedule_warning_is_replaced_instead_of_duplicated(self):
+        agent = bare_agent()
+        agent._record_intervention = mock.Mock()
+        stale = (
+            "I've scheduled it.\n\n"
+            "[Note: no schedule_routine call successfully created a timer this turn; "
+            "any scheduling claim above is false.]"
+        )
+
+        result = agent._note_unperformed_schedule(stale, [])
+
+        self.assertEqual(result.count("[Note:"), 1)
+        self.assertEqual(result.count("no schedule_routine call successfully"), 1)
 
 
 class AutomaticLessonTests(unittest.TestCase):

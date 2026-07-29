@@ -759,9 +759,11 @@ def remember(content, session_id=None):
 
 
 def forget(note_id=None, keyword=None, session_id=None):
-    """Delete note(s) by exact id or by a content keyword match — scoped
-    to the same bucket (session_id) the note was remembered in, so one
-    bucket can't reach into another's notes even by guessing an id."""
+    """Delete one note by id or a keyword that uniquely identifies it.
+
+    A vague keyword is never a bulk-delete operation. Multiple matches are
+    returned as choices so the caller can retry with an exact note id.
+    """
     if not note_id and not keyword:
         return "Specify either note_id or keyword to identify what to forget."
     try:
@@ -774,19 +776,70 @@ def forget(note_id=None, keyword=None, session_id=None):
                         "DELETE FROM notes WHERE id = %s AND session_id <=> %s",
                         (note_id, session_id),
                     )
+                    deleted = cur.rowcount
                 else:
                     cur.execute(
-                        "DELETE FROM notes WHERE content LIKE %s AND session_id <=> %s",
+                        "SELECT id, content FROM notes WHERE content LIKE %s "
+                        "AND session_id <=> %s ORDER BY id DESC LIMIT 6",
                         (f"%{keyword}%", session_id),
                     )
-                deleted = cur.rowcount
+                    matches = cur.fetchall()
+                    if len(matches) > 1:
+                        choices = "\n".join(
+                            f"- #{matched_id}: "
+                            f"{' '.join(str(content).split())[:180]}"
+                            f"{'…' if len(' '.join(str(content).split())) > 180 else ''}"
+                            for matched_id, content in matches
+                        )
+                        return (
+                            "Multiple notes matched; nothing was deleted. "
+                            "Retry with one note id:\n" + choices
+                        )
+                    if not matches:
+                        deleted = 0
+                    else:
+                        cur.execute(
+                            "DELETE FROM notes WHERE id = %s AND session_id <=> %s",
+                            (matches[0][0], session_id),
+                        )
+                        deleted = cur.rowcount
         finally:
             conn.close()
         if deleted == 0:
             return "No matching notes found to delete."
-        return f"Deleted {deleted} note(s)."
+        return f"Deleted {deleted} note."
     except Exception as exc:
         return f"Failed to delete note(s): {exc}"
+
+
+def list_note_records(limit=200, session_id=None):
+    """Return structured notes for host-side unique-target resolution.
+
+    Deletion still happens through forget(note_id=...), after the host has
+    resolved exactly one record. This read deliberately does not expose a
+    bulk keyword-delete shortcut.
+    """
+    limit = min(max(int(limit), 1), 500)
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, content, created_at FROM notes "
+                    "WHERE session_id <=> %s ORDER BY id DESC LIMIT %s",
+                    (session_id, limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        return [
+            {"id": note_id, "content": content, "created_at": created_at}
+            for note_id, content, created_at in rows
+        ]
+    except Exception as exc:
+        print(f"[memory] failed to list note records: {exc}")
+        return None
 
 
 def load_recent_notes(limit=50, session_id=None):

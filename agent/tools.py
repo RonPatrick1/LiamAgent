@@ -838,10 +838,10 @@ def schedule_routine(prompt, schedule_kind, schedule_value, session_id=None):
     --user timer that runs `prompt` against this same thread at the given
     time, whether or not Liam is even open. schedule_kind is 'once'
     (schedule_value = local 'YYYY-MM-DD HH:MM:SS'), 'daily'
-    (schedule_value = 'HH:MM', 24-hour), or 'hourly' (schedule_value = the
-    N in 'every N hours')."""
-    if schedule_kind not in ("once", "daily", "hourly"):
-        return "schedule_kind must be 'once', 'daily', or 'hourly'."
+    (schedule_value = 'HH:MM', 24-hour), 'minutely' (the N in 'every N
+    minutes'), or 'hourly' (the N in 'every N hours')."""
+    if schedule_kind not in ("once", "daily", "minutely", "hourly"):
+        return "schedule_kind must be 'once', 'daily', 'minutely', or 'hourly'."
     try:
         routine_id = routines.create_routine(
             session_id, prompt, schedule_kind, schedule_value,
@@ -852,6 +852,8 @@ def schedule_routine(prompt, schedule_kind, schedule_value, session_id=None):
         when = f"once at {schedule_value}"
     elif schedule_kind == "daily":
         when = f"daily at {schedule_value}"
+    elif schedule_kind == "minutely":
+        when = f"every {schedule_value} minute(s)"
     else:
         when = f"every {schedule_value} hour(s)"
     return f"Scheduled routine #{routine_id} — runs {when}, in this thread."
@@ -870,6 +872,8 @@ def list_my_routines(session_id=None):
             when = f"once at {r['schedule_value']}"
         elif r["schedule_kind"] == "daily":
             when = f"daily at {r['schedule_value']}"
+        elif r["schedule_kind"] == "minutely":
+            when = f"every {r['schedule_value']}m"
         else:
             when = f"every {r['schedule_value']}h"
         status = "enabled" if r["enabled"] else "disabled"
@@ -1442,8 +1446,9 @@ TOOL_SCHEMAS = [
             "name": "forget",
             "description": (
                 "Delete a previously remembered note, by its id (from "
-                "recall_notes' #id output) or by a keyword matching its "
-                "content. Use this when the user asks you to forget, "
+                "recall_notes' #id output) or by a keyword that uniquely "
+                "matches its content. Ambiguous keywords delete nothing. "
+                "Use this when the user asks you to forget, "
                 "remove, or delete something you remembered — never just "
                 "call remember again in response to that, it won't remove "
                 "anything."
@@ -1482,7 +1487,7 @@ TOOL_SCHEMAS = [
                 "just a note, so it actually fires later even if Liam "
                 "isn't open. Use this whenever the user asks you to do "
                 "something 'every day at HH', 'every morning', 'every N "
-                "hours', or similar recurring requests — never tell the "
+                "minutes', 'every N hours', or similar recurring requests — never tell the "
                 "user you can't schedule things or suggest an OS-level "
                 "task scheduler instead; this app already has one."
             ),
@@ -1490,8 +1495,8 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "The exact prompt to run each time, as if the user typed it."},
-                    "schedule_kind": {"type": "string", "enum": ["once", "daily", "hourly"], "description": "'once' for one future local date/time, 'daily' for a specific time each day, or 'hourly' for every N hours."},
-                    "schedule_value": {"type": "string", "description": "For 'once': local 'YYYY-MM-DD HH:MM:SS'. For 'daily': 24-hour 'HH:MM'. For 'hourly': the N in 'every N hours'."},
+                    "schedule_kind": {"type": "string", "enum": ["once", "daily", "minutely", "hourly"], "description": "'once' for one future local date/time, 'daily' for a specific time each day, 'minutely' for every N minutes, or 'hourly' for every N hours."},
+                    "schedule_value": {"type": "string", "description": "For 'once': local 'YYYY-MM-DD HH:MM:SS'. For 'daily': 24-hour 'HH:MM'. For 'minutely' or 'hourly': the interval N."},
                 },
                 "required": ["prompt", "schedule_kind", "schedule_value"],
             },

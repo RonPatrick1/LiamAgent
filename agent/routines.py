@@ -35,7 +35,7 @@ def create_routine(session_id, prompt, schedule_kind, schedule_value):
     """
     # Validate before inserting. A malformed calendar must not leave a DB
     # row that looks enabled even though no timer could have been created.
-    _on_calendar(schedule_kind, schedule_value)
+    _timer_schedule_lines(schedule_kind, schedule_value)
     conn = _connect()
     try:
         _ensure_schema(conn)
@@ -243,9 +243,25 @@ def _on_calendar(schedule_kind, schedule_value):
     raise ValueError(f"unknown schedule_kind: {schedule_kind}")
 
 
+def _timer_schedule_lines(schedule_kind, schedule_value):
+    """Validate a schedule and return its systemd [Timer] directives."""
+    if schedule_kind == "minutely":
+        try:
+            minutes = int(schedule_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("minute interval must be a whole number") from exc
+        if not 1 <= minutes <= 1440:
+            raise ValueError("minute interval must be between 1 and 1440 minutes")
+        # A monotonic interval supports values such as 90 minutes without
+        # forcing them into a wall-clock calendar expression. OnActiveSec
+        # handles the first run; OnUnitActiveSec repeats after each run.
+        return f"OnActiveSec={minutes}min\nOnUnitActiveSec={minutes}min"
+    return f"OnCalendar={_on_calendar(schedule_kind, schedule_value)}\nPersistent=true"
+
+
 def _write_units(routine_id, schedule_kind, schedule_value):
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
-    on_calendar = _on_calendar(schedule_kind, schedule_value)
+    schedule_lines = _timer_schedule_lines(schedule_kind, schedule_value)
 
     service = (
         "[Unit]\n"
@@ -259,9 +275,9 @@ def _write_units(routine_id, schedule_kind, schedule_value):
         "[Unit]\n"
         f"Description=Liam routine {routine_id} schedule\n\n"
         "[Timer]\n"
-        f"OnCalendar={on_calendar}\n"
+        f"{schedule_lines}\n"
         "AccuracySec=1s\n"
-        "Persistent=true\n\n"
+        "\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
     )

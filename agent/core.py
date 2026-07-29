@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 
 from .llm import OllamaClient, DEFAULT_MODEL
@@ -42,7 +43,7 @@ You can also schedule real one-time or recurring tasks with schedule_routine —
 genuine systemd timer that runs a prompt again later, whether or not this
 app is even open. Use it whenever the user asks for something on a
 recurring basis ("every morning at 8", "every 4 hours", "daily at 8:05pm",
-etc.) — never say you can't schedule things, and never suggest an OS-level
+"every 5 minutes", etc.) — never say you can't schedule things, and never suggest an OS-level
 task scheduler (Windows Task Scheduler, cron, etc.) instead; this app
 already has its own. Use list_my_routines/cancel_routine to check or
 remove what's already scheduled in this thread.
@@ -234,6 +235,27 @@ MODEL_LEARNING_NOTICE_RE = re.compile(
     r"[^\]]{0,400}\blesson\b[^\]]*\]\s*",
     re.IGNORECASE | re.DOTALL,
 )
+MEMORY_HOST_NOTICE_RE = re.compile(
+    r"\s*\[\s*Note:\s*(?=[^\]]{0,1200}\bno\s+(?:remember|forget)\s+tool\b)"
+    r"[^\]]{0,1200}\]\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+SCHEDULE_HOST_NOTICE_RE = re.compile(
+    r"\s*\[\s*Note:\s*(?=[^\]]{0,800}\bno\s+schedule_routine\s+call\b)"
+    r"[^\]]{0,800}\]\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+ADD_TO_NOTES_RE = re.compile(
+    r"\badd\s+(?P<content>.+?)\s+to\s+(?:your|my|the)\s+notes?\s*[.!]?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+SAVE_AS_NOTE_RE = re.compile(
+    r"\bsave\s+(?P<content>.+?)\s+(?:as\s+)?(?:a\s+)?note\s*[.!]?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+NOTE_ID_REQUEST_RE = re.compile(
+    r"(?:\bnote\s*#?\s*|#)(\d+)\b", re.IGNORECASE,
+)
 
 SCHEDULE_REQUEST_RE = re.compile(
     r"^\s*(?:liam\s*[:,]?\s*)?(?:please\s+)?(?:"
@@ -243,8 +265,11 @@ SCHEDULE_REQUEST_RE = re.compile(
     r")?(?:schedule\b|create\b.{0,40}\broutine\b|set\s+up\b.{0,40}\b(?:routine|reminder)\b|"
     r"remind\s+me\b|notify\s+me\b|message\s+me\b|"
     r"send\s+me\b.{0,80}\b(?:message|notification|reminder)\b|"
-    r"every\s+(?:day|morning|afternoon|evening|night|\d+\s+hours?)\b)",
+    r"every\s+(?:day|morning|afternoon|evening|night|\d+\s+(?:minutes?|mins?|hours?))\b)",
     re.IGNORECASE | re.DOTALL,
+)
+EVERY_MINUTES_RE = re.compile(
+    r"\bevery\s+(\d{1,4})\s+(?:minutes?|mins?)\b", re.IGNORECASE,
 )
 EVERY_HOURS_RE = re.compile(r"\bevery\s+(\d{1,3})\s+hours?\b", re.IGNORECASE)
 RELATIVE_SCHEDULE_RE = re.compile(
@@ -313,6 +338,124 @@ PARAM_ALIASES = {
     "query_memory": {"query": "keyword", "search": "keyword"},
     "recall_notes": {"query": "keyword", "search": "keyword"},
 }
+
+NOTE_MATCH_STOPWORDS = {
+    "a", "about", "an", "anything", "everything", "my", "note", "notes",
+    "of", "please", "saved", "saying", "says", "that", "the", "this",
+    "to", "with", "your",
+}
+
+
+def _clean_note_phrase(value):
+    value = (value or "").strip().strip(":,-")
+    value = re.sub(
+        r"^(?:(?:the\s+)?(?:saved\s+)?notes?\s+(?:that\s+)?"
+        r"(?:says?|saying|about|containing|with)\s+|"
+        r"(?:the\s+)?(?:saved\s+)?notes?\s+|"
+        r"(?:that|this|to|about|saying)\s+|"
+        r"(?:anything|everything)\s+(?:about|regarding)\s+)",
+        "", value, flags=re.IGNORECASE,
+    ).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1].strip()
+    return value
+
+
+def _parse_remember_content(user_input):
+    """Extract only clear imperative note text; ambiguous shapes stay model-routed."""
+    user_input = (user_input or "").strip()
+    request = REMEMBER_REQUEST_RE.search(user_input)
+    if request is None:
+        return None
+    special = ADD_TO_NOTES_RE.search(user_input) or SAVE_AS_NOTE_RE.search(user_input)
+    raw = special.group("content") if special else user_input[request.end():]
+    return _clean_note_phrase(raw) or None
+
+
+def _parse_forget_target(user_input):
+    """Return an id or short natural-language description from an explicit request."""
+    user_input = (user_input or "").strip()
+    request = FORGET_REQUEST_RE.search(user_input)
+    if request is None:
+        return None
+    note_id = NOTE_ID_REQUEST_RE.search(user_input)
+    if note_id:
+        return {"note_id": int(note_id.group(1))}
+    return {"query": _clean_note_phrase(user_input[request.end():])}
+
+
+def _normalized_note_text(value):
+    return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
+
+
+def _note_preview(value, limit=180):
+    preview = " ".join(str(value or "").split())
+    return preview[:limit] + ("…" if len(preview) > limit else "")
+
+
+def _note_tokens(value):
+    return {
+        token for token in _normalized_note_text(value).split()
+        if token not in NOTE_MATCH_STOPWORDS
+    }
+
+
+def _rank_note_matches(query, records):
+    """Resolve one strong deterministic match, or return plausible choices."""
+    normalized_query = _normalized_note_text(query)
+    query_tokens = _note_tokens(query)
+    if not normalized_query or not query_tokens:
+        return None, []
+
+    ranked = []
+    for record in records or []:
+        content = str(record.get("content") or "")
+        normalized_content = _normalized_note_text(content)
+        content_tokens = _note_tokens(content)
+        exact = normalized_query == normalized_content
+        substring = normalized_query in normalized_content
+        coverage = len(query_tokens & content_tokens) / len(query_tokens)
+        similarity = SequenceMatcher(None, normalized_query, normalized_content).ratio()
+        ranked.append({
+            "record": record,
+            "exact": exact,
+            "substring": substring,
+            "coverage": coverage,
+            "similarity": similarity,
+        })
+
+    ranked.sort(
+        key=lambda item: (
+            item["exact"], item["substring"], item["coverage"], item["similarity"]
+        ),
+        reverse=True,
+    )
+    exact = [item for item in ranked if item["exact"]]
+    if len(exact) == 1:
+        return exact[0]["record"], []
+    substrings = [item for item in ranked if item["substring"]]
+    if len(substrings) == 1:
+        return substrings[0]["record"], []
+    full_coverage = [item for item in ranked if item["coverage"] == 1.0]
+    if len(full_coverage) == 1:
+        return full_coverage[0]["record"], []
+
+    plausible = [
+        item for item in ranked
+        if item["coverage"] >= 0.34 or item["similarity"] >= 0.42
+    ]
+    if plausible:
+        top = plausible[0]
+        runner_up = plausible[1] if len(plausible) > 1 else None
+        coverage_gap = top["coverage"] - (runner_up["coverage"] if runner_up else 0)
+        similarity_gap = top["similarity"] - (runner_up["similarity"] if runner_up else 0)
+        if (
+            top["coverage"] >= 0.5 and coverage_gap >= 0.34
+        ) or (
+            top["similarity"] >= 0.72 and similarity_gap >= 0.12
+        ):
+            return top["record"], []
+    return None, [item["record"] for item in plausible[:5]]
 
 
 class Agent:
@@ -601,6 +744,10 @@ class Agent:
             "no matching files found.",
         }:
             status, reason = "failure", "empty_result"
+        elif lower.startswith("no matching notes found"):
+            status, reason = "failure", "empty_result"
+        elif lower.startswith("multiple notes matched"):
+            status, reason = "failure", "ambiguous_target"
         elif "generation finished but produced no image" in lower:
             status, reason = "transient", "external_dependency"
         elif "byte-for-byte identical" in lower or "nothing would actually change" in lower:
@@ -631,6 +778,7 @@ class Agent:
             lower.endswith(" is required.")
             or "must be a non-empty" in lower
             or "must be 'daily' or 'hourly'" in lower
+            or "schedule_kind must be" in lower
             or "none of those tracks matched" in lower
             or lower.startswith("no tracks found for artist")
         ):
@@ -700,6 +848,17 @@ class Agent:
             "create another routine. Perform the requested action now and return only the "
             f"message or result the user should receive. Original request:\n{user_input}"
         )
+
+        minutely = EVERY_MINUTES_RE.search(user_input)
+        if minutely:
+            minutes = int(minutely.group(1))
+            if 1 <= minutes <= 1440:
+                return {
+                    "prompt": prompt,
+                    "schedule_kind": "minutely",
+                    "schedule_value": str(minutes),
+                }
+            return None
 
         hourly = EVERY_HOURS_RE.search(user_input)
         if hourly:
@@ -1385,6 +1544,10 @@ class Agent:
         )
 
     def _note_unperformed_memory_actions(self, content, tool_results):
+        # A model can quote a real notice from an older turn. Remove that
+        # stale host text before deciding whether this turn needs one, so
+        # the same warning is never stacked repeatedly in chat history.
+        content = MEMORY_HOST_NOTICE_RE.sub("", content or "").rstrip()
         remembered = any(
             name == "remember" and (
                 result.startswith("Remembered as #")
@@ -1418,6 +1581,7 @@ class Agent:
         return f"{content.rstrip()}\n\n[Note: {'; '.join(notices)}.]"
 
     def _note_unperformed_schedule(self, content, tool_results):
+        content = SCHEDULE_HOST_NOTICE_RE.sub("", content or "").rstrip()
         scheduled = any(
             name == "schedule_routine" and result.startswith("Scheduled routine #")
             for name, result in tool_results
@@ -1674,6 +1838,55 @@ class Agent:
             result = self._execute_tool("schedule_routine", schedule_args)
             tool_results.append(("schedule_routine", result))
             content = self._finalize_learning(result, feedback_notice)
+            memory.save_message("assistant", content, session_id=self.session_id)
+            return content
+
+        remember_content = _parse_remember_content(user_input)
+        if remember_content is not None and "remember" in available_tools:
+            args = {"content": remember_content}
+            self.on_tool_call("remember", args)
+            result = self._execute_tool("remember", args)
+            tool_results.append(("remember", result))
+            content = self._finalize_learning(result, feedback_notice)
+            memory.save_message("assistant", content, session_id=self.session_id)
+            return content
+
+        forget_target = _parse_forget_target(user_input)
+        if forget_target is not None and "forget" in available_tools:
+            args = None
+            if "note_id" in forget_target:
+                args = {"note_id": forget_target["note_id"]}
+            elif not forget_target["query"]:
+                content = "Which saved note should I forget? You can describe a few words from it."
+            else:
+                records = memory.list_note_records(session_id=self.notes_session_id)
+                if records is None:
+                    content = "I couldn't read the saved notes, so I did not delete anything."
+                else:
+                    matched, choices = _rank_note_matches(forget_target["query"], records)
+                    if matched is not None:
+                        args = {"note_id": matched["id"]}
+                    elif choices:
+                        lines = [
+                            "I found multiple possible notes and did not delete any. "
+                            "Say “forget note #ID” for the one you mean:"
+                        ]
+                        lines.extend(
+                            f"- #{record['id']}: {_note_preview(record['content'])}"
+                            for record in choices
+                        )
+                        content = "\n".join(lines)
+                    else:
+                        content = (
+                            f"No saved note uniquely matched “{forget_target['query']}”. "
+                            "Nothing was deleted."
+                        )
+            if args is not None:
+                self.on_tool_call("forget", args)
+                result = self._execute_tool("forget", args)
+                tool_results.append(("forget", result))
+                content = result
+            content = self._finalize_learning(content, feedback_notice)
             memory.save_message("assistant", content, session_id=self.session_id)
             return content
 

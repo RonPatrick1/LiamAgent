@@ -1721,6 +1721,8 @@ class LiamWindow(Gtk.ApplicationWindow):
                 schedule_text = f"once at {routine['schedule_value']}"
             elif routine["schedule_kind"] == "daily":
                 schedule_text = f"daily at {routine['schedule_value']}"
+            elif routine["schedule_kind"] == "minutely":
+                schedule_text = f"every {routine['schedule_value']}m"
             else:
                 schedule_text = f"every {routine['schedule_value']}h"
             finished_status = _finished_once_status(routine)
@@ -1836,6 +1838,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         kind_combo = Gtk.ComboBoxText()
         kind_combo.append("once", "Once at")
         kind_combo.append("daily", "Daily at")
+        kind_combo.append("minutely", "Every N minutes")
         kind_combo.append("hourly", "Every N hours")
         kind_combo.set_active_id("daily")
         schedule_row.pack_start(kind_combo, False, False, 0)
@@ -1853,7 +1856,12 @@ class LiamWindow(Gtk.ApplicationWindow):
         once_entry.set_visible(False)
         schedule_row.pack_start(once_entry, False, False, 0)
 
-        hours_spin = Gtk.SpinButton.new_with_range(1, 24, 1)
+        minutes_spin = Gtk.SpinButton.new_with_range(1, 1440, 1)
+        minutes_spin.set_value(5)
+        minutes_spin.set_visible(False)
+        schedule_row.pack_start(minutes_spin, False, False, 0)
+
+        hours_spin = Gtk.SpinButton.new_with_range(1, 168, 1)
         hours_spin.set_value(4)
         hours_spin.set_visible(False)
         schedule_row.pack_start(hours_spin, False, False, 0)
@@ -1863,6 +1871,7 @@ class LiamWindow(Gtk.ApplicationWindow):
             is_daily = kind == "daily"
             time_entry.set_visible(is_daily)
             once_entry.set_visible(kind == "once")
+            minutes_spin.set_visible(kind == "minutely")
             hours_spin.set_visible(kind == "hourly")
 
         kind_combo.connect("changed", on_kind_changed)
@@ -1877,6 +1886,8 @@ class LiamWindow(Gtk.ApplicationWindow):
                     schedule_value = once_entry.get_text().strip()
                 elif schedule_kind == "daily":
                     schedule_value = time_entry.get_text().strip()
+                elif schedule_kind == "minutely":
+                    schedule_value = str(int(minutes_spin.get_value()))
                 else:
                     schedule_value = str(int(hours_spin.get_value()))
                 if prompt:
