@@ -20,6 +20,7 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime
 
 import requests
 
@@ -131,6 +132,31 @@ def _is_external_session(session):
     """
     folder_path = session.get("folder_path", "")
     return any(folder_path.startswith(prefix) for prefix in EXTERNAL_SESSION_PREFIXES)
+
+
+def _routine_display_prompt(prompt):
+    """Hide the execution wrapper while retaining the user's real task."""
+    prompt = prompt or ""
+    original_marker = "Original request:\n"
+    if original_marker in prompt:
+        return prompt.split(original_marker, 1)[1].strip()
+    exact_marker = "Return exactly this message:"
+    if exact_marker in prompt:
+        return prompt.split(exact_marker, 1)[1].strip()
+    return prompt.strip()
+
+
+def _finished_once_status(routine, now=None):
+    """Return Completed/Expired for one-time routines that cannot resume."""
+    if routine.get("schedule_kind") != "once":
+        return None
+    if routine.get("last_run_at") is not None:
+        return "Completed"
+    try:
+        run_at = datetime.strptime(routine["schedule_value"], "%Y-%m-%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError):
+        return "Invalid schedule"
+    return "Expired" if run_at <= (now or datetime.now()) else None
 
 
 def _move_window(window, x, y):
@@ -1590,10 +1616,68 @@ class LiamWindow(Gtk.ApplicationWindow):
 
     # --- routines ---
 
+    def _configure_dialog_geometry(self, dialog, key, default_width, default_height):
+        """Restore a resizable dialog without trusting stale monitor geometry."""
+        all_geometry = self.settings.get("dialog_geometry")
+        saved = all_geometry.get(key, {}) if isinstance(all_geometry, dict) else {}
+        try:
+            width = max(320, int(saved.get("width", default_width)))
+            height = max(240, int(saved.get("height", default_height)))
+            x = int(saved["x"])
+            y = int(saved["y"])
+        except (KeyError, TypeError, ValueError):
+            dialog.set_position(Gtk.WindowPosition.CENTER)
+            dialog.set_default_size(default_width, default_height)
+            return
+
+        display = self.get_display()
+        monitor_index = _monitor_index_at_point(
+            display, x + width // 2, y + height // 2,
+        )
+        monitor = display.get_monitor(monitor_index) if monitor_index >= 0 else None
+        if monitor is None:
+            monitor = display.get_primary_monitor()
+        if monitor is None and display.get_n_monitors() > 0:
+            monitor = display.get_monitor(0)
+        if monitor is not None:
+            workarea = monitor.get_workarea()
+            width = min(width, workarea.width)
+            height = min(height, workarea.height)
+            x = max(workarea.x, min(x, workarea.x + workarea.width - width))
+            y = max(workarea.y, min(y, workarea.y + workarea.height - height))
+
+        dialog.set_default_size(width, height)
+        dialog.resize(width, height)
+        _move_window(dialog, x, y)
+
+        def restore_after_map(_widget, _event):
+            # Mutter can ignore pre-map positioning, so repeat it once the
+            # dialog owns a real window, just as the main window does.
+            GLib.idle_add(lambda: (_move_window(dialog, x, y), False)[1])
+            return False
+
+        dialog.connect("map-event", restore_after_map)
+
+    def _save_dialog_geometry(self, dialog, key):
+        gdk_window = dialog.get_window()
+        if gdk_window is None:
+            return
+        frame = gdk_window.get_frame_extents()
+        width, height = dialog.get_size()
+        all_geometry = self.settings.get("dialog_geometry")
+        all_geometry = dict(all_geometry) if isinstance(all_geometry, dict) else {}
+        all_geometry[key] = {
+            "x": frame.x,
+            "y": frame.y,
+            "width": width,
+            "height": height,
+        }
+        self.settings["dialog_geometry"] = all_geometry
+        liam_settings.save(self.settings)
+
     def _open_routines_dialog(self, _button):
         dialog = Gtk.Dialog(title="Routines", transient_for=self)
-        dialog.set_position(Gtk.WindowPosition.CENTER)
-        dialog.set_default_size(520, 400)
+        self._configure_dialog_geometry(dialog, "routines", 520, 400)
         dialog.add_button(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
 
         content = dialog.get_content_area()
@@ -1618,7 +1702,12 @@ class LiamWindow(Gtk.ApplicationWindow):
         content.pack_start(new_button, False, False, 0)
 
         self._refresh_routines_list(routines_list)
-        dialog.connect("response", lambda dialog, _response: dialog.destroy())
+
+        def close_dialog(widget, _response):
+            self._save_dialog_geometry(widget, "routines")
+            widget.destroy()
+
+        dialog.connect("response", close_dialog)
         dialog.show_all()
 
     def _refresh_routines_list(self, routines_list):
@@ -1634,8 +1723,16 @@ class LiamWindow(Gtk.ApplicationWindow):
                 schedule_text = f"daily at {routine['schedule_value']}"
             else:
                 schedule_text = f"every {routine['schedule_value']}h"
+            finished_status = _finished_once_status(routine)
             last_run = routine["last_run_at"] or "never"
-            prompt_preview = routine["prompt"][:60] + ("…" if len(routine["prompt"]) > 60 else "")
+            if finished_status == "Completed":
+                run_text = f"completed {last_run}"
+            elif finished_status:
+                run_text = finished_status.lower()
+            else:
+                run_text = f"last ran {last_run}"
+            display_prompt = _routine_display_prompt(routine["prompt"])
+            prompt_preview = display_prompt[:60] + ("…" if len(display_prompt) > 60 else "")
 
             row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             row_box.set_margin_top(6)
@@ -1644,20 +1741,48 @@ class LiamWindow(Gtk.ApplicationWindow):
             row_box.set_margin_end(8)
             row_box.pack_start(Gtk.Label(label=prompt_preview, xalign=0), False, False, 0)
             detail_label = Gtk.Label(
-                label=f"{thread_name} · {schedule_text} · last ran {last_run}", xalign=0,
+                label=f"{thread_name} · {schedule_text} · {run_text}", xalign=0,
             )
             detail_label.get_style_context().add_class("dim-label")
             row_box.pack_start(detail_label, False, False, 0)
 
             controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            enabled_switch = Gtk.Switch()
-            enabled_switch.get_style_context().add_class("liam-toggle")
-            enabled_switch.set_active(routine["enabled"])
-            enabled_switch.connect(
-                "state-set",
-                lambda _sw, active, rid=routine["id"]: routines.set_enabled(rid, active) or False,
-            )
-            controls.pack_start(enabled_switch, False, False, 0)
+            if finished_status:
+                status_label = Gtk.Label(label=finished_status)
+                status_label.get_style_context().add_class("dim-label")
+                if finished_status == "Completed":
+                    status_label.set_tooltip_text(
+                        "This one-time routine already ran. Create a new routine to run it again."
+                    )
+                elif finished_status == "Expired":
+                    status_label.set_tooltip_text(
+                        "This one-time schedule is in the past. Create a new routine with a future time."
+                    )
+                controls.pack_start(status_label, False, False, 0)
+            else:
+                enabled_switch = Gtk.Switch()
+                enabled_switch.get_style_context().add_class("liam-toggle")
+                enabled_switch.set_active(routine["enabled"])
+
+                def on_state_set(_switch, active, rid=routine["id"]):
+                    try:
+                        routines.set_enabled(rid, active)
+                    except Exception as exc:
+                        error = Gtk.MessageDialog(
+                            transient_for=self,
+                            message_type=Gtk.MessageType.ERROR,
+                            buttons=Gtk.ButtonsType.CLOSE,
+                            text="Could not update routine",
+                            secondary_text=str(exc),
+                        )
+                        error.connect("response", lambda widget, _response: widget.destroy())
+                        error.show_all()
+                        GLib.idle_add(self._refresh_routines_list, routines_list)
+                        return True
+                    return False
+
+                enabled_switch.connect("state-set", on_state_set)
+                controls.pack_start(enabled_switch, False, False, 0)
             delete_button = Gtk.Button(label="Delete")
             delete_button.connect(
                 "clicked",
