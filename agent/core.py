@@ -190,6 +190,50 @@ CAPABILITY_REFUSAL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+REMEMBER_REQUEST_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?(?:please\s+)?(?:"
+    r"(?:(?:can|could|would|will)\s+you\s+)|"
+    r"(?:i(?:'d|\s+would)?\s+like\s+(?:you\s+)?to\s+)|"
+    r"(?:i\s+want\s+(?:you\s+)?to\s+)"
+    r")?(?:remember\b(?!\s+(?:when|what|who|where|why|how|whether)\b)|"
+    r"(?:do\s+not|don'?t)\s+forget\b|"
+    r"make\s+(?:me\s+)?a\s+note\b|save\b.{0,40}\bnote\b|"
+    r"add\b.{0,60}\bto\s+(?:your|my|the)\s+notes\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+FORGET_REQUEST_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?(?:please\s+)?(?:"
+    r"(?:(?:can|could|would|will)\s+you\s+)|"
+    r"(?:i(?:'d|\s+would)?\s+like\s+(?:you\s+)?to\s+)|"
+    r"(?:i\s+want\s+(?:you\s+)?to\s+)"
+    r")?(?:forget|delete|remove)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+NOTE_RECALL_REQUEST_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?(?:please\s+)?(?:"
+    r"(?:(?:can|could|would|will)\s+you\s+)?"
+    r"(?:show|list|read|recall)\s+(?:me\s+)?(?:all\s+)?(?:of\s+)?"
+    r"(?:(?:your|my|the)\s+)?notes\b|"
+    r"what\s+(?:notes\s+)?do\s+you\s+remember\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+FORGET_CLAIM_RE = re.compile(
+    r"\bi(?:'ve|\s+have)?\s+(?:also\s+|now\s+)?(?:forgotten|deleted|removed)\b|"
+    r"\b(?:the|those|these|following)\s+notes?\s+(?:has|have)\s+been\s+"
+    r"(?:forgotten|deleted|removed)\b",
+    re.IGNORECASE,
+)
+REMEMBER_CLAIM_RE = re.compile(
+    r"\bi(?:'ve|\s+have)\s+(?:also\s+|now\s+)?(?:remembered|saved|"
+    r"made\s+(?:a\s+)?note|added\b.{0,60}\bto\s+(?:my\s+)?notes)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+MODEL_LEARNING_NOTICE_RE = re.compile(
+    r"\s*\[\s*(?:i\s+)?(?:queued|learned|reinforced|quarantined)\b"
+    r"[^\]]{0,400}\blesson\b[^\]]*\]\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
 FEEDBACK_GATE_RE = re.compile(
     r"\b(wrong|incorrect|mistake|actually|instead|next time|should(?:'ve| have)|"
     r"shouldn(?:'t| not)|don(?:'t| not)|never|always|i meant|not what i|"
@@ -304,6 +348,7 @@ class Agent:
         self.actor_id = actor_id
         self.is_owner = bool(is_owner)
         self.learning_enabled = bool(learning_enabled)
+        self._current_user_input = ""
         self._tool_events = []
         self._lesson_uses = []
         self.tool_schemas = (
@@ -407,6 +452,16 @@ class Agent:
             args["session_id"] = self.notes_session_id if name in NOTES_TOOLS else self.session_id
         if "allow_local_fallback" in params:
             args["allow_local_fallback"] = self.allowed_tools is None or "read_file" in self.allowed_tools
+
+        if name in {"remember", "forget"} and not self._explicit_note_action_requested(
+            name, getattr(self, "_current_user_input", "")
+        ):
+            action = "save" if name == "remember" else "delete"
+            return (
+                f"Error: the current user message does not explicitly request that Liam {action} "
+                f"a saved note. Do not infer a new memory action from quoted older messages, "
+                f"a question about past actions, or a complaint containing the word '{name}'."
+            )
 
         if name == "edit_file":
             # Proven live, repeatedly (not theoretical): without this gate,
@@ -526,6 +581,8 @@ class Agent:
             status, reason = "failure", "unknown_tool"
         elif "isn't available in this conversation" in lower:
             status, reason = "failure", "unavailable_tool"
+        elif "current user message does not explicitly request" in lower:
+            status, reason = "failure", "note_action_without_current_intent"
         elif lower.startswith("error:") or lower.startswith("failed to"):
             status, reason = "failure", "tool_error"
         elif (
@@ -573,6 +630,15 @@ class Agent:
     @staticmethod
     def _is_direct_image_request(user_input):
         return bool(IMAGE_GENERATION_REQUEST_RE.search(user_input or ""))
+
+    @staticmethod
+    def _explicit_note_action_requested(name, user_input):
+        pattern = REMEMBER_REQUEST_RE if name == "remember" else FORGET_REQUEST_RE
+        return bool(pattern.search(user_input or ""))
+
+    @staticmethod
+    def _is_direct_note_recall_request(user_input):
+        return bool(NOTE_RECALL_REQUEST_RE.search(user_input or ""))
 
     def _auto_follow_search_links(self, tool_results, max_links=2):
         """Search results are links and snippets, not answers. A person
@@ -896,6 +962,16 @@ class Agent:
                 "When an explicit image-creation request maps to the available generate_image tool, call it instead of inventing a content or capability refusal.",
                 "tool", "generate_image",
             ),
+            "note_action_without_current_intent": (
+                "remember note,forget note,current request",
+                "Only save or delete a note when the current user message explicitly requests that memory action; never infer it from quoted history, a complaint, or a question about an earlier turn.",
+                "tool", None,
+            ),
+            "memory_claim_without_tool": (
+                "remember note,forget note,memory claim",
+                "Never claim that a saved note was added or deleted unless the corresponding memory tool succeeded during the current turn.",
+                "tool", None,
+            ),
         }
         for event in self._tool_events:
             if event.get("reason") not in fixed:
@@ -1177,6 +1253,39 @@ class Agent:
             f"anything said above, it did not succeed:]\n{failures[-1]}"
         )
 
+    def _note_unperformed_memory_actions(self, content, tool_results):
+        remembered = any(
+            name == "remember" and (
+                result.startswith("Remembered as #")
+                or result.startswith("Already remembered as #")
+            )
+            for name, result in tool_results
+        )
+        forgotten = any(
+            name == "forget" and result.startswith("Deleted ")
+            for name, result in tool_results
+        )
+        notices = []
+        if REMEMBER_CLAIM_RE.search(content or "") and not remembered:
+            self._record_intervention(
+                "memory_claim_without_tool", "remember",
+                "The model claimed a saved note was added, but no remember call succeeded this turn.",
+            )
+            notices.append(
+                "no remember tool successfully saved a note this turn; any claim above that a note was made is false"
+            )
+        if FORGET_CLAIM_RE.search(content or "") and not forgotten:
+            self._record_intervention(
+                "memory_claim_without_tool", "forget",
+                "The model claimed saved notes were deleted, but no forget call succeeded this turn.",
+            )
+            notices.append(
+                "no forget tool successfully deleted a saved note this turn; any claimed deletion or resulting note list above is not authoritative"
+            )
+        if not notices:
+            return content
+        return f"{content.rstrip()}\n\n[Note: {'; '.join(notices)}.]"
+
     def _force_compile_retry(self, name, args, result):
         """The deterministic half of "break the task into smaller
         deterministic steps": a compiler's exit code is unambiguous, so
@@ -1346,6 +1455,11 @@ class Agent:
         return f"{content.rstrip()}\n\n[{notice}]" if content.strip() else f"[{notice}]"
 
     def _finalize_learning(self, content, feedback_notice):
+        # Only the host is allowed to issue lifecycle notices. The model
+        # copied an earlier real notice from conversation history and
+        # fabricated incremented lesson ids (#16/#17) even though no such
+        # database rows existed.
+        content = MODEL_LEARNING_NOTICE_RE.sub("", content or "").rstrip()
         self._record_auto_lessons(content)
         self._evaluate_lesson_uses(content)
         content = self._append_learning_notice(content, feedback_notice)
@@ -1365,6 +1479,7 @@ class Agent:
         self._read_paths_this_turn = set()
         self._tool_events = []
         self._lesson_uses = []
+        self._current_user_input = user_input
         previous_answer = next(
             (
                 message.get("content", "") for message in reversed(self.messages)
@@ -1405,6 +1520,15 @@ class Agent:
         hint_text = "\n".join(f"- {record['lesson']}" for record in lesson_hits) if lesson_hits else None
 
         tool_results = []
+
+        if self._is_direct_note_recall_request(user_input) and "recall_notes" in available_tools:
+            args = {}
+            self.on_tool_call("recall_notes", args)
+            result = self._execute_tool("recall_notes", args)
+            tool_results.append(("recall_notes", result))
+            content = self._finalize_learning(result, feedback_notice)
+            memory.save_message("assistant", content, session_id=self.session_id)
+            return content
 
         # Image creation is a deterministic local capability, not a policy
         # judgment for the chat model. Route clear imperative requests
@@ -1460,6 +1584,7 @@ class Agent:
                 content = self._fix_image_claims(content, tool_results)
                 content = self._note_missing_generated_image(content, tool_results)
                 content = self._note_shell_failures(content, tool_results)
+                content = self._note_unperformed_memory_actions(content, tool_results)
                 content = self._finalize_learning(content, feedback_notice)
                 memory.save_message("assistant", content, session_id=self.session_id)
                 if not any(name == "write_file" for name, _ in tool_results):
@@ -1537,6 +1662,7 @@ class Agent:
         content = self._fix_image_claims(content, tool_results)
         content = self._note_missing_generated_image(content, tool_results)
         content = self._note_shell_failures(content, tool_results)
+        content = self._note_unperformed_memory_actions(content, tool_results)
         content = self._finalize_learning(content, feedback_notice)
         memory.save_message("assistant", content, session_id=self.session_id)
         if not any(name == "write_file" for name, _ in tool_results):

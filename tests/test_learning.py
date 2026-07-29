@@ -26,9 +26,11 @@ def bare_agent(*, owner=True, learning=True, payload=None):
     agent.actor_id = "local-owner" if owner else "@guest:example"
     agent.workdir = "/tmp/liam-project"
     agent.session_id = 17
+    agent.notes_session_id = None
     agent.allowed_tools = None
     agent._tool_events = []
     agent._lesson_uses = []
+    agent._current_user_input = ""
     return agent
 
 
@@ -161,6 +163,116 @@ class ImageRoutingTests(unittest.TestCase):
         self.assertNotIn("unable", content.lower())
         self.assertEqual(results[0][0], "generate_image")
         self.assertEqual(agent._tool_events[0]["reason"], "available_capability_refusal")
+
+
+class MemoryTruthTests(unittest.TestCase):
+    def test_only_current_explicit_commands_authorize_note_mutation(self):
+        self.assertTrue(core.Agent._explicit_note_action_requested(
+            "forget", "Liam: please forget the note that says update FredPlayer."
+        ))
+        self.assertTrue(core.Agent._explicit_note_action_requested(
+            "remember", "Liam, remember to ask Codex about shared playlists."
+        ))
+        self.assertTrue(core.Agent._explicit_note_action_requested(
+            "remember", "Don't forget to ask Codex about shared playlists."
+        ))
+        self.assertFalse(core.Agent._explicit_note_action_requested(
+            "forget", "Didn't I ask you to forget the FredPlayer note?"
+        ))
+        self.assertFalse(core.Agent._explicit_note_action_requested(
+            "forget",
+            "I didn't ask you to forget anything. Earlier I said: Liam: forget the old note.",
+        ))
+        self.assertFalse(core.Agent._explicit_note_action_requested(
+            "remember", "Do you remember when we discussed shared playlists?"
+        ))
+
+    def test_forget_tool_is_blocked_for_a_complaint_that_quotes_old_command(self):
+        agent = bare_agent()
+        agent._read_paths_this_turn = set()
+        agent._current_user_input = (
+            "I didn't ask you to forget anything. Earlier I said: "
+            "Liam: forget the note that says update FredPlayer."
+        )
+
+        result = agent._run_tool("forget", {"keyword": "FredPlayer"})
+
+        self.assertIn("does not explicitly request", result)
+
+    def test_false_memory_claim_is_corrected_and_recorded(self):
+        agent = bare_agent()
+        agent._record_intervention = mock.Mock()
+
+        result = agent._note_unperformed_memory_actions(
+            "I have now forgotten the following notes as requested.", []
+        )
+
+        self.assertIn("no forget tool successfully deleted", result)
+        agent._record_intervention.assert_called_once_with(
+            "memory_claim_without_tool", "forget",
+            "The model claimed saved notes were deleted, but no forget call succeeded this turn.",
+        )
+
+    def test_successful_memory_tool_makes_matching_claim_authoritative(self):
+        agent = bare_agent()
+        agent._record_intervention = mock.Mock()
+        content = "I have now forgotten that note."
+
+        result = agent._note_unperformed_memory_actions(
+            content, [("forget", "Deleted 1 note(s).")]
+        )
+
+        self.assertEqual(result, content)
+        agent._record_intervention.assert_not_called()
+
+    def test_model_cannot_fabricate_host_lesson_notice(self):
+        agent = bare_agent()
+        agent.messages = []
+        agent._record_auto_lessons = mock.Mock()
+        agent._evaluate_lesson_uses = mock.Mock()
+
+        result = agent._finalize_learning(
+            "Answer.\n\n[I queued that feedback as lesson candidate #17 for owner review; "
+            "it is not active yet.]",
+            None,
+        )
+
+        self.assertEqual(result, "Answer.")
+
+    def test_fake_lesson_notice_is_removed_even_after_a_false_memory_claim(self):
+        agent = bare_agent()
+        agent.messages = []
+        agent._record_auto_lessons = mock.Mock()
+        agent._evaluate_lesson_uses = mock.Mock()
+        agent._record_intervention = mock.Mock()
+        content = agent._note_unperformed_memory_actions(
+            "I have now forgotten the note.\n\n"
+            "[I queued that feedback as lesson candidate #17 for owner review.]",
+            [],
+        )
+
+        result = agent._finalize_learning(content, None)
+
+        self.assertNotIn("lesson candidate #17", result)
+        self.assertIn("no forget tool successfully deleted", result)
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_direct_note_recall_bypasses_chat_model(self, _match, _save_message):
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "recall_notes"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="#15: Update FredPlayer")
+
+        reply = agent.step("What notes do you remember?")
+
+        self.assertEqual(reply, "#15: Update FredPlayer")
+        agent._execute_tool.assert_called_once_with("recall_notes", {})
+        self.assertEqual(agent.client.calls, 0)
 
 
 class AutomaticLessonTests(unittest.TestCase):

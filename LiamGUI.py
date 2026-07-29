@@ -242,7 +242,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         routines_button.connect("clicked", self._open_routines_dialog)
         headerbar.pack_end(routines_button)
 
-        lessons_button = Gtk.Button.new_from_icon_name("document-properties-symbolic", Gtk.IconSize.BUTTON)
+        lessons_button = Gtk.Button.new_from_icon_name("view-list-bullet-symbolic", Gtk.IconSize.BUTTON)
         lessons_button.set_tooltip_text("Lessons")
         lessons_button.connect("clicked", self._open_lessons_dialog)
         headerbar.pack_end(lessons_button)
@@ -1196,6 +1196,13 @@ class LiamWindow(Gtk.ApplicationWindow):
             status_combo.append(status, label)
         status_combo.set_active_id("pending")
         filter_row.pack_start(status_combo, False, False, 0)
+        refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh_button.set_tooltip_text("Refresh lessons now")
+        filter_row.pack_end(refresh_button, False, False, 0)
+        auto_refresh_label = Gtk.Label(label="Auto-refreshes every 3 seconds")
+        auto_refresh_label.get_style_context().add_class("dim-label")
+        auto_refresh_label.set_tooltip_text("Automatic refresh pauses while you have unsaved edits.")
+        filter_row.pack_end(auto_refresh_label, False, False, 0)
         content.pack_start(filter_row, False, False, 0)
 
         main = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -1204,6 +1211,11 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         lesson_list = Gtk.ListBox()
         lesson_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        empty_label = Gtk.Label(label="No lessons in this view.")
+        empty_label.get_style_context().add_class("dim-label")
+        empty_label.set_margin_top(16)
+        empty_label.set_margin_bottom(16)
+        lesson_list.set_placeholder(empty_label)
         list_scroller = Gtk.ScrolledWindow()
         list_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         list_scroller.add(lesson_list)
@@ -1270,7 +1282,14 @@ class LiamWindow(Gtk.ApplicationWindow):
         actions.pack_end(reject_button, False, False, 0)
         editor.pack_start(actions, False, False, 0)
 
-        state = {"lesson": None}
+        state = {
+            "lesson": None,
+            "loading": False,
+            "dirty": False,
+            "signature": None,
+            "refresh_source": 0,
+            "closed": False,
+        }
 
         def show_error(message):
             error = Gtk.MessageDialog(
@@ -1291,54 +1310,79 @@ class LiamWindow(Gtk.ApplicationWindow):
                 widget.set_sensitive(enabled)
 
         def populate_editor(record):
-            state["lesson"] = record
-            if record is None:
-                provenance_label.set_text("Select a lesson to inspect or edit it.")
-                keywords_entry.set_text("")
-                lesson_buffer.set_text("")
-                scope_combo.set_active_id("global")
-                scope_value_entry.set_text("")
-                stats_label.set_text("")
-                evidence_buffer.set_text("")
-                set_editor_sensitive(False)
-                return
-            set_editor_sensitive(True)
-            provenance_label.set_text(
-                f"#{record['id']} · {record['origin']} · {record.get('detector') or 'no detector'}"
-            )
-            keywords_entry.set_text(record["keywords"])
-            lesson_buffer.set_text(record["lesson"])
-            scope_combo.set_active_id(record["scope_kind"])
-            scope_value_entry.set_text(record.get("scope_value") or "")
-            scope_value_entry.set_sensitive(record["scope_kind"] != "global")
-            stats_label.set_text(
-                f"Observed {record['occurrence_count']} · used {record['hit_count']} · "
-                f"verified success {record['success_count']} · failure {record['failure_count']}"
-            )
-            events = memory.list_lesson_events(record["id"], limit=12)
-            event_text = []
-            for event in events:
-                source = " / ".join(
-                    value for value in (
-                        event.get("source_channel"), event.get("source_actor")
-                    ) if value
-                ) or "system"
-                event_text.append(
-                    f"{event['created_at']} · {event['event_kind']} · {source}\n"
-                    f"{event.get('evidence') or '(no excerpt retained)'}"
+            state["loading"] = True
+            try:
+                state["lesson"] = record
+                if record is None:
+                    provenance_label.set_text("Select a lesson to inspect or edit it.")
+                    keywords_entry.set_text("")
+                    lesson_buffer.set_text("")
+                    scope_combo.set_active_id("global")
+                    scope_value_entry.set_text("")
+                    stats_label.set_text("")
+                    evidence_buffer.set_text("")
+                    set_editor_sensitive(False)
+                    return
+                set_editor_sensitive(True)
+                provenance_label.set_text(
+                    f"#{record['id']} · {record['origin']} · {record.get('detector') or 'no detector'}"
                 )
-            evidence_buffer.set_text("\n\n———\n\n".join(event_text))
-            status = record["status"]
-            save_button.set_label(
-                "Save" if status == "active" else "Approve and activate"
-            )
-            toggle_button.set_label("Disable" if status == "active" else "Reactivate")
-            toggle_button.set_sensitive(status in {"active", "disabled", "quarantined"})
-            reject_button.set_sensitive(status in {"pending", "quarantined"})
+                keywords_entry.set_text(record["keywords"])
+                lesson_buffer.set_text(record["lesson"])
+                scope_combo.set_active_id(record["scope_kind"])
+                scope_value_entry.set_text(record.get("scope_value") or "")
+                scope_value_entry.set_sensitive(record["scope_kind"] != "global")
+                stats_label.set_text(
+                    f"Observed {record['occurrence_count']} · used {record['hit_count']} · "
+                    f"verified success {record['success_count']} · failure {record['failure_count']}"
+                )
+                events = memory.list_lesson_events(record["id"], limit=12)
+                event_text = []
+                for event in events:
+                    source = " / ".join(
+                        value for value in (
+                            event.get("source_channel"), event.get("source_actor")
+                        ) if value
+                    ) or "system"
+                    event_text.append(
+                        f"{event['created_at']} · {event['event_kind']} · {source}\n"
+                        f"{event.get('evidence') or '(no excerpt retained)'}"
+                    )
+                evidence_buffer.set_text("\n\n———\n\n".join(event_text))
+                status = record["status"]
+                save_button.set_label(
+                    "Save" if status == "active" else "Approve and activate"
+                )
+                toggle_button.set_label("Disable" if status == "active" else "Reactivate")
+                toggle_button.set_sensitive(status in {"active", "disabled", "quarantined"})
+                reject_button.set_sensitive(status in {"pending", "quarantined"})
+            finally:
+                state["loading"] = False
+                state["dirty"] = False
 
-        def refresh(preferred_id=None):
+        def refresh(preferred_id=None, force=False):
+            if state["dirty"] and not force:
+                return
             status = status_combo.get_active_id() or "pending"
             records = memory.list_lessons(status=status)
+            signature = (
+                status,
+                tuple(
+                    (
+                        record["id"], record["status"], str(record.get("updated_at")),
+                        record["occurrence_count"], record["hit_count"],
+                        record["success_count"], record["failure_count"],
+                        record["keywords"], record["lesson"], record["scope_kind"],
+                        record.get("scope_value"),
+                    )
+                    for record in records
+                ),
+            )
+            if not force and signature == state["signature"]:
+                return
+            state["signature"] = signature
+            if preferred_id is None and state["lesson"] is not None:
+                preferred_id = state["lesson"]["id"]
             for child in list(lesson_list.get_children()):
                 lesson_list.remove(child)
             selected_row = None
@@ -1376,6 +1420,12 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         def on_scope_changed(_combo):
             scope_value_entry.set_sensitive(scope_combo.get_active_id() != "global")
+            if not state["loading"] and state["lesson"] is not None:
+                state["dirty"] = True
+
+        def on_editor_changed(*_args):
+            if not state["loading"] and state["lesson"] is not None:
+                state["dirty"] = True
 
         def on_save(_widget):
             record = state["lesson"]
@@ -1393,8 +1443,9 @@ class LiamWindow(Gtk.ApplicationWindow):
                 )
                 if updated is None:
                     raise RuntimeError("The database did not update the lesson.")
+                state["dirty"] = False
                 status_combo.set_active_id("active")
-                refresh(updated["id"])
+                refresh(updated["id"], force=True)
             except Exception as exc:
                 show_error(exc)
 
@@ -1407,8 +1458,9 @@ class LiamWindow(Gtk.ApplicationWindow):
             if updated is None:
                 show_error("The database did not update the lesson.")
                 return
+            state["dirty"] = False
             status_combo.set_active_id(next_status)
-            refresh(updated["id"])
+            refresh(updated["id"], force=True)
 
         def on_reject(_widget):
             record = state["lesson"]
@@ -1476,8 +1528,12 @@ class LiamWindow(Gtk.ApplicationWindow):
             merge.show_all()
 
         lesson_list.connect("row-selected", on_selected)
-        status_combo.connect("changed", lambda _combo: refresh())
+        status_combo.connect("changed", lambda _combo: refresh(force=True))
         scope_combo.connect("changed", on_scope_changed)
+        keywords_entry.connect("changed", on_editor_changed)
+        lesson_buffer.connect("changed", on_editor_changed)
+        scope_value_entry.connect("changed", on_editor_changed)
+        refresh_button.connect("clicked", lambda _button: refresh(force=True))
         save_button.connect("clicked", on_save)
         toggle_button.connect("clicked", on_toggle)
         reject_button.connect("clicked", on_reject)
@@ -1485,10 +1541,29 @@ class LiamWindow(Gtk.ApplicationWindow):
         merge_button.connect("clicked", on_merge)
         dialog.connect("response", lambda widget, _response: widget.destroy())
 
-        refresh()
+        def poll_refresh():
+            if state["closed"]:
+                state["refresh_source"] = 0
+                return GLib.SOURCE_REMOVE
+            refresh()
+            return GLib.SOURCE_CONTINUE
+
+        def on_destroy(_widget):
+            state["closed"] = True
+            source_id = state["refresh_source"]
+            state["refresh_source"] = 0
+            if source_id:
+                GLib.source_remove(source_id)
+
+        dialog.connect("destroy", on_destroy)
+
+        refresh(force=True)
         dialog.show_all()
         # show_all() re-enables the value field even for global scope.
+        state["loading"] = True
         on_scope_changed(scope_combo)
+        state["loading"] = False
+        state["refresh_source"] = GLib.timeout_add_seconds(3, poll_refresh)
 
     # --- routines ---
 
