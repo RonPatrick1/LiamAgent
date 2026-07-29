@@ -430,6 +430,9 @@ class RoutineRoutingTests(unittest.TestCase):
         abbreviated = core.Agent._parse_schedule_request(
             "Send me a test message every 15 mins.", now=self.NOW,
         )
+        conversational = core.Agent._parse_schedule_request(
+            "liam: tell me I'm handsome every 5 minutes", now=self.NOW,
+        )
 
         self.assertEqual(
             (daily["schedule_kind"], daily["schedule_value"]), ("daily", "20:05")
@@ -445,6 +448,10 @@ class RoutineRoutingTests(unittest.TestCase):
             (abbreviated["schedule_kind"], abbreviated["schedule_value"]),
             ("minutely", "15"),
         )
+        self.assertEqual(
+            (conversational["schedule_kind"], conversational["schedule_value"]),
+            ("minutely", "5"),
+        )
 
     def test_schedule_complaint_or_quote_is_not_a_new_schedule(self):
         self.assertIsNone(core.Agent._parse_schedule_request(
@@ -453,6 +460,9 @@ class RoutineRoutingTests(unittest.TestCase):
         ))
         self.assertIsNone(core.Agent._parse_schedule_request(
             "Can you tell me what the weather will be at 8pm?", now=self.NOW,
+        ))
+        self.assertIsNone(core.Agent._parse_schedule_request(
+            "Tell me why that job runs every 5 minutes.", now=self.NOW,
         ))
 
     @mock.patch.object(core.memory, "save_message")
@@ -475,6 +485,29 @@ class RoutineRoutingTests(unittest.TestCase):
         self.assertEqual(agent._execute_tool.call_args.args[0], "schedule_routine")
         self.assertEqual(agent.client.calls, 0)
 
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_tell_me_recurring_schedule_bypasses_chat_model(self, _match, _save_message):
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "schedule_routine"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value=(
+            "Scheduled routine #9 — runs every 5 minute(s), in this thread."
+        ))
+
+        reply = agent.step("liam: tell me I'm handsome every 5 minutes")
+
+        self.assertTrue(reply.startswith("Scheduled routine #9"))
+        agent._execute_tool.assert_called_once()
+        name, args = agent._execute_tool.call_args.args
+        self.assertEqual(name, "schedule_routine")
+        self.assertEqual((args["schedule_kind"], args["schedule_value"]), ("minutely", "5"))
+        self.assertEqual(agent.client.calls, 0)
+
     def test_false_scheduled_claim_is_corrected_and_recorded(self):
         agent = bare_agent()
         agent._record_intervention = mock.Mock()
@@ -483,7 +516,12 @@ class RoutineRoutingTests(unittest.TestCase):
             "I've scheduled the routine for 9:25 AM.", []
         )
 
-        self.assertIn("any scheduling claim above is false", reply)
+        self.assertEqual(
+            reply,
+            "I couldn't create that routine because no timer was actually created. "
+            "Nothing has been scheduled.",
+        )
+        self.assertNotIn("I've scheduled", reply)
         agent._record_intervention.assert_called_once()
 
     def test_echoed_schedule_warning_is_replaced_instead_of_duplicated(self):
@@ -497,8 +535,9 @@ class RoutineRoutingTests(unittest.TestCase):
 
         result = agent._note_unperformed_schedule(stale, [])
 
-        self.assertEqual(result.count("[Note:"), 1)
-        self.assertEqual(result.count("no schedule_routine call successfully"), 1)
+        self.assertNotIn("[Note:", result)
+        self.assertNotIn("I've scheduled", result)
+        self.assertIn("Nothing has been scheduled", result)
 
 
 class AutomaticLessonTests(unittest.TestCase):

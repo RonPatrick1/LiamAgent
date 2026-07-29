@@ -265,6 +265,8 @@ SCHEDULE_REQUEST_RE = re.compile(
     r")?(?:schedule\b|create\b.{0,40}\broutine\b|set\s+up\b.{0,40}\b(?:routine|reminder)\b|"
     r"remind\s+me\b|notify\s+me\b|message\s+me\b|"
     r"send\s+me\b.{0,80}\b(?:message|notification|reminder)\b|"
+    r"(?:tell\s+me\s+(?!(?:why|how|whether|what|when|where|who)\b)|say\s+)"
+    r".{0,180}\bevery\s+\d+\s+(?:minutes?|mins?|hours?)\b|"
     r"every\s+(?:day|morning|afternoon|evening|night|\d+\s+(?:minutes?|mins?|hours?))\b)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -1593,8 +1595,8 @@ class Agent:
             "The model claimed a routine was scheduled, but no schedule_routine call succeeded this turn.",
         )
         return (
-            f"{content.rstrip()}\n\n[Note: no schedule_routine call successfully created a "
-            "timer this turn; any scheduling claim above is false.]"
+            "I couldn't create that routine because no timer was actually created. "
+            "Nothing has been scheduled."
         )
 
     def _force_compile_retry(self, name, args, result):
