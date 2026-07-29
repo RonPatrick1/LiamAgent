@@ -25,7 +25,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import memory
+from . import memory, routines
 from . import tools as tools_module
 from .core import Agent
 from .llm import DEFAULT_MODEL
@@ -191,7 +191,10 @@ class _ChatHandler(BaseHTTPRequestHandler):
         pass  # request-level logging belongs to the Rust side (tracing); keep this quiet
 
     def do_POST(self):
-        if self.path not in ("/chat", "/fredplayer-ask"):
+        if self.path not in (
+            "/chat", "/fredplayer-ask",
+            "/routine-deliveries/claim", "/routine-deliveries/ack",
+        ):
             self.send_response(404)
             self.end_headers()
             return
@@ -202,8 +205,18 @@ class _ChatHandler(BaseHTTPRequestHandler):
             if self.path == "/chat":
                 reply = handle_chat(body.get("room_id"), body.get("sender_id"), body.get("message"))
                 payload = {"reply": reply}
-            else:
+            elif self.path == "/fredplayer-ask":
                 payload = handle_fredplayer_ask(body.get("device_id"), body.get("message"))
+            elif self.path == "/routine-deliveries/claim":
+                payload = {"delivery": routines.claim_matrix_delivery()}
+            else:
+                delivery_id = int(body.get("id"))
+                delivered = bool(body.get("delivered"))
+                if not routines.resolve_matrix_delivery(
+                    delivery_id, delivered, body.get("error"),
+                ):
+                    raise ValueError(f"routine delivery {delivery_id} does not exist")
+                payload = {"ok": True}
             status = 200
         except Exception as exc:
             payload = {"error": str(exc)}
@@ -224,6 +237,13 @@ def main():
             "sender will get the safe tool tier only, no one will get "
             "filesystem/shell access."
         )
+    # The delivery bot polls frequently, so apply schema migrations once
+    # at process startup instead of repeating DDL on every empty claim.
+    conn = memory._connect()
+    try:
+        memory._ensure_schema(conn)
+    finally:
+        conn.close()
     server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), _ChatHandler)
     print(
         f"Liam messenger bridge listening on http://{HTTP_HOST}:{HTTP_PORT}/chat "

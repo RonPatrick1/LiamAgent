@@ -1601,10 +1601,12 @@ class LiamWindow(Gtk.ApplicationWindow):
         for routine in routines.list_routines():
             session = sessions_by_id.get(routine["session_id"])
             thread_name = session["title"] if session else "(deleted thread)"
-            schedule_text = (
-                f"daily at {routine['schedule_value']}" if routine["schedule_kind"] == "daily"
-                else f"every {routine['schedule_value']}h"
-            )
+            if routine["schedule_kind"] == "once":
+                schedule_text = f"once at {routine['schedule_value']}"
+            elif routine["schedule_kind"] == "daily":
+                schedule_text = f"daily at {routine['schedule_value']}"
+            else:
+                schedule_text = f"every {routine['schedule_value']}h"
             last_run = routine["last_run_at"] or "never"
             prompt_preview = routine["prompt"][:60] + ("…" if len(routine["prompt"]) > 60 else "")
 
@@ -1679,6 +1681,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         content.pack_start(Gtk.Label(label="Schedule", xalign=0), False, False, 0)
         schedule_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         kind_combo = Gtk.ComboBoxText()
+        kind_combo.append("once", "Once at")
         kind_combo.append("daily", "Daily at")
         kind_combo.append("hourly", "Every N hours")
         kind_combo.set_active_id("daily")
@@ -1690,15 +1693,24 @@ class LiamWindow(Gtk.ApplicationWindow):
         time_entry.set_width_chars(6)
         schedule_row.pack_start(time_entry, False, False, 0)
 
+        once_entry = Gtk.Entry()
+        once_entry.set_text(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 3600)))
+        once_entry.set_placeholder_text("YYYY-MM-DD HH:MM:SS")
+        once_entry.set_width_chars(19)
+        once_entry.set_visible(False)
+        schedule_row.pack_start(once_entry, False, False, 0)
+
         hours_spin = Gtk.SpinButton.new_with_range(1, 24, 1)
         hours_spin.set_value(4)
         hours_spin.set_visible(False)
         schedule_row.pack_start(hours_spin, False, False, 0)
 
         def on_kind_changed(_combo):
-            is_daily = kind_combo.get_active_id() == "daily"
+            kind = kind_combo.get_active_id()
+            is_daily = kind == "daily"
             time_entry.set_visible(is_daily)
-            hours_spin.set_visible(not is_daily)
+            once_entry.set_visible(kind == "once")
+            hours_spin.set_visible(kind == "hourly")
 
         kind_combo.connect("changed", on_kind_changed)
         content.pack_start(schedule_row, False, False, 0)
@@ -1708,10 +1720,12 @@ class LiamWindow(Gtk.ApplicationWindow):
                 start, end = prompt_buffer.get_bounds()
                 prompt = prompt_buffer.get_text(start, end, False).strip()
                 schedule_kind = kind_combo.get_active_id()
-                schedule_value = (
-                    time_entry.get_text().strip() if schedule_kind == "daily"
-                    else str(int(hours_spin.get_value()))
-                )
+                if schedule_kind == "once":
+                    schedule_value = once_entry.get_text().strip()
+                elif schedule_kind == "daily":
+                    schedule_value = time_entry.get_text().strip()
+                else:
+                    schedule_value = str(int(hours_spin.get_value()))
                 if prompt:
                     routines.create_routine(int(thread_combo.get_active_id()), prompt, schedule_kind, schedule_value)
                     self._refresh_routines_list(routines_list)
@@ -1719,7 +1733,7 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         dialog.connect("response", on_response)
         dialog.show_all()
-        hours_spin.set_visible(kind_combo.get_active_id() != "daily")
+        on_kind_changed(kind_combo)
 
     # --- artifacts ---
 

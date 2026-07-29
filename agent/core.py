@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+from datetime import datetime, timedelta
 
 from .llm import OllamaClient, DEFAULT_MODEL
 from .tools import TOOL_SCHEMAS, TOOL_IMPL, DANGEROUS_TOOLS, GENERATED_DIR, _resolve
@@ -37,7 +38,7 @@ will append the real learning status. This is different from
 remember/notes: notes are facts about the user, while lessons are
 corrections to your own behavior.
 
-You can also schedule real, recurring tasks with schedule_routine — a
+You can also schedule real one-time or recurring tasks with schedule_routine — a
 genuine systemd timer that runs a prompt again later, whether or not this
 app is even open. Use it whenever the user asks for something on a
 recurring basis ("every morning at 8", "every 4 hours", "daily at 8:05pm",
@@ -232,6 +233,36 @@ MODEL_LEARNING_NOTICE_RE = re.compile(
     r"\s*\[\s*(?:i\s+)?(?:queued|learned|reinforced|quarantined)\b"
     r"[^\]]{0,400}\blesson\b[^\]]*\]\s*",
     re.IGNORECASE | re.DOTALL,
+)
+
+SCHEDULE_REQUEST_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?(?:please\s+)?(?:"
+    r"(?:(?:can|could|would|will)\s+you\s+)|"
+    r"(?:i(?:'d|\s+would)?\s+like\s+(?:you\s+)?to\s+)|"
+    r"(?:i\s+want\s+(?:you\s+)?to\s+)"
+    r")?(?:schedule\b|create\b.{0,40}\broutine\b|set\s+up\b.{0,40}\b(?:routine|reminder)\b|"
+    r"remind\s+me\b|notify\s+me\b|message\s+me\b|"
+    r"send\s+me\b.{0,80}\b(?:message|notification|reminder)\b|"
+    r"every\s+(?:day|morning|afternoon|evening|night|\d+\s+hours?)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+EVERY_HOURS_RE = re.compile(r"\bevery\s+(\d{1,3})\s+hours?\b", re.IGNORECASE)
+RELATIVE_SCHEDULE_RE = re.compile(
+    r"\bin\s+(\d{1,4})\s+(minutes?|hours?)\b", re.IGNORECASE,
+)
+SCHEDULE_TIME_RE = re.compile(
+    r"\b(?:at\s+)?(?P<hour>1[0-2]|0?[1-9])"
+    r"(?::(?P<minute>[0-5]\d))?\s*(?P<ampm>a(?:\.?m\.?)?|p(?:\.?m\.?)?)\b",
+    re.IGNORECASE,
+)
+SCHEDULE_24H_TIME_RE = re.compile(
+    r"\bat\s+(?P<hour>[01]?\d|2[0-3]):(?P<minute>[0-5]\d)\b",
+    re.IGNORECASE,
+)
+SCHEDULE_CLAIM_RE = re.compile(
+    r"\bi(?:'ve|\s+have)?\s+(?:now\s+|successfully\s+)?scheduled\b|"
+    r"\b(?:the\s+)?routine\s+(?:is|has\s+been)\s+scheduled\b",
+    re.IGNORECASE,
 )
 
 FEEDBACK_GATE_RE = re.compile(
@@ -463,6 +494,15 @@ class Agent:
                 f"a question about past actions, or a complaint containing the word '{name}'."
             )
 
+        if name == "schedule_routine" and not self._parse_schedule_request(
+            getattr(self, "_current_user_input", "")
+        ):
+            return (
+                "Error: the current user message does not contain a complete, explicit schedule "
+                "request with a deterministically recognizable time. Do not infer a schedule "
+                "from quoted history or claim one was created."
+            )
+
         if name == "edit_file":
             # Proven live, repeatedly (not theoretical): without this gate,
             # the model guesses old_string from memory instead of the
@@ -583,6 +623,8 @@ class Agent:
             status, reason = "failure", "unavailable_tool"
         elif "current user message does not explicitly request" in lower:
             status, reason = "failure", "note_action_without_current_intent"
+        elif "does not contain a complete, explicit schedule request" in lower:
+            status, reason = "failure", "schedule_without_current_intent"
         elif lower.startswith("error:") or lower.startswith("failed to"):
             status, reason = "failure", "tool_error"
         elif (
@@ -639,6 +681,85 @@ class Agent:
     @staticmethod
     def _is_direct_note_recall_request(user_input):
         return bool(NOTE_RECALL_REQUEST_RE.search(user_input or ""))
+
+    @staticmethod
+    def _parse_schedule_request(user_input, now=None):
+        """Parse schedule shapes whose timing is deterministic.
+
+        The original natural-language request is retained inside an
+        execution wrapper. Scheduled runs do not receive schedule tools,
+        so the model performs the requested action instead of recursively
+        scheduling another copy of the same routine.
+        """
+        user_input = (user_input or "").strip()
+        if not SCHEDULE_REQUEST_RE.search(user_input):
+            return None
+        now = now or datetime.now().astimezone()
+        prompt = (
+            "This is the scheduled execution time. Do not discuss scheduling and do not "
+            "create another routine. Perform the requested action now and return only the "
+            f"message or result the user should receive. Original request:\n{user_input}"
+        )
+
+        hourly = EVERY_HOURS_RE.search(user_input)
+        if hourly:
+            hours = int(hourly.group(1))
+            if 1 <= hours <= 168:
+                return {
+                    "prompt": prompt,
+                    "schedule_kind": "hourly",
+                    "schedule_value": str(hours),
+                }
+            return None
+
+        relative = RELATIVE_SCHEDULE_RE.search(user_input)
+        if relative:
+            amount = int(relative.group(1))
+            if amount < 1:
+                return None
+            unit = relative.group(2).lower()
+            delay = timedelta(hours=amount) if unit.startswith("hour") else timedelta(minutes=amount)
+            run_at = (now + delay).replace(second=0, microsecond=0)
+            return {
+                "prompt": prompt,
+                "schedule_kind": "once",
+                "schedule_value": run_at.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        time_match = SCHEDULE_TIME_RE.search(user_input)
+        if time_match:
+            hour = int(time_match.group("hour"))
+            minute = int(time_match.group("minute") or 0)
+            if time_match.group("ampm").lower().startswith("p") and hour != 12:
+                hour += 12
+            elif time_match.group("ampm").lower().startswith("a") and hour == 12:
+                hour = 0
+        else:
+            time_match = SCHEDULE_24H_TIME_RE.search(user_input)
+            if not time_match:
+                return None
+            hour = int(time_match.group("hour"))
+            minute = int(time_match.group("minute"))
+
+        if re.search(
+            r"\b(?:daily|every\s+(?:day|morning|afternoon|evening|night)|each\s+day)\b",
+            user_input, re.IGNORECASE,
+        ):
+            return {
+                "prompt": prompt,
+                "schedule_kind": "daily",
+                "schedule_value": f"{hour:02d}:{minute:02d}",
+            }
+
+        days = 1 if re.search(r"\btomorrow\b", user_input, re.IGNORECASE) else 0
+        run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=days)
+        if days == 0 and run_at <= now:
+            run_at += timedelta(days=1)
+        return {
+            "prompt": prompt,
+            "schedule_kind": "once",
+            "schedule_value": run_at.strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
     def _auto_follow_search_links(self, tool_results, max_links=2):
         """Search results are links and snippets, not answers. A person
@@ -972,6 +1093,16 @@ class Agent:
                 "Never claim that a saved note was added or deleted unless the corresponding memory tool succeeded during the current turn.",
                 "tool", None,
             ),
+            "schedule_without_current_intent": (
+                "schedule routine,current request,time",
+                "Only create a routine for a complete scheduling request in the current user message; never infer one from quoted history or an unrelated discussion.",
+                "tool", "schedule_routine",
+            ),
+            "schedule_claim_without_tool": (
+                "schedule routine,timer,scheduled claim",
+                "Never claim a routine was scheduled unless schedule_routine succeeded and returned a real routine id during the current turn.",
+                "tool", "schedule_routine",
+            ),
         }
         for event in self._tool_events:
             if event.get("reason") not in fixed:
@@ -1286,6 +1417,22 @@ class Agent:
             return content
         return f"{content.rstrip()}\n\n[Note: {'; '.join(notices)}.]"
 
+    def _note_unperformed_schedule(self, content, tool_results):
+        scheduled = any(
+            name == "schedule_routine" and result.startswith("Scheduled routine #")
+            for name, result in tool_results
+        )
+        if not SCHEDULE_CLAIM_RE.search(content or "") or scheduled:
+            return content
+        self._record_intervention(
+            "schedule_claim_without_tool", "schedule_routine",
+            "The model claimed a routine was scheduled, but no schedule_routine call succeeded this turn.",
+        )
+        return (
+            f"{content.rstrip()}\n\n[Note: no schedule_routine call successfully created a "
+            "timer this turn; any scheduling claim above is false.]"
+        )
+
     def _force_compile_retry(self, name, args, result):
         """The deterministic half of "break the task into smaller
         deterministic steps": a compiler's exit code is unambiguous, so
@@ -1521,6 +1668,15 @@ class Agent:
 
         tool_results = []
 
+        schedule_args = self._parse_schedule_request(user_input)
+        if schedule_args is not None and "schedule_routine" in available_tools:
+            self.on_tool_call("schedule_routine", schedule_args)
+            result = self._execute_tool("schedule_routine", schedule_args)
+            tool_results.append(("schedule_routine", result))
+            content = self._finalize_learning(result, feedback_notice)
+            memory.save_message("assistant", content, session_id=self.session_id)
+            return content
+
         if self._is_direct_note_recall_request(user_input) and "recall_notes" in available_tools:
             args = {}
             self.on_tool_call("recall_notes", args)
@@ -1585,6 +1741,7 @@ class Agent:
                 content = self._note_missing_generated_image(content, tool_results)
                 content = self._note_shell_failures(content, tool_results)
                 content = self._note_unperformed_memory_actions(content, tool_results)
+                content = self._note_unperformed_schedule(content, tool_results)
                 content = self._finalize_learning(content, feedback_notice)
                 memory.save_message("assistant", content, session_id=self.session_id)
                 if not any(name == "write_file" for name, _ in tool_results):
@@ -1663,6 +1820,7 @@ class Agent:
         content = self._note_missing_generated_image(content, tool_results)
         content = self._note_shell_failures(content, tool_results)
         content = self._note_unperformed_memory_actions(content, tool_results)
+        content = self._note_unperformed_schedule(content, tool_results)
         content = self._finalize_learning(content, feedback_notice)
         memory.save_message("assistant", content, session_id=self.session_id)
         if not any(name == "write_file" for name, _ in tool_results):

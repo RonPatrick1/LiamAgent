@@ -33,7 +33,7 @@ _load_dotenv()
 from agent import memory, routines, settings as liam_settings
 from agent.core import Agent
 from agent.llm import DEFAULT_MODEL
-from agent.tools import TOOL_SCHEMAS
+from agent.tools import TOOL_IMPL, TOOL_SCHEMAS
 
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".liam_history")
 
@@ -62,8 +62,8 @@ def _run_routine(routine_id):
     """Headless execution path for a scheduled routine — invoked by its
     systemd --user timer, not interactively. Runs the routine's prompt
     against its thread exactly like a normal launch would (same folder,
-    extra folders, custom instructions), then notifies via notify-send
-    since nothing is watching a terminal at 3am."""
+    extra folders, custom instructions), then queues encrypted delivery
+    for a Matrix thread or uses notify-send for a desktop thread."""
     routine = routines.get_routine(routine_id)
     if routine is None:
         print(f"[routine] no such routine: {routine_id}")
@@ -74,26 +74,46 @@ def _run_routine(routine_id):
         print(f"[routine] routine {routine_id}'s thread no longer exists")
         return
 
+    folder_path = session.get("folder_path") or ""
+    matrix_prefix = "/matrix-room/"
+    is_matrix = folder_path.startswith(matrix_prefix)
+    workdir = (
+        os.path.expanduser(os.environ.get("LIAM_MESSENGER_WORKDIR", "~/liam-messenger"))
+        if is_matrix else folder_path
+    )
+    os.makedirs(workdir, exist_ok=True)
+
     saved = liam_settings.load()
     extra_folders = [f["folder_path"] for f in memory.list_session_folders(session["id"])]
+    routine_allowed_tools = set(TOOL_IMPL) - {
+        "schedule_routine", "cancel_routine", "list_my_routines",
+    }
     agent = Agent(
         model=saved["model"] or DEFAULT_MODEL, auto_confirm=True,
-        workdir=session["folder_path"], session_id=session["id"],
+        workdir=workdir, session_id=session["id"],
         extra_folders=extra_folders, custom_instructions=saved["custom_instructions"],
         channel="routine", actor_id="system-routine", is_owner=True,
-        learning_enabled=False,
+        learning_enabled=False, allowed_tools=routine_allowed_tools,
     )
     reply = agent.step(routine["prompt"])
-    routines.mark_ran(routine_id)
 
-    summary = reply.strip().splitlines()[0][:200] if reply.strip() else "(no reply)"
-    try:
-        subprocess.run(
-            ["notify-send", f"Liam routine: {session['title']}", summary],
-            capture_output=True, timeout=5,
-        )
-    except Exception as exc:
-        print(f"[routine] notify-send failed: {exc}")
+    if is_matrix:
+        room_id = folder_path[len(matrix_prefix):]
+        delivery_id = routines.enqueue_matrix_delivery(routine_id, room_id, reply)
+        print(f"[routine] queued Matrix delivery #{delivery_id} for {room_id}")
+    else:
+        summary = reply.strip().splitlines()[0][:200] if reply.strip() else "(no reply)"
+        try:
+            subprocess.run(
+                ["notify-send", f"Liam routine: {session['title']}", summary],
+                capture_output=True, timeout=5,
+            )
+        except Exception as exc:
+            print(f"[routine] notify-send failed: {exc}")
+
+    routines.mark_ran(routine_id)
+    if routine["schedule_kind"] == "once":
+        routines.set_enabled(routine_id, False)
 
 
 def main():

@@ -1,6 +1,8 @@
 import json
 import unittest
+from datetime import datetime
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from agent import core, memory
 
@@ -273,6 +275,76 @@ class MemoryTruthTests(unittest.TestCase):
         self.assertEqual(reply, "#15: Update FredPlayer")
         agent._execute_tool.assert_called_once_with("recall_notes", {})
         self.assertEqual(agent.client.calls, 0)
+
+
+class RoutineRoutingTests(unittest.TestCase):
+    NOW = datetime(2026, 7, 24, 9, 24, tzinfo=ZoneInfo("America/Detroit"))
+
+    def test_original_failed_matrix_request_parses_as_one_time_schedule(self):
+        parsed = core.Agent._parse_schedule_request(
+            "can you schedule a test routine to run at 9:25a today (in a few minutes) "
+            "to say how handsome Ron is in this chat?",
+            now=self.NOW,
+        )
+
+        self.assertEqual(parsed["schedule_kind"], "once")
+        self.assertEqual(parsed["schedule_value"], "2026-07-24 09:25:00")
+        self.assertIn("Original request:", parsed["prompt"])
+
+    def test_daily_and_hourly_schedules_parse_deterministically(self):
+        daily = core.Agent._parse_schedule_request(
+            "Remind me every day at 8:05pm to check the porch.", now=self.NOW,
+        )
+        hourly = core.Agent._parse_schedule_request(
+            "Schedule a routine every 4 hours to check the server.", now=self.NOW,
+        )
+
+        self.assertEqual(
+            (daily["schedule_kind"], daily["schedule_value"]), ("daily", "20:05")
+        )
+        self.assertEqual(
+            (hourly["schedule_kind"], hourly["schedule_value"]), ("hourly", "4")
+        )
+
+    def test_schedule_complaint_or_quote_is_not_a_new_schedule(self):
+        self.assertIsNone(core.Agent._parse_schedule_request(
+            "Why didn't this work? Earlier I said: schedule it at 9:25 today.",
+            now=self.NOW,
+        ))
+        self.assertIsNone(core.Agent._parse_schedule_request(
+            "Can you tell me what the weather will be at 8pm?", now=self.NOW,
+        ))
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_explicit_schedule_bypasses_chat_model(self, _match, _save_message):
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "schedule_routine"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value=(
+            "Scheduled routine #8: test — runs once at 2026-07-29 11:00:00, in this thread."
+        ))
+
+        reply = agent.step("Schedule a test routine at 11:00am today to say hello.")
+
+        self.assertTrue(reply.startswith("Scheduled routine #8:"))
+        self.assertEqual(agent._execute_tool.call_args.args[0], "schedule_routine")
+        self.assertEqual(agent.client.calls, 0)
+
+    def test_false_scheduled_claim_is_corrected_and_recorded(self):
+        agent = bare_agent()
+        agent._record_intervention = mock.Mock()
+
+        reply = agent._note_unperformed_schedule(
+            "I've scheduled the routine for 9:25 AM.", []
+        )
+
+        self.assertIn("any scheduling claim above is false", reply)
+        agent._record_intervention.assert_called_once()
 
 
 class AutomaticLessonTests(unittest.TestCase):

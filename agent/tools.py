@@ -836,14 +836,25 @@ def fredplayer_propose_playlist(playlist_name, tracks=None, artist=None, session
 def schedule_routine(prompt, schedule_kind, schedule_value, session_id=None):
     """Create a real scheduled routine tied to this thread — a systemd
     --user timer that runs `prompt` against this same thread at the given
-    time, whether or not Liam is even open. schedule_kind is 'daily'
-    (schedule_value = 'HH:MM', 24-hour) or 'hourly' (schedule_value = the
+    time, whether or not Liam is even open. schedule_kind is 'once'
+    (schedule_value = local 'YYYY-MM-DD HH:MM:SS'), 'daily'
+    (schedule_value = 'HH:MM', 24-hour), or 'hourly' (schedule_value = the
     N in 'every N hours')."""
-    if schedule_kind not in ("daily", "hourly"):
-        return "schedule_kind must be 'daily' or 'hourly'."
-    routine_id = routines.create_routine(session_id, prompt, schedule_kind, schedule_value)
-    when = f"daily at {schedule_value}" if schedule_kind == "daily" else f"every {schedule_value} hour(s)"
-    return f'Scheduled routine #{routine_id}: "{prompt}" — runs {when}, in this thread.'
+    if schedule_kind not in ("once", "daily", "hourly"):
+        return "schedule_kind must be 'once', 'daily', or 'hourly'."
+    try:
+        routine_id = routines.create_routine(
+            session_id, prompt, schedule_kind, schedule_value,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return f"Failed to schedule routine: {exc}"
+    if schedule_kind == "once":
+        when = f"once at {schedule_value}"
+    elif schedule_kind == "daily":
+        when = f"daily at {schedule_value}"
+    else:
+        when = f"every {schedule_value} hour(s)"
+    return f"Scheduled routine #{routine_id} — runs {when}, in this thread."
 
 
 def list_my_routines(session_id=None):
@@ -855,7 +866,12 @@ def list_my_routines(session_id=None):
         return "No routines scheduled in this thread."
     lines = []
     for r in mine:
-        when = f"daily at {r['schedule_value']}" if r["schedule_kind"] == "daily" else f"every {r['schedule_value']}h"
+        if r["schedule_kind"] == "once":
+            when = f"once at {r['schedule_value']}"
+        elif r["schedule_kind"] == "daily":
+            when = f"daily at {r['schedule_value']}"
+        else:
+            when = f"every {r['schedule_value']}h"
         status = "enabled" if r["enabled"] else "disabled"
         lines.append(f"#{r['id']}: \"{r['prompt']}\" — {when}, {status}, last ran {r['last_run_at'] or 'never'}")
     return "\n".join(lines)
@@ -1461,8 +1477,8 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "schedule_routine",
             "description": (
-                "Schedule a prompt to run automatically and repeatedly in "
-                "this thread, at a given time — a real systemd timer, not "
+                "Schedule a prompt to run automatically once or repeatedly "
+                "in this thread at a given time — a real systemd timer, not "
                 "just a note, so it actually fires later even if Liam "
                 "isn't open. Use this whenever the user asks you to do "
                 "something 'every day at HH', 'every morning', 'every N "
@@ -1474,8 +1490,8 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "The exact prompt to run each time, as if the user typed it."},
-                    "schedule_kind": {"type": "string", "enum": ["daily", "hourly"], "description": "'daily' for a specific time each day, 'hourly' for every N hours."},
-                    "schedule_value": {"type": "string", "description": "For 'daily': 24-hour 'HH:MM' (e.g. '20:05' for 8:05pm). For 'hourly': the N in 'every N hours' (e.g. '4')."},
+                    "schedule_kind": {"type": "string", "enum": ["once", "daily", "hourly"], "description": "'once' for one future local date/time, 'daily' for a specific time each day, or 'hourly' for every N hours."},
+                    "schedule_value": {"type": "string", "description": "For 'once': local 'YYYY-MM-DD HH:MM:SS'. For 'daily': 24-hour 'HH:MM'. For 'hourly': the N in 'every N hours'."},
                 },
                 "required": ["prompt", "schedule_kind", "schedule_value"],
             },

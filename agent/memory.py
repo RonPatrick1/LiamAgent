@@ -127,6 +127,24 @@ def _ensure_schema(conn):
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS routine_deliveries (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                routine_id INT NOT NULL,
+                room_id VARCHAR(512) NOT NULL,
+                content MEDIUMTEXT NOT NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                attempts INT NOT NULL DEFAULT 0,
+                last_error TEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                claimed_at TIMESTAMP NULL,
+                delivered_at TIMESTAMP NULL,
+                INDEX routine_delivery_status_created (status, created_at),
+                INDEX routine_delivery_routine (routine_id)
+            )
+            """
+        )
         # Renamed from "gotchas" -- same table, just a less silly name. Only
         # rename if a fresh "lessons" table doesn't already exist (upgrade
         # path); a brand-new install just gets "lessons" directly below.
