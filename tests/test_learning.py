@@ -465,6 +465,21 @@ class RoutineRoutingTests(unittest.TestCase):
             "Tell me why that job runs every 5 minutes.", now=self.NOW,
         ))
 
+    def test_natural_cancel_request_extracts_description_or_id(self):
+        self.assertEqual(
+            core._parse_cancel_routine_target(
+                "liam: stop telling me I'm handsome every 5 minutes"
+            ),
+            {"query": "telling me I'm handsome every 5 minutes"},
+        )
+        self.assertEqual(
+            core._parse_cancel_routine_target("cancel routine #5"),
+            {"routine_id": 5},
+        )
+        self.assertIsNone(core._parse_cancel_routine_target(
+            "delete the file named routine.txt"
+        ))
+
     @mock.patch.object(core.memory, "save_message")
     @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
     def test_explicit_schedule_bypasses_chat_model(self, _match, _save_message):
@@ -508,6 +523,73 @@ class RoutineRoutingTests(unittest.TestCase):
         self.assertEqual((args["schedule_kind"], args["schedule_value"]), ("minutely", "5"))
         self.assertEqual(agent.client.calls, 0)
 
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.routines, "list_routines")
+    def test_natural_cancellation_resolves_and_calls_exact_routine(
+        self, list_routines, _match, _save_message,
+    ):
+        list_routines.return_value = [{
+            "id": 5,
+            "session_id": 17,
+            "enabled": True,
+            "schedule_kind": "minutely",
+            "schedule_value": "5",
+            "prompt": (
+                "This is the scheduled execution time. Original request:\n"
+                "tell me I'm handsome every 5 minutes"
+            ),
+        }]
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "cancel_routine"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="Cancelled routine #5.")
+
+        reply = agent.step("liam: stop telling me I'm handsome every 5 minutes")
+
+        self.assertEqual(reply, "Cancelled routine #5.")
+        agent._execute_tool.assert_called_once_with("cancel_routine", {"routine_id": 5})
+        self.assertEqual(agent.client.calls, 0)
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.routines, "list_routines")
+    def test_ambiguous_cancellation_lists_routines_and_cancels_none(
+        self, list_routines, _match, _save_message,
+    ):
+        list_routines.return_value = [
+            {
+                "id": 5, "session_id": 17, "enabled": True,
+                "schedule_kind": "minutely", "schedule_value": "5",
+                "prompt": "tell me I'm handsome every 5 minutes",
+            },
+            {
+                "id": 6, "session_id": 17, "enabled": True,
+                "schedule_kind": "minutely", "schedule_value": "5",
+                "prompt": "tell me the server status every 5 minutes",
+            },
+        ]
+        agent = bare_agent(payload=RuntimeError("chat model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "cancel_routine"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock()
+
+        reply = agent.step("Cancel the routine every 5 minutes")
+
+        self.assertIn("cancelled none", reply)
+        self.assertIn("#5", reply)
+        self.assertIn("#6", reply)
+        agent._execute_tool.assert_not_called()
+        self.assertEqual(agent.client.calls, 0)
+
     def test_false_scheduled_claim_is_corrected_and_recorded(self):
         agent = bare_agent()
         agent._record_intervention = mock.Mock()
@@ -538,6 +620,22 @@ class RoutineRoutingTests(unittest.TestCase):
         self.assertNotIn("[Note:", result)
         self.assertNotIn("I've scheduled", result)
         self.assertIn("Nothing has been scheduled", result)
+
+    def test_false_cancellation_claim_is_replaced_and_recorded(self):
+        agent = bare_agent()
+        agent._record_intervention = mock.Mock()
+
+        reply = agent._note_unperformed_cancellation(
+            "I have canceled the routine that told you you're handsome.", []
+        )
+
+        self.assertNotIn("I have canceled", reply)
+        self.assertIn("no scheduled timer was removed", reply)
+        self.assertIn("still be active", reply)
+        agent._record_intervention.assert_called_once_with(
+            "cancel_claim_without_tool", "cancel_routine",
+            "The model claimed a routine was cancelled, but no cancel_routine call succeeded this turn.",
+        )
 
 
 class AutomaticLessonTests(unittest.TestCase):

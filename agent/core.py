@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 from .llm import OllamaClient, DEFAULT_MODEL
 from .tools import TOOL_SCHEMAS, TOOL_IMPL, DANGEROUS_TOOLS, GENERATED_DIR, _resolve
-from . import memory
+from . import memory, routines
 
 SYSTEM_PROMPT = """You are Liam, a local autonomous agent running on the \
 Mistral Small 3.2 (24B) model via Ollama, operating through a command-line \
@@ -291,6 +291,29 @@ SCHEDULE_CLAIM_RE = re.compile(
     r"\b(?:the\s+)?routine\s+(?:is|has\s+been)\s+scheduled\b",
     re.IGNORECASE,
 )
+CANCEL_ROUTINE_REQUEST_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?(?:please\s+)?(?:"
+    r"stop\b(?=.{0,180}\b(?:routine|reminder|schedule|telling|sending|messaging|"
+    r"notifying|every\s+\d+\s+(?:minutes?|mins?|hours?))\b)|"
+    r"(?:cancel|disable|turn\s+off)\b(?=.{0,180}\b(?:routine|reminder|schedule|"
+    r"every\s+\d+\s+(?:minutes?|mins?|hours?))\b)|"
+    r"(?:delete|remove)\s+(?:(?:the|that|this|my)\s+)?"
+    r"(?:recurring\s+|scheduled\s+)?(?:routine|reminder|schedule)\b|"
+    r"(?:do\s+not|don'?t)\s+(?:keep\s+)?(?:tell|send|message|notify)\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+CANCEL_ROUTINE_ID_RE = re.compile(
+    r"\b(?:routine|reminder|schedule)\s*#?\s*(\d+)\b", re.IGNORECASE,
+)
+CANCEL_ROUTINE_CLAIM_RE = re.compile(
+    r"\bi(?:'ve|\s+have)?\s+(?:now\s+|successfully\s+)?"
+    r"(?:cancelled|canceled|stopped|disabled|removed|deleted)\b.{0,120}"
+    r"\b(?:routine|reminder|schedule)\b|"
+    r"\b(?:the|that|this)\s+(?:routine|reminder|schedule)\s+"
+    r"(?:has\s+been|is)\s+(?:cancelled|canceled|stopped|disabled|removed|deleted)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 FEEDBACK_GATE_RE = re.compile(
     r"\b(wrong|incorrect|mistake|actually|instead|next time|should(?:'ve| have)|"
@@ -458,6 +481,58 @@ def _rank_note_matches(query, records):
         ):
             return top["record"], []
     return None, [item["record"] for item in plausible[:5]]
+
+
+def _parse_cancel_routine_target(user_input):
+    """Extract an exact routine id or a short description to resolve safely."""
+    user_input = (user_input or "").strip()
+    request = CANCEL_ROUTINE_REQUEST_RE.search(user_input)
+    if request is None:
+        return None
+    routine_id = CANCEL_ROUTINE_ID_RE.search(user_input)
+    if routine_id:
+        return {"routine_id": int(routine_id.group(1))}
+    query = user_input[request.end():].strip().strip(":,-")
+    query = re.sub(
+        r"^(?:(?:the|that|this|my)\s+)?(?:recurring\s+|scheduled\s+)?"
+        r"(?:routine|reminder|schedule|task)\s*(?:that|which|to)?\s*",
+        "", query, flags=re.IGNORECASE,
+    ).strip()
+    return {"query": query}
+
+
+def _routine_request_text(routine):
+    prompt = str(routine.get("prompt") or "")
+    marker = "Original request:\n"
+    return prompt.split(marker, 1)[1].strip() if marker in prompt else prompt.strip()
+
+
+def _routine_schedule_text(routine):
+    kind = routine.get("schedule_kind")
+    value = routine.get("schedule_value")
+    if kind == "once":
+        return f"once at {value}"
+    if kind == "daily":
+        return f"daily at {value}"
+    if kind == "minutely":
+        return f"every {value} minutes"
+    return f"every {value} hours"
+
+
+def _rank_routine_matches(query, records):
+    projected = [
+        {
+            "id": routine["id"],
+            "content": f"{_routine_request_text(routine)} {_routine_schedule_text(routine)}",
+            "routine": routine,
+        }
+        for routine in records or []
+    ]
+    matched, choices = _rank_note_matches(query, projected)
+    return (
+        matched["routine"] if matched else None,
+        [choice["routine"] for choice in choices],
+    )
 
 
 class Agent:
@@ -648,6 +723,15 @@ class Agent:
                 "from quoted history or claim one was created."
             )
 
+        if name == "cancel_routine" and _parse_cancel_routine_target(
+            getattr(self, "_current_user_input", "")
+        ) is None:
+            return (
+                "Error: the current user message does not explicitly request cancellation "
+                "of a scheduled routine. Do not infer cancellation from quoted history or "
+                "claim that a routine was removed."
+            )
+
         if name == "edit_file":
             # Proven live, repeatedly (not theoretical): without this gate,
             # the model guesses old_string from memory instead of the
@@ -770,6 +854,8 @@ class Agent:
             status, reason = "failure", "unknown_tool"
         elif "isn't available in this conversation" in lower:
             status, reason = "failure", "unavailable_tool"
+        elif "does not explicitly request cancellation" in lower:
+            status, reason = "failure", "cancel_without_current_intent"
         elif "current user message does not explicitly request" in lower:
             status, reason = "failure", "note_action_without_current_intent"
         elif "does not contain a complete, explicit schedule request" in lower:
@@ -1599,6 +1685,22 @@ class Agent:
             "Nothing has been scheduled."
         )
 
+    def _note_unperformed_cancellation(self, content, tool_results):
+        cancelled = any(
+            name == "cancel_routine" and result.startswith("Cancelled routine #")
+            for name, result in tool_results
+        )
+        if not CANCEL_ROUTINE_CLAIM_RE.search(content or "") or cancelled:
+            return content
+        self._record_intervention(
+            "cancel_claim_without_tool", "cancel_routine",
+            "The model claimed a routine was cancelled, but no cancel_routine call succeeded this turn.",
+        )
+        return (
+            "I couldn't cancel that routine because no scheduled timer was removed. "
+            "It may still be active."
+        )
+
     def _force_compile_retry(self, name, args, result):
         """The deterministic half of "break the task into smaller
         deterministic steps": a compiler's exit code is unambiguous, so
@@ -1843,6 +1945,58 @@ class Agent:
             memory.save_message("assistant", content, session_id=self.session_id)
             return content
 
+        cancel_target = _parse_cancel_routine_target(user_input)
+        if cancel_target is not None and "cancel_routine" in available_tools:
+            args = None
+            if "routine_id" in cancel_target:
+                args = {"routine_id": cancel_target["routine_id"]}
+            else:
+                try:
+                    active = [
+                        routine for routine in routines.list_routines()
+                        if routine["session_id"] == self.session_id and routine["enabled"]
+                    ]
+                except Exception:
+                    active = None
+                if active is None:
+                    content = "I couldn't read the scheduled routines, so nothing was cancelled."
+                elif not active:
+                    content = "There are no active routines in this conversation to cancel."
+                else:
+                    query = cancel_target["query"]
+                    if not query and len(active) == 1:
+                        matched, choices = active[0], []
+                    elif query:
+                        matched, choices = _rank_routine_matches(query, active)
+                    else:
+                        matched, choices = None, active[:5]
+                    if matched is not None:
+                        args = {"routine_id": matched["id"]}
+                    elif choices:
+                        lines = [
+                            "I found multiple possible routines and cancelled none. "
+                            "Say “cancel routine #ID” for the one you mean:"
+                        ]
+                        lines.extend(
+                            f"- #{routine['id']}: {_note_preview(_routine_request_text(routine))} "
+                            f"({_routine_schedule_text(routine)})"
+                            for routine in choices
+                        )
+                        content = "\n".join(lines)
+                    else:
+                        content = (
+                            f"No active routine uniquely matched “{query}”. "
+                            "Nothing was cancelled."
+                        )
+            if args is not None:
+                self.on_tool_call("cancel_routine", args)
+                result = self._execute_tool("cancel_routine", args)
+                tool_results.append(("cancel_routine", result))
+                content = result
+            content = self._finalize_learning(content, feedback_notice)
+            memory.save_message("assistant", content, session_id=self.session_id)
+            return content
+
         remember_content = _parse_remember_content(user_input)
         if remember_content is not None and "remember" in available_tools:
             args = {"content": remember_content}
@@ -1957,6 +2111,7 @@ class Agent:
                 content = self._note_shell_failures(content, tool_results)
                 content = self._note_unperformed_memory_actions(content, tool_results)
                 content = self._note_unperformed_schedule(content, tool_results)
+                content = self._note_unperformed_cancellation(content, tool_results)
                 content = self._finalize_learning(content, feedback_notice)
                 memory.save_message("assistant", content, session_id=self.session_id)
                 if not any(name == "write_file" for name, _ in tool_results):
@@ -2036,6 +2191,7 @@ class Agent:
         content = self._note_shell_failures(content, tool_results)
         content = self._note_unperformed_memory_actions(content, tool_results)
         content = self._note_unperformed_schedule(content, tool_results)
+        content = self._note_unperformed_cancellation(content, tool_results)
         content = self._finalize_learning(content, feedback_notice)
         memory.save_message("assistant", content, session_id=self.session_id)
         if not any(name == "write_file" for name, _ in tool_results):
