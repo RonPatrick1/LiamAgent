@@ -248,6 +248,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         headerbar.pack_end(lessons_button)
 
         self.artifacts_toggle = Gtk.ToggleButton()
+        self.artifacts_toggle.get_style_context().add_class("liam-toggle")
         self.artifacts_toggle.set_image(
             Gtk.Image.new_from_icon_name("view-paged-symbolic", Gtk.IconSize.BUTTON)
         )
@@ -266,8 +267,8 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         # --- sidebar: one thread per folder, like Recents ---
         self.session_list = Gtk.ListBox()
-        self.session_list.get_style_context().add_class("liam-thread-list")
-        self._install_thread_list_css()
+        self.session_list.get_style_context().add_class("liam-select-list")
+        self._install_liam_css()
         self.session_list.connect("row-activated", self._on_row_activated)
         self.session_list.connect("button-press-event", self._on_session_list_button_press)
         session_scroller = Gtk.ScrolledWindow()
@@ -277,6 +278,7 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.external_sessions_toggle = Gtk.CheckButton(label="Show Matrix / FredPlayer")
+        self.external_sessions_toggle.get_style_context().add_class("liam-toggle")
         self.external_sessions_toggle.set_tooltip_text(
             "Show conversations created by Matrix and FredPlayer"
         )
@@ -384,6 +386,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.artifacts_box.pack_start(artifacts_label, False, False, 0)
 
         self.artifacts_list = Gtk.ListBox()
+        self.artifacts_list.get_style_context().add_class("liam-select-list")
         self.artifacts_list.connect("row-selected", self._on_artifact_selected)
         artifacts_list_scroller = Gtk.ScrolledWindow()
         artifacts_list_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -580,23 +583,41 @@ class LiamWindow(Gtk.ApplicationWindow):
 
     # --- session/thread management ---
 
-    def _install_thread_list_css(self):
+    def _install_liam_css(self):
         """Override the system theme's default accent color (Ubuntu's Yaru
         defaults it to orange/green — including text selection inside a
         plain GtkTextView) in favor of colors actually sampled from
         icons/liam.png — its glowing outline averages to #32a2e2, its
         dark metal head to #1c2c4a. Scoped to dedicated classes
-        (.liam-thread-list, .liam-accent-button, .liam-chat-view) rather
+        (.liam-select-list, .liam-toggle, .liam-accent-button,
+        .liam-chat-view) rather
         than overriding GTK's own "suggested-action"/selection styling
         globally, which would leak into every other GTK3 app's widgets in
         this session (add_provider_for_screen is X-session-wide, not
         limited to this process), not just Liam's."""
         provider = Gtk.CssProvider()
         provider.load_from_data(b"""
-            list.liam-thread-list row:selected {
+            list.liam-select-list row:selected {
                 background-color: rgba(70, 110, 150, 0.35);
                 background-image: none;
                 color: inherit;
+            }
+            switch.liam-toggle:checked {
+                background-color: #2f6f9e;
+                background-image: none;
+                border-color: #1c2c4a;
+            }
+            checkbutton.liam-toggle check:checked {
+                background-color: #2f6f9e;
+                background-image: none;
+                border-color: #1c2c4a;
+                color: #ffffff;
+            }
+            button.liam-toggle:checked {
+                background-color: #2f6f9e;
+                background-image: none;
+                border-color: #1c2c4a;
+                color: #ffffff;
             }
             textview.liam-chat-view text selection {
                 background-color: #2f6f9e;
@@ -1121,6 +1142,7 @@ class LiamWindow(Gtk.ApplicationWindow):
             True, True, 0,
         )
         auto_confirm_switch = Gtk.Switch()
+        auto_confirm_switch.get_style_context().add_class("liam-toggle")
         auto_confirm_switch.set_active(self.settings["auto_confirm"])
         auto_confirm_row.pack_start(auto_confirm_switch, False, False, 0)
         content.pack_start(auto_confirm_row, False, False, 0)
@@ -1211,6 +1233,7 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         lesson_list = Gtk.ListBox()
         lesson_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        lesson_list.get_style_context().add_class("liam-select-list")
         empty_label = Gtk.Label(label="No lessons in this view.")
         empty_label.get_style_context().add_class("dim-label")
         empty_label.set_margin_top(16)
@@ -1581,6 +1604,10 @@ class LiamWindow(Gtk.ApplicationWindow):
         content.set_spacing(8)
 
         routines_list = Gtk.ListBox()
+        # Each routine row contains its own controls and has no row-level
+        # action, so selecting the entire row is misleading.
+        routines_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        routines_list.get_style_context().add_class("liam-select-list")
         list_scroller = Gtk.ScrolledWindow()
         list_scroller.set_vexpand(True)
         list_scroller.add(routines_list)
@@ -1624,6 +1651,7 @@ class LiamWindow(Gtk.ApplicationWindow):
 
             controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             enabled_switch = Gtk.Switch()
+            enabled_switch.get_style_context().add_class("liam-toggle")
             enabled_switch.set_active(routine["enabled"])
             enabled_switch.connect(
                 "state-set",
