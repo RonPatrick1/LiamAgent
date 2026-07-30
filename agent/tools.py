@@ -19,6 +19,7 @@ BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY")
 COMFYUI_URL = "http://127.0.0.1:8188"
 SD_CHECKPOINT = os.environ.get("LIAM_SD_CHECKPOINT", "sd_xl_base_1.0.safetensors")
 GENERATED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".liam_generated")
+SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _resolve(path, base_dir=None):
@@ -292,6 +293,92 @@ def run_shell_command(command, base_dir=None, timeout=60):
         command, shell=True, capture_output=True, text=True, timeout=timeout,
         cwd=base_dir or None,
     )
+    output = result.stdout
+    if result.stderr:
+        output += f"\n[stderr]\n{result.stderr}"
+    output += f"\n[exit code: {result.returncode}]"
+    return output[:20_000]
+
+
+def _configured_ssh_hosts():
+    """Desktop SSH targets are explicit aliases, never arbitrary hosts."""
+    aliases = []
+    for alias in re.split(r"[\s,]+", os.environ.get("LIAM_SSH_HOSTS", "").strip()):
+        if alias and SSH_ALIAS_RE.fullmatch(alias) and alias not in aliases:
+            aliases.append(alias)
+    return aliases
+
+
+def _require_ssh_host(host):
+    host = (host or "").strip()
+    configured = _configured_ssh_hosts()
+    if host not in configured:
+        available = ", ".join(configured) or "(none configured)"
+        raise ValueError(
+            f"SSH host alias '{host}' is not allowed. Configured aliases: {available}."
+        )
+    return host
+
+
+def _ssh_base_command(host, connect_timeout=8):
+    return [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"ConnectTimeout={int(connect_timeout)}",
+        "-o", "LogLevel=ERROR",
+        host,
+    ]
+
+
+def ssh_list_hosts():
+    """List only aliases explicitly granted to Liam's desktop app."""
+    configured = _configured_ssh_hosts()
+    if not configured:
+        return (
+            "No SSH hosts are configured. Add comma-separated ~/.ssh/config aliases "
+            "to LIAM_SSH_HOSTS in LiamAgent's .env file."
+        )
+    lines = []
+    for alias in configured:
+        result = subprocess.run(
+            ["ssh", "-G", alias], capture_output=True, text=True, timeout=5,
+        )
+        resolved = {}
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition(" ")
+            if key in {"hostname", "user", "port"}:
+                resolved[key] = value
+        target = resolved.get("hostname", alias)
+        user = resolved.get("user", "?")
+        port = resolved.get("port", "22")
+        lines.append(f"{alias}: {user}@{target}:{port}")
+    return "Configured desktop SSH hosts:\n" + "\n".join(lines)
+
+
+def ssh_run_command(host, command, timeout=60):
+    """Run one non-interactive command through an allowlisted SSH alias."""
+    host = _require_ssh_host(host)
+    command = (command or "").strip()
+    if not command:
+        raise ValueError("command must be a non-empty string")
+    timeout = min(max(int(timeout), 1), 300)
+    try:
+        result = subprocess.run(
+            _ssh_base_command(host) + [command],
+            capture_output=True, text=True, timeout=timeout + 10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "")
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        return (
+            f"{output}\n[stderr]\nSSH command timed out after {timeout} seconds."
+            "\n[exit code: 124]"
+        )[:20_000]
     output = result.stdout
     if result.stderr:
         output += f"\n[stderr]\n{result.stderr}"
@@ -930,6 +1017,8 @@ TOOL_IMPL = {
     "git_blame": git_blame,
     "git_add": git_add,
     "run_shell_command": run_shell_command,
+    "ssh_list_hosts": ssh_list_hosts,
+    "ssh_run_command": ssh_run_command,
     "get_weather": get_weather,
     "web_search": web_search,
     "image_search": image_search,
@@ -949,6 +1038,10 @@ TOOL_IMPL = {
     "fredplayer_propose_playlist": fredplayer_propose_playlist,
 }
 
+# These tools are offered only by LiamGUI.py. Agent also enforces this at
+# execution time, so hiding a schema is not the sole security boundary.
+DESKTOP_ONLY_TOOLS = {"ssh_list_hosts", "ssh_run_command"}
+
 # Tools that mutate the filesystem, execute arbitrary commands, or delete
 # data require confirmation from the user before running (unless --yes is
 # passed). remember is excluded — inserting a note can't destroy anything,
@@ -966,7 +1059,7 @@ TOOL_IMPL = {
 DANGEROUS_TOOLS = {
     "write_file", "edit_file", "run_shell_command", "forget", "schedule_routine",
     "cancel_routine", "propose_lesson", "make_directory", "copy_path", "move_path",
-    "delete_path", "git_add",
+    "delete_path", "git_add", "ssh_run_command",
     # Mutates the FredPlayer server the same way write_file mutates the
     # filesystem — creates or overwrites a playlist file.
     "fredplayer_save_playlist",
@@ -1262,6 +1355,47 @@ TOOL_SCHEMAS = [
                     "command": {"type": "string", "description": "The shell command to execute."},
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ssh_list_hosts",
+            "description": (
+                "List the local-computer SSH aliases explicitly available to Liam from "
+                "the Ubuntu desktop app. Call this before choosing a remote computer; "
+                "never guess or invent a hostname."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ssh_run_command",
+            "description": (
+                "Run one non-interactive shell command on an allowlisted local computer "
+                "over key-based SSH. This is available only inside Liam's Ubuntu desktop "
+                "app; use ssh_list_hosts to get valid aliases first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "Exact alias returned by ssh_list_hosts.",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run on that remote computer.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Command timeout in seconds (default 60, maximum 300).",
+                    },
+                },
+                "required": ["host", "command"],
             },
         },
     },

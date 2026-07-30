@@ -49,9 +49,10 @@ def _make_prompt_fn():
     return lambda: input("You>\n")
 
 
-def _help_text():
+def _help_text(tool_schemas=None):
     lines = ["REPL commands:", "  help          Show this help message", "  exit, quit    Quit Liam", "", "Tools Liam can use (it decides on its own when to call these):"]
-    for schema in TOOL_SCHEMAS:
+    schemas = TOOL_SCHEMAS if tool_schemas is None else tool_schemas
+    for schema in schemas:
         fn = schema["function"]
         desc = fn["description"].split(".")[0] + "."
         lines.append(f"  {fn['name']:<16} {desc}")
@@ -167,7 +168,7 @@ def main():
             break
         if user_input.lower() == "help":
             print()
-            print(_help_text())
+            print(_help_text(agent.tool_schemas))
             print()
             continue
 

@@ -9,7 +9,10 @@ from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 
 from .llm import OllamaClient, DEFAULT_MODEL
-from .tools import TOOL_SCHEMAS, TOOL_IMPL, DANGEROUS_TOOLS, GENERATED_DIR, _resolve
+from .tools import (
+    TOOL_SCHEMAS, TOOL_IMPL, DANGEROUS_TOOLS, DESKTOP_ONLY_TOOLS,
+    GENERATED_DIR, _resolve,
+)
 from . import memory, routines
 
 SYSTEM_PROMPT = """You are Liam, a local autonomous agent running on the \
@@ -602,19 +605,19 @@ class Agent:
         self._current_user_input = ""
         self._tool_events = []
         self._lesson_uses = []
-        self.tool_schemas = (
-            [s for s in TOOL_SCHEMAS if s["function"]["name"] != "propose_lesson"]
-            if self.allowed_tools is None
-            else [
-                s for s in TOOL_SCHEMAS
-                if s["function"]["name"] in self.allowed_tools
-                and s["function"]["name"] != "propose_lesson"
-            ]
-        )
+        offered_tools = set(TOOL_IMPL) - {"propose_lesson"}
+        if self.allowed_tools is not None:
+            offered_tools &= self.allowed_tools
+        if self.channel != "gui":
+            offered_tools -= DESKTOP_ONLY_TOOLS
+        self.tool_schemas = [
+            schema for schema in TOOL_SCHEMAS
+            if schema["function"]["name"] in offered_tools
+        ]
         self.extra_folders = list(extra_folders or [])
         system_prompt = SYSTEM_PROMPT
-        if self.allowed_tools is not None:
-            disallowed = sorted(set(TOOL_IMPL) - self.allowed_tools)
+        if self.allowed_tools is not None or self.channel != "gui":
+            disallowed = sorted(set(TOOL_IMPL) - offered_tools)
             if disallowed:
                 # Proven necessary, not precautionary: tested against a
                 # restricted session with these tools simply absent from
@@ -681,6 +684,8 @@ class Agent:
     def _run_tool(self, name, args):
         if name not in TOOL_IMPL:
             return f"Error: unknown tool '{name}'. There is no such tool — the only tools that exist are: {', '.join(sorted(TOOL_IMPL))}."
+        if name in DESKTOP_ONLY_TOOLS and self.channel != "gui":
+            return f"Error: the '{name}' tool is available only in Liam's Ubuntu desktop app."
         if self.allowed_tools is not None and name not in self.allowed_tools:
             # Not just "don't advertise it" — actively refuse it too, in
             # case the model calls a tool it wasn't offered (hallucinated
@@ -819,7 +824,7 @@ class Agent:
             status, reason = "denied", "user_denied"
         elif any(marker in lower for marker in transient_markers):
             status, reason = "transient", "external_dependency"
-        elif name == "run_shell_command" or name.startswith("git_"):
+        elif name in {"run_shell_command", "ssh_run_command"} or name.startswith("git_"):
             match = re.search(r"\[exit code: (-?\d+)\]\s*$", result)
             if match and int(match.group(1)) != 0:
                 status, reason = "failure", "nonzero_exit"

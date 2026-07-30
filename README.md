@@ -61,6 +61,26 @@ Then open `.env` in an editor and paste your key after `BRAVE_API_KEY=`.
 the key never gets committed). If `BRAVE_API_KEY` isn't set, `web_search`
 reports that plainly instead of failing silently.
 
+## Desktop-only SSH
+
+The Ubuntu desktop app can run non-interactive commands on explicitly
+allowlisted SSH aliases. These tools are removed from the CLI, Patrick
+Messenger, FredPlayer, and scheduled routines at both schema and execution
+time.
+
+Configure each computer normally in `~/.ssh/config`, using an SSH key and
+`IdentityFile` (or `ssh-agent`), and connect manually once so its host key is
+present in `~/.ssh/known_hosts`. Then add only the aliases Liam may use:
+
+```dotenv
+LIAM_SSH_HOSTS=worklaptop,jetson,alien
+```
+
+Liam uses batch-mode public-key authentication, refuses unknown host keys,
+and rejects any host not in that list. Passwords in `.env` are intentionally
+unsupported: they would expose reusable login secrets to the long-running app
+and subprocess environment.
+
 ## Persistent memory
 
 Liam remembers past conversations across restarts via a MySQL table

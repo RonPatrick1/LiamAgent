@@ -29,7 +29,7 @@ from . import memory, routines
 from . import tools as tools_module
 from .core import Agent
 from .llm import DEFAULT_MODEL
-from .tools import TOOL_IMPL
+from .tools import DESKTOP_ONLY_TOOLS, TOOL_IMPL
 
 OWNER_MATRIX_ID = os.environ.get("LIAM_OWNER_MATRIX_ID", "")
 SHARED_NOTES_ROOM_ID = os.environ.get("LIAM_SHARED_NOTES_ROOM_ID", "")
@@ -56,7 +56,7 @@ RESTRICTED_TOOLS = {
     "make_directory", "copy_path", "move_path", "delete_path",
     "git_status", "git_diff", "git_log", "git_blame", "git_add",
 }
-SAFE_TOOLS = set(TOOL_IMPL) - RESTRICTED_TOOLS
+SAFE_TOOLS = set(TOOL_IMPL) - RESTRICTED_TOOLS - DESKTOP_ONLY_TOOLS
 
 
 def handle_chat(room_id, sender_id, message):
