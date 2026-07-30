@@ -134,6 +134,9 @@ MAX_TOTAL_CALLS = 15
 HISTORY_LIMIT = 20
 CHUNK_THRESHOLD = 8000
 CHUNK_SIZE = 2000
+MAX_TOOL_CONTEXT_CHARS = 7000
+CONTEXT_MESSAGE_CHAR_BUDGET = 60_000
+CONTEXT_RETRY_CHAR_BUDGET = 36_000
 
 # Matches how LiamGUI._insert_formatted recognizes fenced code blocks, so a
 # code artifact's label/content is derived the same way it's rendered.
@@ -661,6 +664,115 @@ class Agent:
         self.messages.extend(memory.load_recent_messages(HISTORY_LIMIT, session_id=self.session_id))
 
     @staticmethod
+    def _truncate_context_text(text, limit):
+        text = text or ""
+        if len(text) <= limit:
+            return text
+        notice = f"\n\n[... {len(text) - limit:,} characters omitted to keep Liam's context bounded ...]\n\n"
+        available = max(limit - len(notice), 0)
+        head = (available * 2) // 3
+        tail = available - head
+        return text[:head] + notice + (text[-tail:] if tail else "")
+
+    @staticmethod
+    def _message_context_size(message):
+        size = len(message.get("content") or "")
+        if message.get("tool_calls"):
+            size += len(json.dumps(message["tool_calls"], ensure_ascii=False))
+        # Base64 length is not a useful estimate of vision-token use.
+        size += 4000 * len(message.get("images") or [])
+        return size
+
+    def _prepare_context_messages(self, messages, budget=CONTEXT_MESSAGE_CHAR_BUDGET):
+        """Build a bounded request copy without changing live history."""
+        prepared = []
+        for index, original in enumerate(messages):
+            message = dict(original)
+            if message.get("role") == "tool":
+                message["content"] = self._truncate_context_text(
+                    message.get("content", ""), MAX_TOOL_CONTEXT_CHARS,
+                )
+            prepared.append((index, message))
+
+        if not prepared:
+            return []
+        user_indices = [
+            index for index, message in prepared if message.get("role") == "user"
+        ]
+        current_start = user_indices[-1] if user_indices else len(prepared)
+        system_indices = {
+            index for index, message in prepared if message.get("role") == "system"
+        }
+        required_indices = system_indices | set(range(current_start, len(prepared)))
+        selected = {
+            index: message for index, message in prepared if index in required_indices
+        }
+
+        def total_size():
+            return sum(
+                self._message_context_size(message) for message in selected.values()
+            )
+
+        remaining = budget - total_size()
+        if remaining > 0:
+            for index, message in reversed(prepared):
+                if index in required_indices:
+                    continue
+                size = self._message_context_size(message)
+                if size <= remaining:
+                    selected[index] = message
+                    remaining -= size
+
+        primary_system = min(system_indices) if system_indices else None
+        while total_size() > budget:
+            candidates = []
+            for index, message in selected.items():
+                content = message.get("content") or ""
+                if index == primary_system or len(content) <= 512:
+                    continue
+                role = message.get("role")
+                priority = (
+                    0 if role == "tool" else
+                    1 if role == "system" else
+                    2 if role == "assistant" else 3
+                )
+                candidates.append((priority, -len(content), index, message))
+            if not candidates:
+                break
+            _priority, _length, _index, message = min(candidates)
+            over = total_size() - budget
+            content = message.get("content") or ""
+            target = max(512, len(content) - over - 128)
+            message["content"] = self._truncate_context_text(content, target)
+
+        return [selected[index] for index in sorted(selected)]
+
+    def _chat(self, messages, tools=None):
+        """Apply the prompt budget and retry a context rejection once."""
+        prepared = self._prepare_context_messages(messages)
+        response = self.client.chat(prepared, tools=tools)
+        if response.get("_liam_error") == "context_overflow":
+            status = getattr(self, "on_status", None)
+            if status:
+                status("  [Ollama context limit reached; compacting and retrying once...]")
+            retry_messages = self._prepare_context_messages(
+                messages, budget=CONTEXT_RETRY_CHAR_BUDGET,
+            )
+            response = self.client.chat(retry_messages, tools=tools)
+        response = dict(response)
+        response.pop("_liam_error", None)
+        return response
+
+    def _discard_transient_tool_history(self):
+        """Keep final conversation, not prior turns' tool protocol payloads."""
+        self.messages = [
+            message for message in self.messages
+            if message.get("role") != "tool" and not (
+                message.get("role") == "assistant" and message.get("tool_calls")
+            )
+        ]
+
+    @staticmethod
     def _cli_confirm(name, args):
         if name == "propose_lesson":
             print("\n[Liam wants to remember a lesson]")
@@ -1081,7 +1193,7 @@ class Agent:
             },
             {"role": "user", "content": f"Original request: {user_input}\n\nGathered library data:\n{library_data}"},
         ]
-        response = self.client.chat(messages, tools=propose_schema)
+        response = self._chat(messages, tools=propose_schema)
         for call in response.get("tool_calls") or []:
             fn = call["function"]
             name = fn["name"]
@@ -1118,7 +1230,7 @@ class Agent:
             },
             {"role": "user", "content": f"Question: {question}\n\nDocument piece:\n{chunk}"},
         ]
-        response = self.client.chat(messages)
+        response = self._chat(messages)
         return response.get("content", "").strip()
 
     def _reduce_large_result(self, question, name, result):
@@ -1127,7 +1239,9 @@ class Agent:
         relevant excerpts are kept — instead of handing one huge blob to
         the final answer step, which is unreliable at that size."""
         if len(result) <= CHUNK_THRESHOLD:
-            return f"[{name} result]\n{result}"
+            return self._truncate_context_text(
+                f"[{name} result]\n{result}", MAX_TOOL_CONTEXT_CHARS,
+            )
 
         chunks = [result[i:i + CHUNK_SIZE] for i in range(0, len(result), CHUNK_SIZE)]
         self.on_status(f"  [scanning {len(result)}-char {name} result in {len(chunks)} pieces...]")
@@ -1139,7 +1253,16 @@ class Agent:
 
         if not extracts:
             return f"[{name} result — no relevant content found across {len(chunks)} pieces]"
-        return f"[{name} result — relevant excerpts]\n" + "\n---\n".join(extracts)
+        combined = f"[{name} result — relevant excerpts]\n" + "\n---\n".join(extracts)
+        return self._truncate_context_text(combined, MAX_TOOL_CONTEXT_CHARS)
+
+    def _model_visible_tool_result(self, question, name, result):
+        """Return the only form of a tool result allowed into model history."""
+        if len(result) <= MAX_TOOL_CONTEXT_CHARS:
+            return result
+        if name in GROUNDING_TOOLS:
+            return self._reduce_large_result(question, name, result)
+        return self._truncate_context_text(result, MAX_TOOL_CONTEXT_CHARS)
 
     def _recent_context_note(self, limit=20):
         """A bounded snippet of recent conversation — enough for
@@ -1191,7 +1314,7 @@ class Agent:
             },
             {"role": "user", "content": f"{context_block}Question: {question}\n\nData:\n{data}"},
         ]
-        response = self.client.chat(messages)
+        response = self._chat(messages)
         return response.get("content", "")
 
     @staticmethod
@@ -1228,7 +1351,7 @@ class Agent:
             },
             {"role": "user", "content": evidence[:8000]},
         ]
-        value = self._parse_json_object(self.client.chat(messages).get("content", "")) or {}
+        value = self._parse_json_object(self._chat(messages).get("content", "")) or {}
         keywords = value.get("keywords")
         if isinstance(keywords, list):
             keywords = ",".join(str(item) for item in keywords[:8])
@@ -1779,7 +1902,7 @@ class Agent:
                 ),
             },
         ]
-        value = self._parse_json_object(self.client.chat(messages).get("content", ""))
+        value = self._parse_json_object(self._chat(messages).get("content", ""))
         if not value:
             return None
         try:
@@ -1896,6 +2019,7 @@ class Agent:
         special handling needed there. Only the current model needs
         "vision" in its capabilities (mistral-small3.2:24b already has
         it, alongside "tools" — confirmed via `ollama show`)."""
+        self._discard_transient_tool_history()
         self._read_paths_this_turn = set()
         self._tool_events = []
         self._lesson_uses = []
@@ -2088,7 +2212,7 @@ class Agent:
                 hinted = dict(chat_messages[user_message_index])
                 hinted["content"] = f"{hinted['content']}\n\n[Relevant lessons from past mistakes:\n{hint_text}]"
                 chat_messages[user_message_index] = hinted
-            message = self.client.chat(chat_messages, tools=self.tool_schemas)
+            message = self._chat(chat_messages, tools=self.tool_schemas)
             self.messages.append(message)
 
             tool_calls = message.get("tool_calls")
@@ -2159,6 +2283,7 @@ class Agent:
                     self.on_tool_call(name, args)
                     result = self._execute_tool(name, args)
                     seen[dedupe_key] = (result, self._tool_events[-1])
+                    result = self._model_visible_tool_result(user_input, name, result)
                     tool_results.append((name, result))
 
                 total_calls += 1

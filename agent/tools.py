@@ -22,6 +22,7 @@ SD_CHECKPOINT = os.environ.get("LIAM_SD_CHECKPOINT", "sd_xl_base_1.0.safetensors
 GENERATED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".liam_generated")
 SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SUDO_VALIDATED_MARKER = "__LIAM_SUDO_VALIDATED_7F6C3A2D__"
+DEFAULT_READ_MAX_CHARS = 20_000
 
 
 def _resolve(path, base_dir=None):
@@ -31,18 +32,28 @@ def _resolve(path, base_dir=None):
     return os.path.abspath(os.path.join(base_dir or os.getcwd(), path))
 
 
-def read_file(path, base_dir=None, max_chars=200_000, offset=None, limit=None):
-    """offset/limit (1-indexed line numbers, both inclusive) read a
-    specific line range instead of the whole file — for a large file,
-    or to double-check a small range right before an edit_file call."""
+def _bounded_file_content(content, max_chars):
+    if len(content) <= max_chars:
+        return content
+    return (
+        content[:max_chars]
+        + f"\n\n[read_file truncated this result after {max_chars} characters. "
+          "Use search_text to locate relevant text, then read_file with offset "
+          "and limit to inspect a specific line range.]"
+    )
+
+
+def read_file(path, base_dir=None, max_chars=DEFAULT_READ_MAX_CHARS,
+              offset=None, limit=None):
+    """Read from offset (a 1-indexed line) for at most limit lines."""
     if offset is None and limit is None:
         with open(_resolve(path, base_dir), "r", errors="replace") as f:
-            return f.read(max_chars)
+            return _bounded_file_content(f.read(max_chars + 1), max_chars)
     with open(_resolve(path, base_dir), "r", errors="replace") as f:
         lines = f.readlines()
     start = max((offset or 1) - 1, 0)
     end = start + limit if limit is not None else len(lines)
-    return "".join(lines[start:end])[:max_chars]
+    return _bounded_file_content("".join(lines[start:end]), max_chars)
 
 
 def write_file(path, content, base_dir=None):
@@ -1162,7 +1173,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a text file from the local filesystem, or a specific line range with offset/limit.",
+            "description": (
+                "Read a text file or a specific line range. Large unrestricted reads "
+                "are truncated to protect the model context; use search_text first, "
+                "then offset/limit to inspect the relevant lines."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

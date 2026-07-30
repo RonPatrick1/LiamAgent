@@ -646,6 +646,12 @@ class LiamWindow(Gtk.ApplicationWindow):
                 border-color: #1c2c4a;
                 color: #ffffff;
             }
+            textview.liam-chat-view,
+            textview.liam-chat-view text {
+                background-color: #000000;
+                background-image: none;
+                color: #e6e6e6;
+            }
             textview.liam-chat-view text selection {
                 background-color: #2f6f9e;
                 color: #ffffff;

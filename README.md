@@ -108,6 +108,13 @@ are loaded back into context. If the database is unreachable, memory calls
 fail quietly (a `[memory] ...` warning is printed) rather than crashing the
 agent — search and file tools still work fine without it.
 
+Raw tool protocol messages are discarded between turns. Large file/tool
+results are reduced before they enter model-visible history, unrestricted
+file reads return a bounded preview, and every Ollama request has a
+conservative message budget. If Ollama still reports a context overflow,
+Liam compacts further and retries once while preserving the real server error
+if that retry also fails.
+
 ## Learning from corrections and failures
 
 Lessons are separate from remembered user notes. Liam can activate a lesson
