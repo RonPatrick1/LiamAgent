@@ -2,7 +2,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from agent import core, tools
+from agent import core, ssh_secrets, tools
 
 
 class SshToolTests(unittest.TestCase):
@@ -32,9 +32,127 @@ class SshToolTests(unittest.TestCase):
         self.assertIn("PasswordAuthentication=no", argv)
         self.assertIn("IdentitiesOnly=yes", argv)
         self.assertIn("StrictHostKeyChecking=yes", argv)
+        self.assertNotIn("-tt", argv)
         self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertIsNone(run.call_args.kwargs["input"])
         self.assertIn("remote-host", result)
         self.assertTrue(result.endswith("[exit code: 0]"))
+
+    @staticmethod
+    def _identity():
+        return {
+            "alias": "alien",
+            "hostname": "192.168.0.128",
+            "port": "22",
+            "user": "ronpatrick",
+        }
+
+    def test_sudo_uses_keyring_stdin_pty_and_validated_timestamp(self):
+        password = "not-in-arguments"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=f"{tools.SUDO_VALIDATED_MARKER}\r\nroot\r\n", stderr="",
+        )
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(tools, "_ssh_host_details", return_value=self._identity()), \
+             mock.patch.object(
+                 tools.ssh_secrets, "lookup_sudo_password", return_value=password,
+             ) as lookup, \
+             mock.patch.object(tools.subprocess, "run", return_value=completed) as run:
+            result = tools.ssh_run_command(
+                "alien", "id -u", timeout=15, sudo=True,
+            )
+
+        argv = run.call_args.args[0]
+        remote_command = argv[-1]
+        self.assertIn("-tt", argv)
+        self.assertIn("sudo -S -p '' -v", remote_command)
+        self.assertIn("exec </dev/null", remote_command)
+        self.assertIn("sudo -n -p '' -- sh -c", remote_command)
+        self.assertNotIn(password, " ".join(argv))
+        self.assertEqual(run.call_args.kwargs["input"], f"{password}\n")
+        self.assertNotIn(password, result)
+        self.assertNotIn(tools.SUDO_VALIDATED_MARKER, result)
+        self.assertIn("root", result)
+        lookup.assert_called_once_with(
+            "alien", "192.168.0.128", "22", "ronpatrick",
+        )
+
+    def test_non_boolean_sudo_value_cannot_accidentally_elevate(self):
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(tools.ssh_secrets, "lookup_sudo_password") as lookup:
+            with self.assertRaisesRegex(ValueError, "sudo must be true or false"):
+                tools.ssh_run_command("alien", "id", sudo="false")
+        lookup.assert_not_called()
+
+    def test_missing_sudo_password_does_not_start_ssh(self):
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(tools, "_ssh_host_details", return_value=self._identity()), \
+             mock.patch.object(
+                 tools.ssh_secrets, "lookup_sudo_password", return_value=None,
+             ), \
+             mock.patch.object(tools.subprocess, "run") as run:
+            result = tools.ssh_run_command("alien", "id", sudo=True)
+
+        run.assert_not_called()
+        self.assertIn("no sudo password is stored", result)
+        self.assertTrue(result.startswith("Error:"))
+
+    def test_multiline_keyring_value_is_rejected_before_ssh(self):
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(tools, "_ssh_host_details", return_value=self._identity()), \
+             mock.patch.object(
+                 tools.ssh_secrets, "lookup_sudo_password", return_value="one\ntwo",
+             ), \
+             mock.patch.object(tools.subprocess, "run") as run:
+            result = tools.ssh_run_command("alien", "id", sudo=True)
+
+        run.assert_not_called()
+        self.assertIn("credential", result.lower())
+        self.assertNotIn("one", result)
+
+    def test_incorrect_sudo_password_is_clear_and_redacted(self):
+        password = "accidental-secret"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=f"{password}\r\n",
+            stderr="Sorry, try again.\r\n",
+        )
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(tools, "_ssh_host_details", return_value=self._identity()), \
+             mock.patch.object(
+                 tools.ssh_secrets, "lookup_sudo_password", return_value=password,
+             ), \
+             mock.patch.object(tools.subprocess, "run", return_value=completed):
+            result = tools.ssh_run_command("alien", "id", sudo=True)
+
+        self.assertIn("Sudo authentication failed", result)
+        self.assertNotIn(password, result)
+
+    def test_process_errors_are_redacted_before_returning(self):
+        password = "transport-secret"
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(tools, "_ssh_host_details", return_value=self._identity()), \
+             mock.patch.object(
+                 tools.ssh_secrets, "lookup_sudo_password", return_value=password,
+             ), \
+             mock.patch.object(
+                 tools.subprocess, "run",
+                 side_effect=OSError(f"transport rejected {password}"),
+             ):
+            result = tools.ssh_run_command("alien", "id", sudo=True)
+
+        self.assertTrue(result.startswith("Error:"))
+        self.assertIn("[REDACTED]", result)
+        self.assertNotIn(password, result)
+
+    def test_sudo_on_unknown_host_is_rejected_before_secret_lookup(self):
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(
+                 tools.ssh_secrets, "lookup_sudo_password",
+             ) as lookup:
+            with self.assertRaises(ValueError):
+                tools.ssh_run_command("prod-rabbitmq", "id", sudo=True)
+        lookup.assert_not_called()
 
     def test_unknown_host_is_rejected_before_ssh_starts(self):
         with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "jetson"}), \
@@ -77,6 +195,49 @@ class DesktopOnlySshTests(unittest.TestCase):
 
     def test_remote_commands_require_confirmation_when_confirmation_is_enabled(self):
         self.assertIn("ssh_run_command", tools.DANGEROUS_TOOLS)
+
+    def test_sudo_is_only_a_boolean_tool_argument(self):
+        schema = next(
+            item for item in tools.TOOL_SCHEMAS
+            if item["function"]["name"] == "ssh_run_command"
+        )
+        properties = schema["function"]["parameters"]["properties"]
+        self.assertEqual(properties["sudo"]["type"], "boolean")
+        self.assertNotIn("password", properties)
+
+
+class SshSecretTests(unittest.TestCase):
+    def test_store_uses_libsecret_without_putting_password_in_attributes(self):
+        password = "keyring-only-value"
+        secret_api = mock.Mock()
+        secret_api.COLLECTION_DEFAULT = "default"
+        secret_api.password_store_sync.return_value = True
+        with mock.patch.object(ssh_secrets, "Secret", secret_api), \
+             mock.patch.object(ssh_secrets, "_SCHEMA", object()):
+            ssh_secrets.store_sudo_password(
+                "alien", "192.168.0.128", "22", "ronpatrick", password,
+            )
+
+        store = secret_api.password_store_sync
+        args = store.call_args.args
+        attributes = args[1]
+        label = args[3]
+        self.assertNotIn(password, str(attributes))
+        self.assertNotIn(password, label)
+        self.assertEqual(args[4], password)
+
+    def test_keyring_errors_do_not_include_secret(self):
+        password = "never-report-me"
+        secret_api = mock.Mock()
+        secret_api.COLLECTION_DEFAULT = "default"
+        secret_api.password_store_sync.side_effect = RuntimeError(password)
+        with mock.patch.object(ssh_secrets, "Secret", secret_api), \
+             mock.patch.object(ssh_secrets, "_SCHEMA", object()):
+            with self.assertRaises(ssh_secrets.SudoSecretError) as caught:
+                ssh_secrets.store_sudo_password(
+                    "alien", "192.168.0.128", "22", "ronpatrick", password,
+                )
+        self.assertNotIn(password, str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.parse
@@ -12,7 +13,7 @@ import uuid
 import requests
 from playwright.sync_api import sync_playwright
 
-from . import memory, routines
+from . import memory, routines, ssh_secrets
 
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY")
 
@@ -20,6 +21,7 @@ COMFYUI_URL = "http://127.0.0.1:8188"
 SD_CHECKPOINT = os.environ.get("LIAM_SD_CHECKPOINT", "sd_xl_base_1.0.safetensors")
 GENERATED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".liam_generated")
 SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+SUDO_VALIDATED_MARKER = "__LIAM_SUDO_VALIDATED_7F6C3A2D__"
 
 
 def _resolve(path, base_dir=None):
@@ -320,8 +322,8 @@ def _require_ssh_host(host):
     return host
 
 
-def _ssh_base_command(host, connect_timeout=8):
-    return [
+def _ssh_base_command(host, connect_timeout=8, request_pty=False):
+    command = [
         "ssh",
         "-o", "BatchMode=yes",
         "-o", "PasswordAuthentication=no",
@@ -330,8 +332,34 @@ def _ssh_base_command(host, connect_timeout=8):
         "-o", "StrictHostKeyChecking=yes",
         "-o", f"ConnectTimeout={int(connect_timeout)}",
         "-o", "LogLevel=ERROR",
-        host,
     ]
+    if request_pty:
+        command.append("-tt")
+    command.append(host)
+    return command
+
+
+def _ssh_host_details(host):
+    """Resolve the allowlisted alias identity used to key its secret."""
+    host = _require_ssh_host(host)
+    result = subprocess.run(
+        ["ssh", "-G", host], capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"Could not resolve SSH configuration for '{host}'.")
+    resolved = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key in {"hostname", "user", "port"}:
+            resolved[key] = value
+    if not resolved.get("hostname") or not resolved.get("user"):
+        raise ValueError(f"SSH configuration for '{host}' has no host or user.")
+    return {
+        "alias": host,
+        "hostname": resolved["hostname"],
+        "user": resolved["user"],
+        "port": resolved.get("port", "22"),
+    }
 
 
 def ssh_list_hosts():
@@ -344,44 +372,108 @@ def ssh_list_hosts():
         )
     lines = []
     for alias in configured:
-        result = subprocess.run(
-            ["ssh", "-G", alias], capture_output=True, text=True, timeout=5,
+        details = _ssh_host_details(alias)
+        lines.append(
+            f"{alias}: {details['user']}@{details['hostname']}:{details['port']}"
         )
-        resolved = {}
-        for line in result.stdout.splitlines():
-            key, _, value = line.partition(" ")
-            if key in {"hostname", "user", "port"}:
-                resolved[key] = value
-        target = resolved.get("hostname", alias)
-        user = resolved.get("user", "?")
-        port = resolved.get("port", "22")
-        lines.append(f"{alias}: {user}@{target}:{port}")
     return "Configured desktop SSH hosts:\n" + "\n".join(lines)
 
 
-def ssh_run_command(host, command, timeout=60):
+def _redact_secret(text, secret):
+    text = text or ""
+    return text.replace(secret, "[REDACTED]") if secret else text
+
+
+def _sudo_remote_command(command):
+    quoted_command = shlex.quote(command)
+    return (
+        "sudo -S -p '' -v && "
+        f"printf '%s\\n' {shlex.quote(SUDO_VALIDATED_MARKER)} && "
+        "exec </dev/null && "
+        f"sudo -n -p '' -- sh -c {quoted_command}"
+    )
+
+
+def ssh_run_command(host, command, timeout=60, sudo=False):
     """Run one non-interactive command through an allowlisted SSH alias."""
     host = _require_ssh_host(host)
     command = (command or "").strip()
     if not command:
         raise ValueError("command must be a non-empty string")
+    if not isinstance(sudo, bool):
+        raise ValueError("sudo must be true or false")
     timeout = min(max(int(timeout), 1), 300)
+    password = None
+    remote_command = command
+    identity = None
+    if sudo:
+        identity = _ssh_host_details(host)
+        try:
+            password = ssh_secrets.lookup_sudo_password(
+                identity["alias"], identity["hostname"],
+                identity["port"], identity["user"],
+            )
+        except ssh_secrets.SudoSecretError:
+            return (
+                f"Error: Sudo credential lookup failed for {identity['user']}@{host}: "
+                "GNOME Keyring is unavailable or locked."
+            )
+        if not password:
+            return (
+                f"Error: Sudo authentication unavailable for {identity['user']}@{host}: "
+                "no sudo password is stored in GNOME Keyring."
+            )
+        if any(character in password for character in ("\n", "\r", "\x00")):
+            return (
+                f"Error: Sudo credential for {identity['user']}@{host} is invalid. "
+                "Replace it in Liam's desktop settings."
+            )
+        remote_command = _sudo_remote_command(command)
+
     try:
         result = subprocess.run(
-            _ssh_base_command(host) + [command],
+            _ssh_base_command(host, request_pty=bool(sudo)) + [remote_command],
+            input=f"{password}\n" if sudo else None,
             capture_output=True, text=True, timeout=timeout + 10,
         )
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "")
+        output = exc.stdout or ""
         if isinstance(output, bytes):
             output = output.decode(errors="replace")
+        output = _redact_secret(output, password)
         return (
             f"{output}\n[stderr]\nSSH command timed out after {timeout} seconds."
             "\n[exit code: 124]"
         )[:20_000]
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        detail = _redact_secret(str(exc), password)
+        return f"Error: SSH command could not start: {detail}"[:20_000]
     output = result.stdout
     if result.stderr:
         output += f"\n[stderr]\n{result.stderr}"
+    output = _redact_secret(output, password)
+
+    if sudo:
+        validated = SUDO_VALIDATED_MARKER in output
+        output = output.replace(SUDO_VALIDATED_MARKER, "", 1).lstrip("\r\n")
+        if not validated:
+            lowered = output.lower()
+            if any(marker in lowered for marker in (
+                "sorry, try again", "incorrect password", "authentication failure",
+                "no password was provided",
+            )):
+                return (
+                    f"Error: Sudo authentication failed for {identity['user']}@{host}. "
+                    "Replace the stored password in Liam's desktop settings."
+                    f"\n[exit code: {result.returncode}]"
+                )
+            detail = output.strip()
+            prefix = f"Error: Sudo validation failed for {identity['user']}@{host}."
+            return (
+                f"{prefix}\n{detail}\n[exit code: {result.returncode}]"
+                if detail else f"{prefix}\n[exit code: {result.returncode}]"
+            )[:20_000]
+
     output += f"\n[exit code: {result.returncode}]"
     return output[:20_000]
 
@@ -1393,6 +1485,14 @@ TOOL_SCHEMAS = [
                     "timeout": {
                         "type": "integer",
                         "description": "Command timeout in seconds (default 60, maximum 300).",
+                    },
+                    "sudo": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true only when the requested command requires administrator "
+                            "privileges. The credential is retrieved internally from GNOME "
+                            "Keyring and is never supplied in this tool call."
+                        ),
                     },
                 },
                 "required": ["host", "command"],

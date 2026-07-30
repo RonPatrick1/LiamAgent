@@ -60,7 +60,8 @@ def _load_dotenv(path=None):
 
 _load_dotenv()
 
-from agent import memory, routines  # noqa: E402
+from agent import memory, routines, ssh_secrets  # noqa: E402
+from agent import tools as agent_tools  # noqa: E402
 from agent import settings as liam_settings  # noqa: E402
 from agent.core import Agent  # noqa: E402
 from agent.llm import DEFAULT_MODEL  # noqa: E402
@@ -1149,7 +1150,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         content.set_margin_start(12)
         content.set_margin_end(12)
         content.set_spacing(8)
-        dialog.set_default_size(420, 320)
+        dialog.set_default_size(620, 520)
 
         content.pack_start(Gtk.Label(label="Model", xalign=0), False, False, 0)
         model_combo = Gtk.ComboBoxText()
@@ -1172,6 +1173,121 @@ class LiamWindow(Gtk.ApplicationWindow):
         auto_confirm_switch.set_active(self.settings["auto_confirm"])
         auto_confirm_row.pack_start(auto_confirm_switch, False, False, 0)
         content.pack_start(auto_confirm_row, False, False, 0)
+
+        sudo_expander = Gtk.Expander(label="SSH sudo passwords (GNOME Keyring)")
+        sudo_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        sudo_box.set_margin_top(8)
+        sudo_box.set_margin_start(8)
+        sudo_box.set_margin_end(8)
+        sudo_box.pack_start(
+            Gtk.Label(
+                label=(
+                    "Optional credentials for allowlisted desktop SSH hosts. "
+                    "Passwords are never shown to Liam. Save/replace and remove "
+                    "actions take effect immediately."
+                ),
+                xalign=0,
+                wrap=True,
+            ),
+            False, False, 0,
+        )
+
+        configured_hosts = agent_tools._configured_ssh_hosts()
+        if not configured_hosts:
+            empty = Gtk.Label(
+                label="No hosts are configured in LIAM_SSH_HOSTS.", xalign=0,
+            )
+            empty.get_style_context().add_class("dim-label")
+            sudo_box.pack_start(empty, False, False, 0)
+
+        for alias in configured_hosts:
+            try:
+                identity = agent_tools._ssh_host_details(alias)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                error = Gtk.Label(
+                    label=f"{alias}: SSH configuration could not be resolved.",
+                    xalign=0,
+                )
+                error.get_style_context().add_class("error")
+                sudo_box.pack_start(error, False, False, 0)
+                continue
+
+            host_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            host_box.pack_start(
+                Gtk.Label(
+                    label=(
+                        f"{alias} — {identity['user']}@{identity['hostname']}:"
+                        f"{identity['port']}"
+                    ),
+                    xalign=0,
+                ),
+                False, False, 0,
+            )
+            controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            password_entry = Gtk.Entry()
+            password_entry.set_visibility(False)
+            password_entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+            password_entry.set_placeholder_text("Sudo password")
+            controls.pack_start(password_entry, True, True, 0)
+            save_password = Gtk.Button(label="Save / replace")
+            remove_password = Gtk.Button(label="Remove")
+            controls.pack_start(save_password, False, False, 0)
+            controls.pack_start(remove_password, False, False, 0)
+            host_box.pack_start(controls, False, False, 0)
+            credential_status = Gtk.Label(xalign=0)
+            credential_status.get_style_context().add_class("dim-label")
+            host_box.pack_start(credential_status, False, False, 0)
+
+            def set_initial_status(identity=identity, label=credential_status):
+                try:
+                    stored = ssh_secrets.has_sudo_password(
+                        identity["alias"], identity["hostname"],
+                        identity["port"], identity["user"],
+                    )
+                    label.set_text("Password stored" if stored else "No password stored")
+                except ssh_secrets.SudoSecretError as exc:
+                    label.set_text(str(exc))
+
+            def on_save_password(
+                _button, identity=identity, entry=password_entry,
+                label=credential_status,
+            ):
+                password = entry.get_text()
+                try:
+                    ssh_secrets.store_sudo_password(
+                        identity["alias"], identity["hostname"],
+                        identity["port"], identity["user"], password,
+                    )
+                except ssh_secrets.SudoSecretError as exc:
+                    label.set_text(str(exc))
+                    return
+                entry.set_text("")
+                label.set_text("Password saved in GNOME Keyring")
+
+            def on_remove_password(
+                _button, identity=identity, entry=password_entry,
+                label=credential_status,
+            ):
+                try:
+                    removed = ssh_secrets.clear_sudo_password(
+                        identity["alias"], identity["hostname"],
+                        identity["port"], identity["user"],
+                    )
+                except ssh_secrets.SudoSecretError as exc:
+                    label.set_text(str(exc))
+                    return
+                entry.set_text("")
+                label.set_text(
+                    "Password removed" if removed else "No password was stored"
+                )
+
+            save_password.connect("clicked", on_save_password)
+            remove_password.connect("clicked", on_remove_password)
+            set_initial_status()
+            sudo_box.pack_start(host_box, False, False, 0)
+
+        sudo_expander.add(sudo_box)
+        content.pack_start(sudo_expander, False, False, 0)
 
         content.pack_start(
             Gtk.Label(label="Custom instructions (added to every thread's system prompt)", xalign=0),

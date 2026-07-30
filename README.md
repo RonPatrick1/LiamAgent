@@ -81,6 +81,14 @@ and rejects any host not in that list. Passwords in `.env` are intentionally
 unsupported: they would expose reusable login secrets to the long-running app
 and subprocess environment.
 
+For commands that require administrator privileges, open **Customize → SSH
+sudo passwords** in the Ubuntu desktop app and save the destination's sudo
+password in GNOME Keyring. Liam can then call the same SSH tool with
+`sudo: true`; the credential is looked up internally, passed only over the SSH
+process's standard input for `sudo -S -v`, and redacted from returned output.
+Removing a credential from Customize does not change the remote computer's
+sudo configuration. Liam never creates passwordless-sudo or sudoers entries.
+
 ## Persistent memory
 
 Liam remembers past conversations across restarts via a MySQL table
