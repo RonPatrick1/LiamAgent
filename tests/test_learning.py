@@ -718,6 +718,36 @@ class AutomaticLessonTests(unittest.TestCase):
 
 
 class ChatFeedbackTests(unittest.TestCase):
+    def test_classifier_placeholder_values_are_rejected(self):
+        agent = bare_agent(payload=json.dumps({
+            "actionable": True,
+            "explicit": True,
+            "confidence": 1.0,
+            "keywords": ["2 to 8 short triggers"],
+            "lesson": "concise imperative reusable behavior",
+            "scope_kind": "global",
+            "scope_value": "",
+        }))
+
+        result = agent._classify_chat_feedback("previous", "next time do better")
+
+        self.assertIsNone(result)
+
+    def test_classifier_rejects_only_generic_retrieval_keywords(self):
+        agent = bare_agent(payload=json.dumps({
+            "actionable": True,
+            "explicit": True,
+            "confidence": 1.0,
+            "keywords": ["next", "time", "better"],
+            "lesson": "Use the smaller remote model for classification.",
+            "scope_kind": "global",
+            "scope_value": "",
+        }))
+
+        result = agent._classify_chat_feedback("previous", "next time do better")
+
+        self.assertIsNone(result)
+
     def feedback_payload(self, *, explicit=True, confidence=0.97):
         return json.dumps({
             "actionable": True,

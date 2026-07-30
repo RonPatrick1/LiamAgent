@@ -137,6 +137,14 @@ CHUNK_SIZE = 2000
 MAX_TOOL_CONTEXT_CHARS = 7000
 CONTEXT_MESSAGE_CHAR_BUDGET = 60_000
 CONTEXT_RETRY_CHAR_BUDGET = 36_000
+DEFAULT_HELPER_MODEL = "llama3.1:8b"
+DEFAULT_HELPER_TIMEOUT = 45
+DEFAULT_HELPER_KEEP_ALIVE = "30m"
+GENERIC_FEEDBACK_KEYWORDS = {
+    "always", "assistant", "behavior", "better", "change", "correction",
+    "feedback", "instead", "liam", "never", "next", "next time", "should",
+    "time", "use",
+}
 
 # Matches how LiamGUI._insert_formatted recognizes fenced code blocks, so a
 # code artifact's label/content is derived the same way it's rendered.
@@ -663,6 +671,42 @@ class Agent:
         tool is never advertised: activation comes from host-observed
         evidence, not from the model's opinion of its own behavior."""
         self.client = OllamaClient(model=model)
+        helper_url = os.environ.get("LIAM_HELPER_OLLAMA_URL", "").strip()
+        if helper_url:
+            try:
+                helper_timeout = int(os.environ.get(
+                    "LIAM_HELPER_OLLAMA_TIMEOUT", DEFAULT_HELPER_TIMEOUT,
+                ))
+            except (TypeError, ValueError):
+                helper_timeout = DEFAULT_HELPER_TIMEOUT
+            helper_timeout = min(max(helper_timeout, 1), 300)
+            self.helper_client = OllamaClient(
+                model=(os.environ.get("LIAM_HELPER_OLLAMA_MODEL") or DEFAULT_HELPER_MODEL),
+                url=helper_url,
+                timeout=helper_timeout,
+                keep_alive=(
+                    os.environ.get("LIAM_HELPER_OLLAMA_KEEP_ALIVE")
+                    or DEFAULT_HELPER_KEEP_ALIVE
+                ),
+                options={"temperature": 0},
+                response_format="json",
+            )
+            self.helper_text_client = OllamaClient(
+                model=(os.environ.get("LIAM_HELPER_OLLAMA_MODEL") or DEFAULT_HELPER_MODEL),
+                url=helper_url,
+                timeout=helper_timeout,
+                keep_alive=(
+                    os.environ.get("LIAM_HELPER_OLLAMA_KEEP_ALIVE")
+                    or DEFAULT_HELPER_KEEP_ALIVE
+                ),
+                options={"temperature": 0},
+            )
+        else:
+            # Preserve the original single-model behavior when no helper is
+            # configured. Keeping the exact same object also prevents an
+            # error from being retried pointlessly against itself.
+            self.helper_client = self.client
+            self.helper_text_client = self.client
         self.auto_confirm = auto_confirm
         self._read_paths_this_turn = set()
         self.on_tool_call = on_tool_call or (lambda name, args: print(f"  -> {name}({json.dumps(args)})"))
@@ -830,6 +874,25 @@ class Agent:
                 messages, budget=CONTEXT_RETRY_CHAR_BUDGET,
             )
             response = self.client.chat(retry_messages, tools=tools)
+        response = dict(response)
+        response.pop("_liam_error", None)
+        return response
+
+    def _helper_chat(self, messages, *, structured=True):
+        """Run a small structured or plain-text preprocessing job.
+
+        A remote 8B helper keeps these hidden preprocessing calls off Liam's
+        much larger primary model. If the helper is absent or unavailable,
+        fall back to the primary client so preprocessing never blocks a chat.
+        """
+        attribute = "helper_client" if structured else "helper_text_client"
+        helper = getattr(self, attribute, self.client)
+        response = helper.chat(messages)
+        if response.get("_liam_error") and helper is not self.client:
+            status = getattr(self, "on_status", None)
+            if status:
+                status("  [Remote helper unavailable; using Liam's local model for this preprocessing step...]")
+            response = self.client.chat(messages)
         response = dict(response)
         response.pop("_liam_error", None)
         return response
@@ -1289,29 +1352,27 @@ class Agent:
         return tool_results
 
     def _extract_from_chunk(self, question, chunk):
-        """A small, isolated task: does this one piece of a larger document
-        contain anything relevant to the question? If so, quote it. This is
-        the kind of narrow task the model handles reliably, unlike scanning
-        an entire large document at once."""
+        """Decide whether one document piece matters, then copy it verbatim.
+
+        The helper performs only the binary relevance decision. Returning
+        the original host-owned string avoids trusting a smaller model to
+        quote source material without omissions or paraphrasing.
+        """
         messages = [
             {
-                "role": "system",
+                "role": "user",
                 "content": (
-                    "You are shown one small piece of a larger document, "
-                    "and a question. If the question asks to see, list, "
-                    "show, or read the actual content itself (not to find "
-                    "one specific fact within it), quote this entire piece "
-                    "verbatim — the piece itself is the answer in that "
-                    "case. Otherwise, if this piece contains information "
-                    "relevant to answering the question, quote the "
-                    "relevant part verbatim. If neither applies, respond "
-                    "with exactly: NOT_FOUND"
+                    "Does the document piece contain any information that helps "
+                    "answer the question? Reply exactly YES or NO. If the "
+                    "question asks to see, list, show, or read the document "
+                    "itself, reply YES.\n\n"
+                    f"Question: {question}\n\nDocument piece:\n{chunk}"
                 ),
             },
-            {"role": "user", "content": f"Question: {question}\n\nDocument piece:\n{chunk}"},
         ]
-        response = self._chat(messages)
-        return response.get("content", "").strip()
+        response = self._helper_chat(messages, structured=False)
+        decision = response.get("content", "").strip().upper()
+        return chunk if decision.startswith("YES") else "NOT_FOUND"
 
     def _reduce_large_result(self, question, name, result):
         """Large tool results (mainly full webpages from fetch_url) get
@@ -1424,19 +1485,30 @@ class Agent:
                     "The evidence below contains a machine-verified failure followed "
                     "by a successful corrected attempt. Extract only the reusable "
                     "behavior supported by that evidence. Return one JSON object and "
-                    "nothing else: {\"keywords\":[\"short trigger\"],"
-                    "\"lesson\":\"one concise imperative correction\"}. Do not "
-                    "invent causes, commands, paths, or facts absent from the evidence."
+                    "nothing else, with keys named keywords and lesson. keywords must "
+                    "be an array of 2 to 8 actual short trigger phrases taken from the "
+                    "kind of task that failed. lesson must be the actual concise "
+                    "imperative behavior to apply next time, not a description of what "
+                    "belongs in the field. Never output placeholder phrases such as "
+                    "'short trigger' or 'concise imperative correction'. Do not invent "
+                    "causes, commands, paths, or facts absent from the evidence."
                 ),
             },
             {"role": "user", "content": evidence[:8000]},
         ]
-        value = self._parse_json_object(self._chat(messages).get("content", "")) or {}
+        value = self._parse_json_object(self._helper_chat(messages).get("content", "")) or {}
         keywords = value.get("keywords")
         if isinstance(keywords, list):
             keywords = ",".join(str(item) for item in keywords[:8])
         lesson = value.get("lesson")
         if not isinstance(keywords, str) or not isinstance(lesson, str):
+            return fallback_keywords, fallback_lesson
+        lowered = lesson.strip().lower()
+        if lowered in {
+            "one concise imperative correction",
+            "concise imperative correction",
+            "concise imperative reusable behavior",
+        } or "short trigger" in keywords.lower():
             return fallback_keywords, fallback_lesson
         try:
             # Reuse storage validation without writing anything.
@@ -1987,12 +2059,20 @@ class Agent:
                     "request, quoted criticism, hypotheticals, and factual discussion about "
                     "someone else's mistake are not actionable. Explicit means the user directly "
                     "instructs future behavior with language such as next time, always, never, "
-                    "use X instead, or you should have. Return exactly one JSON object: "
-                    "{\"actionable\":boolean,\"explicit\":boolean,\"confidence\":0.0,"
-                    "\"keywords\":[\"2 to 8 short triggers\"],"
-                    "\"lesson\":\"concise imperative reusable behavior\","
-                    "\"scope_kind\":\"global|workspace|channel|tool\","
-                    "\"scope_value\":\"tool name only when scope_kind is tool, otherwise empty\"}."
+                    "use X instead, or you should have. Return exactly one JSON object "
+                    "with these keys: actionable (boolean), explicit (boolean), "
+                    "confidence (number from 0 to 1), keywords (array containing 2 to "
+                    "8 actual short trigger phrases), lesson (the actual concise "
+                    "imperative behavior Liam should apply next time), scope_kind "
+                    "(exactly one of global, workspace, channel, or tool), and "
+                    "scope_value (the actual tool name only for tool scope, otherwise "
+                    "an empty string). Every value must be your conclusion about the "
+                    "quoted messages. Never copy field descriptions or output placeholder "
+                    "phrases such as 'short triggers', 'concise imperative reusable "
+                    "behavior', or 'tool name only'. Keywords must identify the "
+                    "specific task, capability, or subject that should retrieve this "
+                    "lesson later; never use generic correction words such as next, "
+                    "time, always, never, use, should, feedback, or better as keywords."
                 ),
             },
             {
@@ -2003,7 +2083,7 @@ class Agent:
                 ),
             },
         ]
-        value = self._parse_json_object(self._chat(messages).get("content", ""))
+        value = self._parse_json_object(self._helper_chat(messages).get("content", ""))
         if not value:
             return None
         try:
@@ -2016,6 +2096,20 @@ class Agent:
         lesson = value.get("lesson")
         if not value.get("actionable") or not isinstance(keywords, str) or not isinstance(lesson, str):
             return None
+        lowered = lesson.strip().lower()
+        if lowered in {
+            "concise imperative reusable behavior",
+            "concise imperative behavior",
+            "actual concise imperative behavior liam should apply next time",
+        } or "short trigger" in keywords.lower():
+            return None
+        specific_terms = [
+            term.strip() for term in keywords.split(",")
+            if term.strip().lower() not in GENERIC_FEEDBACK_KEYWORDS
+        ]
+        if not specific_terms:
+            return None
+        keywords = ",".join(specific_terms)
         try:
             keywords, lesson = memory._normalize_lesson_fields(keywords, lesson)
         except ValueError:

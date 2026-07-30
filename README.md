@@ -25,6 +25,44 @@ ollama create liam-mistral-small3.2:latest -f Modelfile.liam
 python3 LiamAgent.py
 ```
 
+### Optional remote helper model
+
+Liam can offload hidden corrective-feedback classification, verified lesson
+extraction, and relevance scanning of chunks from large file/web results to a
+smaller Ollama model on another trusted LAN computer. This moves narrow
+preprocessing calls off the local 24B model while the main answers, vision,
+final synthesis, and tool decisions continue to use Liam's selected local
+model unchanged.
+
+```dotenv
+LIAM_HELPER_OLLAMA_URL=http://127.0.0.1:11435/api/chat
+LIAM_HELPER_OLLAMA_MODEL=llama3.1:8b
+LIAM_HELPER_OLLAMA_TIMEOUT=45
+LIAM_HELPER_OLLAMA_KEEP_ALIVE=30m
+```
+
+If the helper is unreachable, times out, or returns an invalid response, Liam
+automatically repeats only that preprocessing step on its primary model. The
+helper receives only the bounded input needed for its current job: the
+immediately preceding answer and latest user message for feedback
+classification, verified failure/recovery evidence for lesson extraction, or
+one document chunk plus the current question for relevance scanning. It does
+not receive Liam's tools or full conversation history.
+
+The included `systemd/liam-ollama-alien-tunnel.service` keeps that local port
+forwarded through key-authenticated SSH to Alien's loopback-only Ollama server.
+Install it as a user service with:
+
+```bash
+systemctl --user link /var/www/LiamAgent/systemd/liam-ollama-alien-tunnel.service
+systemctl --user enable --now liam-ollama-alien-tunnel.service
+```
+
+This leaves Ollama's unauthenticated port closed to the LAN. The service uses
+the existing `alien` SSH alias, refuses password authentication and unknown
+host keys, and reconnects automatically after either computer or network
+restarts.
+
 Tool calls run without asking by default. Pass `--confirm` if you want to be
 prompted before write_file/run_shell_command calls. Use `--model` to point at
 a different Ollama model.
