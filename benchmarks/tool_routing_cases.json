@@ -1,0 +1,63 @@
+[
+  {
+    "id": "git_push_status",
+    "description": "Verify whether local repository work reached its remote",
+    "messages": [
+      {"role": "user", "content": "Are all changes in this repo pushed up?"}
+    ],
+    "expected_tools": ["git_status", "git_log", "run_shell_command"],
+    "relevant_tools": ["git_status", "git_log", "run_shell_command"]
+  },
+  {
+    "id": "git_refusal_followup",
+    "description": "Recover the real multi-turn Git request without copying old refusals",
+    "messages": [
+      {"role": "user", "content": "Are all changes in this repo pushed up?"},
+      {"role": "assistant", "content": "I don't have the capability to access or check git status remotely."},
+      {"role": "user", "content": "That's wrong"},
+      {"role": "assistant", "content": "You can use git status in your terminal."},
+      {"role": "user", "content": "run it yourself"},
+      {"role": "user", "content": "do it"}
+    ],
+    "expected_tools": ["git_status", "git_log", "run_shell_command"],
+    "relevant_tools": ["git_status", "git_log", "run_shell_command"]
+  },
+  {
+    "id": "read_gtk_version",
+    "description": "Inspect a named local source file instead of narrating how",
+    "messages": [
+      {"role": "user", "content": "Read /var/www/LiamAgent/LiamGUI.py and tell me which GTK version it requires."}
+    ],
+    "expected_tools": ["read_file"],
+    "relevant_tools": ["read_file"]
+  },
+  {
+    "id": "read_core_constants",
+    "description": "Inspect another named source file for exact values",
+    "messages": [
+      {"role": "user", "content": "Read /var/www/LiamAgent/agent/core.py and tell me the values of MAX_STEPS, MAX_TOTAL_CALLS, CHUNK_THRESHOLD, and CHUNK_SIZE."}
+    ],
+    "expected_tools": ["read_file", "search_text"],
+    "relevant_tools": ["read_file", "search_text"]
+  },
+  {
+    "id": "remote_ollama_ps",
+    "description": "Use desktop SSH for an explicitly named allowlisted host",
+    "messages": [
+      {"role": "user", "content": "On alien, run ollama ps."}
+    ],
+    "expected_tools": ["ssh_list_hosts", "ssh_run_command"],
+    "relevant_tools": ["ssh_list_hosts", "ssh_run_command"],
+    "recovery_eligible": false
+  },
+  {
+    "id": "remote_ollama_pull",
+    "description": "Start a long remote Ollama operation through desktop SSH",
+    "messages": [
+      {"role": "user", "content": "On alien, run ollama pull llama3.1:8b."}
+    ],
+    "expected_tools": ["ssh_list_hosts", "ssh_run_command"],
+    "relevant_tools": ["ssh_list_hosts", "ssh_run_command"],
+    "recovery_eligible": false
+  }
+]

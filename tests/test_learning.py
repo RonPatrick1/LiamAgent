@@ -129,6 +129,9 @@ class ModelRecoveryTests(unittest.TestCase):
         agent.on_tool_call = mock.Mock()
         agent.on_status = mock.Mock()
         agent.auto_confirm = True
+        agent._select_recovery_tool_schemas = mock.Mock(
+            return_value=agent.tool_schemas,
+        )
         return agent
 
     @mock.patch.object(core.memory, "save_message")
@@ -150,6 +153,10 @@ class ModelRecoveryTests(unittest.TestCase):
             "Host recovery: Your previous response was empty",
             agent.client.messages[1][-1]["content"],
         )
+        self.assertEqual(len(agent.client.messages[1]), 2)
+        self.assertNotIn("assistant", [
+            message["role"] for message in agent.client.messages[1]
+        ])
         agent.on_status.assert_called_once()
 
     @mock.patch.object(core.memory, "save_message")
@@ -214,6 +221,63 @@ class ModelRecoveryTests(unittest.TestCase):
         self.assertIn("invalid tool-call data", reply)
         self.assertIn("No tool ran", reply)
         agent._run_tool.assert_not_called()
+
+    def test_helper_router_returns_only_valid_allowed_tools_with_a_hard_cap(self):
+        names = [
+            "read_file", "git_status", "git_log", "run_shell_command",
+            "list_directory", "search_text", "file_info",
+        ]
+        agent = self._agent([], tool_names=set(names))
+        del agent._select_recovery_tool_schemas
+        agent.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "Are all repo changes pushed?"},
+        ]
+        agent._helper_chat = mock.Mock(return_value={
+            "content": json.dumps({"tools": names + ["not_a_real_tool"]}),
+        })
+
+        selected = agent._select_recovery_tool_schemas(1)
+
+        selected_names = [schema["function"]["name"] for schema in selected]
+        self.assertEqual(selected_names, names[:core.RECOVERY_TOOL_LIMIT])
+        self.assertNotIn("not_a_real_tool", selected_names)
+
+    def test_router_failure_never_restores_the_full_tool_catalog(self):
+        agent = self._agent([], tool_names={"read_file", "run_shell_command"})
+        del agent._select_recovery_tool_schemas
+        agent.messages = [{"role": "user", "content": "inspect it"}]
+        agent._helper_chat = mock.Mock(return_value={"content": "not json"})
+
+        selected = agent._select_recovery_tool_schemas(0)
+
+        self.assertEqual(selected, [])
+        self.assertIn(
+            "no tool will be exposed",
+            agent.on_status.call_args.args[0],
+        )
+
+    def test_focused_context_keeps_recent_users_and_drops_assistant_refusals(self):
+        agent = self._agent([])
+        agent.messages = [
+            {"role": "system", "content": "very long normal system prompt"},
+            {"role": "user", "content": "Are all changes pushed?"},
+            {"role": "assistant", "content": "I cannot access Git."},
+            {"role": "user", "content": "run it yourself"},
+            {"role": "assistant", "content": "Use git status yourself."},
+            {"role": "user", "content": "do it"},
+        ]
+
+        focused = agent._focused_recovery_messages(5, core.TOOL_DEFLECTION_RECOVERY)
+        combined = "\n".join(message["content"] for message in focused)
+
+        self.assertEqual([message["role"] for message in focused], ["system", "user"])
+        self.assertIn("Are all changes pushed?", combined)
+        self.assertIn("run it yourself", combined)
+        self.assertIn("do it", combined)
+        self.assertNotIn("I cannot access Git", combined)
+        self.assertNotIn("Use git status yourself", combined)
+        self.assertNotIn("very long normal system prompt", combined)
 
 
 class ImageRoutingTests(unittest.TestCase):

@@ -92,12 +92,18 @@ the user must still press Enter or click Send.
 
 Liam never treats an absent model response as success. Empty replies, malformed
 tool calls, and capability brush-offs while tools are available get one focused
-model retry using the same tool schemas. If that retry still cannot produce a
-valid answer or tool call, the current frontend receives an explicit `[error]`
-stating that no action should be assumed. Desktop thread-loading and image
-rendering failures, Messenger/FredPlayer request exceptions, CLI exceptions,
-and routine-agent exceptions are likewise surfaced instead of returning a
-blank response.
+model retry. The preprocessing helper selects the single best allowed tool for
+the next action; the primary retry sees only that schema and a compact sequence
+of recent user requests, with prior assistant refusals and tool payloads removed.
+If that retry still cannot produce a valid answer or tool call, the current
+frontend receives an explicit `[error]` stating that no action should be
+assumed. Desktop thread-loading and image rendering failures,
+Messenger/FredPlayer request exceptions, CLI exceptions, and routine-agent
+exceptions are likewise surfaced instead of returning a blank response.
+
+The repeatable primary-model/tool-router benchmark and latest measured results
+are documented in [benchmarks/README.md](benchmarks/README.md). It records tool
+calls but never executes them.
 
 ## Web search
 
