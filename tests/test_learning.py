@@ -19,6 +19,16 @@ class FakeClient:
         return {"content": self.payload or "not json"}
 
 
+class SequenceClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.messages = []
+
+    def chat(self, messages, tools=None):
+        self.messages.append(messages)
+        return self.responses.pop(0)
+
+
 def bare_agent(*, owner=True, learning=True, payload=None):
     agent = core.Agent.__new__(core.Agent)
     agent.client = FakeClient(payload)
@@ -106,70 +116,104 @@ class ToolOutcomeTests(unittest.TestCase):
                          ("failure", "invalid_arguments"))
 
 
-class GitSyncRoutingTests(unittest.TestCase):
-    def test_push_status_question_is_distinct_from_push_command(self):
-        self.assertTrue(core._is_git_sync_status_request(
-            "Are all changes in this repo pushed up?"
-        ))
-        self.assertTrue(core._is_git_sync_status_request(
-            "Do I have any unpushed commits?"
-        ))
-        self.assertFalse(core._is_git_sync_status_request(
-            "Please push all changes in this repo."
-        ))
-        self.assertFalse(core._is_git_sync_status_request(
-            "How do I push these commits?"
-        ))
-
-    def test_porcelain_status_is_formatted_without_model_judgment(self):
-        raw = (
-            "# branch.oid abc123\n"
-            "# branch.head master\n"
-            "# branch.upstream origin/master\n"
-            "# branch.ab +2 -1\n"
-            "1 .M N... 100644 100644 100644 abc123 abc123 agent/core.py\n"
-            "[exit code: 0]"
-        )
-
-        result = core._format_git_sync_status(raw)
-
-        self.assertIn("All changes pushed: NO", result)
-        self.assertIn("Uncommitted paths: 1", result)
-        self.assertIn("Unpushed commits: 2", result)
-        self.assertIn("Remote-only commits not pulled: 1", result)
-        self.assertIn(".M agent/core.py", result)
-        self.assertNotIn("100644", result)
-
-    @mock.patch.object(core.memory, "save_message")
-    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
-    def test_push_status_question_runs_existing_shell_tool_directly(
-        self, _match_lessons, _save_message,
-    ):
-        agent = bare_agent(payload=RuntimeError("model must not be consulted"))
+class ModelRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _agent(responses, tool_names=()):
+        agent = bare_agent()
+        agent.client = SequenceClient(responses)
         agent.messages = [{"role": "system", "content": "system"}]
         agent.tool_schemas = [
             schema for schema in core.TOOL_SCHEMAS
-            if schema["function"]["name"] == "run_shell_command"
+            if schema["function"]["name"] in set(tool_names)
         ]
         agent.on_tool_call = mock.Mock()
-        agent._execute_tool = mock.Mock(return_value=(
-            "# branch.oid abc123\n"
-            "# branch.head master\n"
-            "# branch.upstream origin/master\n"
-            "# branch.ab +0 -0\n"
-            "[exit code: 0]"
-        ))
+        agent.on_status = mock.Mock()
+        agent.auto_confirm = True
+        return agent
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_two_empty_model_responses_become_a_visible_terminal_error(
+        self, _match_lessons, _save_message,
+    ):
+        agent = self._agent([
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": ""},
+        ])
+
+        reply = agent.step("Answer me")
+
+        self.assertIn("[error]", reply)
+        self.assertIn("No tool ran and no action was performed", reply)
+        self.assertEqual(len(agent.client.messages), 2)
+        self.assertIn(
+            "Host recovery: Your previous response was empty",
+            agent.client.messages[1][-1]["content"],
+        )
+        agent.on_status.assert_called_once()
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_capability_deflection_retries_model_then_honors_its_tool_call(
+        self, _match_lessons, _save_message,
+    ):
+        agent = self._agent([
+            {
+                "role": "assistant",
+                "content": "I don't have the capability to check this repository.",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "run_shell_command",
+                        "arguments": {"command": "git status --short"},
+                    },
+                }],
+            },
+            {"role": "assistant", "content": "The repository is clean."},
+        ], tool_names={"run_shell_command"})
+        agent._run_tool = mock.Mock(return_value="[exit code: 0]")
 
         reply = agent.step("Are all changes in this repo pushed up?")
 
-        self.assertIn("All changes pushed: YES", reply)
+        self.assertEqual(reply, "The repository is clean.")
+        self.assertEqual(len(agent.client.messages), 3)
+        self.assertIn(
+            "Host recovery: Your previous answer claimed you could not perform",
+            agent.client.messages[1][-1]["content"],
+        )
+        agent._run_tool.assert_called_once_with(
+            "run_shell_command", {"command": "git status --short"},
+        )
         agent.on_tool_call.assert_called_once_with(
-            "run_shell_command", {"command": core.GIT_SYNC_STATUS_COMMAND},
+            "run_shell_command", {"command": "git status --short"},
         )
-        agent._execute_tool.assert_called_once_with(
-            "run_shell_command", {"command": core.GIT_SYNC_STATUS_COMMAND},
-        )
-        self.assertEqual(agent.client.calls, 0)
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_second_malformed_tool_call_is_visible_and_never_executed(
+        self, _match_lessons, _save_message,
+    ):
+        malformed = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "run_shell_command",
+                    "arguments": "{not json",
+                },
+            }],
+        }
+        agent = self._agent([malformed, malformed], tool_names={"run_shell_command"})
+        agent._run_tool = mock.Mock()
+
+        reply = agent.step("Check the repository")
+
+        self.assertIn("invalid tool-call data", reply)
+        self.assertIn("No tool ran", reply)
+        agent._run_tool.assert_not_called()
 
 
 class ImageRoutingTests(unittest.TestCase):

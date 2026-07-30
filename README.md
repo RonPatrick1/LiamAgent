@@ -90,11 +90,14 @@ recalled or listed.
 History navigation only fills the editor. It never executes a recalled entry;
 the user must still press Enter or click Send.
 
-Repository push-status questions such as “Are all changes in this repo pushed
-up?” bypass the language model and run standard Git commands through the
-existing shell tool. Liam fetches the configured upstream, runs porcelain-v2
-status, then reports uncommitted paths, unpushed commits, and remote-only
-commits separately. This inspection never commits or pushes.
+Liam never treats an absent model response as success. Empty replies, malformed
+tool calls, and capability brush-offs while tools are available get one focused
+model retry using the same tool schemas. If that retry still cannot produce a
+valid answer or tool call, the current frontend receives an explicit `[error]`
+stating that no action should be assumed. Desktop thread-loading and image
+rendering failures, Messenger/FredPlayer request exceptions, CLI exceptions,
+and routine-agent exceptions are likewise surfaced instead of returning a
+blank response.
 
 ## Web search
 

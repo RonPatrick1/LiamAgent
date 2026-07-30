@@ -31,7 +31,7 @@ def _load_dotenv(path=None):
 _load_dotenv()
 
 from agent import memory, routines, settings as liam_settings
-from agent.core import Agent
+from agent.core import Agent, ensure_visible_reply
 from agent.llm import DEFAULT_MODEL
 from agent.tools import TOOL_IMPL, TOOL_SCHEMAS
 
@@ -89,14 +89,23 @@ def _run_routine(routine_id):
     routine_allowed_tools = set(TOOL_IMPL) - {
         "schedule_routine", "cancel_routine", "list_my_routines",
     }
-    agent = Agent(
-        model=saved["model"] or DEFAULT_MODEL, auto_confirm=True,
-        workdir=workdir, session_id=session["id"],
-        extra_folders=extra_folders, custom_instructions=saved["custom_instructions"],
-        channel="routine", actor_id="system-routine", is_owner=True,
-        learning_enabled=False, allowed_tools=routine_allowed_tools,
-    )
-    reply = agent.step(routine["prompt"])
+    try:
+        agent = Agent(
+            model=saved["model"] or DEFAULT_MODEL, auto_confirm=True,
+            workdir=workdir, session_id=session["id"],
+            extra_folders=extra_folders, custom_instructions=saved["custom_instructions"],
+            channel="routine", actor_id="system-routine", is_owner=True,
+            learning_enabled=False, allowed_tools=routine_allowed_tools,
+        )
+        reply = ensure_visible_reply(
+            agent.step(routine["prompt"]), stage=f"running routine #{routine_id}",
+            tool_events=agent._tool_events,
+        )
+    except Exception as exc:
+        reply = (
+            f"[error] Liam failed while running routine #{routine_id} "
+            f"({type(exc).__name__}): {exc}"
+        )
 
     if is_matrix:
         room_id = folder_path[len(matrix_prefix):]
@@ -105,10 +114,16 @@ def _run_routine(routine_id):
     else:
         summary = reply.strip().splitlines()[0][:200] if reply.strip() else "(no reply)"
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 ["notify-send", f"Liam routine: {session['title']}", summary],
                 capture_output=True, timeout=5,
             )
+            if completed.returncode != 0:
+                detail = completed.stderr.decode(errors="replace").strip()
+                print(
+                    f"[routine] notify-send failed with exit code "
+                    f"{completed.returncode}: {detail or '(no error text)'}"
+                )
         except Exception as exc:
             print(f"[routine] notify-send failed: {exc}")
 
@@ -172,7 +187,16 @@ def main():
             print()
             continue
 
-        reply = agent.step(user_input)
+        try:
+            reply = ensure_visible_reply(
+                agent.step(user_input), stage="processing the CLI request",
+                tool_events=agent._tool_events,
+            )
+        except Exception as exc:
+            reply = (
+                f"[error] Liam failed while processing the CLI request "
+                f"({type(exc).__name__}): {exc}"
+            )
         print("\nLiam>")
         print(reply)
         print()

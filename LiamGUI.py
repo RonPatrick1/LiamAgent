@@ -63,7 +63,7 @@ _load_dotenv()
 from agent import memory, routines, ssh_secrets  # noqa: E402
 from agent import tools as agent_tools  # noqa: E402
 from agent import settings as liam_settings  # noqa: E402
-from agent.core import Agent  # noqa: E402
+from agent.core import Agent, ensure_visible_reply  # noqa: E402
 from agent.llm import DEFAULT_MODEL  # noqa: E402
 
 APP_ID = "com.ronpatrick.Liam"
@@ -986,10 +986,24 @@ class LiamWindow(Gtk.ApplicationWindow):
         threading.Thread(target=self._switch_worker, args=(folder_path, title, is_new), daemon=True).start()
 
     def _switch_worker(self, folder_path, title, is_new):
-        session_id = memory.get_or_create_session(folder_path, title=title)
-        agent, history = self._build_agent_and_history(session_id, folder_path)
-        resolved_title = title or os.path.basename(os.path.abspath(os.path.expanduser(folder_path)).rstrip("/")) or folder_path
-        GLib.idle_add(self._finish_switch, session_id, folder_path, resolved_title, agent, history, is_new)
+        try:
+            session_id = memory.get_or_create_session(folder_path, title=title)
+            agent, history = self._build_agent_and_history(session_id, folder_path)
+            resolved_title = title or os.path.basename(os.path.abspath(os.path.expanduser(folder_path)).rstrip("/")) or folder_path
+            GLib.idle_add(self._finish_switch, session_id, folder_path, resolved_title, agent, history, is_new)
+        except Exception as exc:
+            GLib.idle_add(
+                self._finish_switch_error,
+                f"[error] Liam could not open that thread ({type(exc).__name__}): {exc}",
+            )
+
+    def _finish_switch_error(self, message):
+        self.headerbar.set_title("Liam — thread load failed")
+        self.spinner.stop()
+        self.spinner.set_visible(False)
+        self._append_message(message, "assistant", use_markup=True)
+        self._set_busy(False)
+        return False
 
     def _finish_switch(self, session_id, folder_path, title, agent, history, is_new):
         self._apply_session(session_id, folder_path, title, agent, history)
@@ -2836,8 +2850,19 @@ class LiamWindow(Gtk.ApplicationWindow):
         try:
             reply = agent.step(text, images=images)
         except Exception as exc:
-            reply = f"[error] {exc}"
-        image_map = self._download_reply_images(reply)
+            reply = (
+                f"[error] Liam failed while processing this desktop request "
+                f"({type(exc).__name__}): {exc}"
+            )
+        reply = ensure_visible_reply(reply, stage="processing this desktop request")
+        try:
+            image_map = self._download_reply_images(reply)
+        except Exception as exc:
+            image_map = {}
+            reply += (
+                "\n\n[error] Liam produced text, but the desktop failed while "
+                f"preparing its linked images ({type(exc).__name__}): {exc}"
+            )
         GLib.idle_add(self._finish_reply, reply, image_map)
 
     def _finish_reply(self, reply, image_map=None):

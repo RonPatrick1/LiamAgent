@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import memory, routines
 from . import tools as tools_module
-from .core import Agent
+from .core import Agent, ensure_visible_reply
 from .llm import DEFAULT_MODEL
 from .tools import DESKTOP_ONLY_TOOLS, TOOL_IMPL
 
@@ -93,7 +93,10 @@ def handle_chat(room_id, sender_id, message):
         channel="matrix", actor_id=sender_id, is_owner=is_owner,
         learning_enabled=True,
     )
-    return agent.step(message)
+    return ensure_visible_reply(
+        agent.step(message), stage="answering the Patrick Messenger request",
+        tool_events=agent._tool_events,
+    )
 
 
 def handle_fredplayer_ask(device_id, message):
@@ -174,7 +177,10 @@ def handle_fredplayer_ask(device_id, message):
             "again: pick specific songs (artist + title) and call "
             "fredplayer_propose_playlist with them directly."
         )
-        reply = agent.step(prompt)
+        reply = ensure_visible_reply(
+            agent.step(prompt), stage="answering the FredPlayer request",
+            tool_events=agent._tool_events,
+        )
         playlist = tools_module._PROPOSED_PLAYLISTS.pop(session_id, None)
         if playlist is not None:
             break
@@ -219,8 +225,27 @@ class _ChatHandler(BaseHTTPRequestHandler):
                 payload = {"ok": True}
             status = 200
         except Exception as exc:
-            payload = {"error": str(exc)}
-            status = 400
+            visible_error = (
+                f"[error] Liam failed inside the {self.path} request handler "
+                f"({type(exc).__name__}): {exc}"
+            )
+            # The Messenger/FredPlayer clients display `reply`; a bare HTTP
+            # 400 with only an `error` field was discarded by callers and
+            # looked exactly like Liam had ignored the user. Preserve the
+            # protocol's normal response shape so the failure reaches the UI.
+            if self.path == "/chat":
+                payload = {"reply": visible_error, "error": str(exc)}
+                status = 200
+            elif self.path == "/fredplayer-ask":
+                payload = {
+                    "reply": visible_error,
+                    "playlist": None,
+                    "error": str(exc),
+                }
+                status = 200
+            else:
+                payload = {"error": str(exc)}
+                status = 400
 
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)

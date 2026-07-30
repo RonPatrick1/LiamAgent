@@ -206,6 +206,63 @@ CAPABILITY_REFUSAL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# A stronger, capability-specific signal than CAPABILITY_REFUSAL_RE. This
+# does not decide which tool should run and does not execute anything. It
+# only recognizes the model giving the user a procedural brush-off while
+# this conversation has tools available, so the model can get one focused
+# chance to reconsider its own tool selection.
+TOOL_DEFLECTION_RE = re.compile(
+    r"\b(?:i\s+)?(?:do\s+not|don't)\s+have\s+(?:the\s+)?"
+    r"(?:ability|capability|access|permission)\b|"
+    r"\b(?:i\s+)?(?:can(?:not|'t)|am\s+unable\s+to)\s+"
+    r"(?:access|check|inspect|execute|run|use|open|read|write|modify|verify)\b|"
+    r"\b(?:you\s+(?:can|should|will\s+need\s+to)|you'll\s+need\s+to|"
+    r"please)\s+(?:run|execute|check|inspect|use)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+EMPTY_RESPONSE_RECOVERY = (
+    "[Host recovery: Your previous response was empty. Re-evaluate the "
+    "original request now. Either call an available tool needed to complete "
+    "it, or return a non-empty answer that states the concrete failure. Never "
+    "return an empty response and never imply an action happened unless a tool "
+    "actually performed it.]"
+)
+TOOL_DEFLECTION_RECOVERY = (
+    "[Host recovery: Your previous answer claimed you could not perform the "
+    "request or told the user to do it, but this conversation has tools. "
+    "Re-evaluate the original request and choose the appropriate available "
+    "tool yourself. Do not repeat instructions for the user. If none of the "
+    "available tools can do it, state the exact missing capability and do not "
+    "claim that any action occurred.]"
+)
+INVALID_TOOL_CALL_RECOVERY = (
+    "[Host recovery: Your previous tool call was structurally invalid and no "
+    "tool ran from it. Try once more using the exact JSON schema of an "
+    "available tool, or return a plain non-empty explanation of the failure.]"
+)
+
+
+def ensure_visible_reply(content, *, stage="request", tool_events=None):
+    """Never let a caller mistake an absent model reply for success.
+
+    Frontends also call this as defense in depth, but keeping the primary
+    contract here means every Agent caller receives printable text even if
+    Ollama returns null, an empty string, or a non-text content value.
+    """
+    if isinstance(content, str) and content.strip():
+        return content
+    if tool_events:
+        return (
+            f"[error] Liam failed to produce a visible response while {stage}. "
+            "Tool activity occurred, but no unreported result should be "
+            "assumed; review the displayed tool output."
+        )
+    return (
+        f"[error] Liam failed to produce a visible response while {stage}. "
+        "No tool ran and no action was performed."
+    )
+
 REMEMBER_REQUEST_RE = re.compile(
     r"^\s*(?:liam\s*[:,]?\s*)?(?:please\s+)?(?:"
     r"(?:(?:can|could|would|will)\s+you\s+)|"
@@ -405,85 +462,6 @@ PARAM_ALIASES = {
     "query_memory": {"query": "keyword", "search": "keyword"},
     "recall_notes": {"query": "keyword", "search": "keyword"},
 }
-
-
-def _is_git_sync_status_request(text):
-    """Recognize questions about local work reaching the tracked remote.
-
-    Deliberately exclude imperative push requests: this route only inspects
-    repository state and never authorizes a commit or push.
-    """
-    normalized = " ".join((text or "").lower().split())
-    if not re.search(r"\b(?:pushed|unpushed|push status|up to date with (?:the )?remote)\b", normalized):
-        return False
-    if re.search(r"\b(?:how (?:do|can|should) i|please push|push (?:all|my|the|these))\b", normalized):
-        return False
-    subject = re.search(
-        r"\b(?:repo(?:sitory)?|git|changes?|commits?|everything|anything|all)\b",
-        normalized,
-    )
-    question = re.search(
-        r"\b(?:are|is|have|has|did|do|what|which|check|verify|whether|status|any)\b",
-        normalized,
-    )
-    return bool(subject and question)
-
-
-GIT_SYNC_STATUS_COMMAND = "git fetch --quiet && git status --porcelain=v2 --branch"
-
-
-def _format_git_sync_status(result):
-    """Turn porcelain-v2 output into a literal, model-free answer."""
-    if not re.search(r"\[exit code: 0\]\s*$", result or ""):
-        return "I couldn't verify whether all changes are pushed.\n\n" + (result or "")
-
-    branch = "unknown"
-    upstream = None
-    ahead = behind = 0
-    changes = []
-    for line in (result or "").splitlines():
-        if line.startswith("# branch.head "):
-            branch = line.removeprefix("# branch.head ").strip()
-        elif line.startswith("# branch.upstream "):
-            upstream = line.removeprefix("# branch.upstream ").strip()
-        elif line.startswith("# branch.ab "):
-            match = re.fullmatch(r"# branch\.ab \+(\d+) -(\d+)", line)
-            if match:
-                ahead, behind = (int(value) for value in match.groups())
-        elif line and not line.startswith(("#", "[exit code:")):
-            if line.startswith("1 "):
-                fields = line.split(" ", 8)
-                changes.append(f"{fields[1]} {fields[8]}" if len(fields) == 9 else line)
-            elif line.startswith("2 "):
-                fields = line.split(" ", 9)
-                path = fields[9].replace("\t", " -> ") if len(fields) == 10 else line
-                changes.append(f"{fields[1]} {path}" if len(fields) == 10 else line)
-            elif line.startswith("u "):
-                fields = line.split(" ", 10)
-                changes.append(f"{fields[1]} {fields[10]}" if len(fields) == 11 else line)
-            else:
-                changes.append(line)
-
-    if upstream is None:
-        lines = [
-            "All changes pushed: UNKNOWN",
-            f"Branch: {branch}",
-            "Upstream: not configured",
-            f"Uncommitted paths: {len(changes)}",
-        ]
-    else:
-        all_pushed = not changes and ahead == 0
-        lines = [
-            f"All changes pushed: {'YES' if all_pushed else 'NO'}",
-            f"Branch: {branch}",
-            f"Upstream: {upstream}",
-            f"Uncommitted paths: {len(changes)}",
-            f"Unpushed commits: {ahead}",
-            f"Remote-only commits not pulled: {behind}",
-        ]
-    if changes:
-        lines.extend(["Working-tree changes:"] + changes[:50])
-    return "\n".join(lines)
 
 
 def _parse_explicit_ssh_command(text):
@@ -945,6 +923,8 @@ class Agent:
         """Apply the prompt budget and retry a context rejection once."""
         prepared = self._prepare_context_messages(messages)
         response = self.client.chat(prepared, tools=tools)
+        if not isinstance(response, dict):
+            return {"role": "assistant", "content": ""}
         if response.get("_liam_error") == "context_overflow":
             status = getattr(self, "on_status", None)
             if status:
@@ -953,6 +933,8 @@ class Agent:
                 messages, budget=CONTEXT_RETRY_CHAR_BUDGET,
             )
             response = self.client.chat(retry_messages, tools=tools)
+            if not isinstance(response, dict):
+                return {"role": "assistant", "content": ""}
         response = dict(response)
         response.pop("_liam_error", None)
         return response
@@ -2271,12 +2253,48 @@ class Agent:
             return content
         return f"{content.rstrip()}\n\n[{notice}]" if content.strip() else f"[{notice}]"
 
+    @staticmethod
+    def _tool_call_protocol_problem(message):
+        """Return a concrete reason when Ollama emitted unusable tool JSON."""
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            return None
+        if not isinstance(tool_calls, list):
+            return "tool_calls was not a list"
+        for index, call in enumerate(tool_calls, start=1):
+            if not isinstance(call, dict):
+                return f"tool call #{index} was not an object"
+            function = call.get("function")
+            if not isinstance(function, dict):
+                return f"tool call #{index} had no function object"
+            if not isinstance(function.get("name"), str) or not function["name"].strip():
+                return f"tool call #{index} had no function name"
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, ValueError) as exc:
+                    return f"tool call #{index} had invalid JSON arguments: {exc}"
+            if not isinstance(arguments, dict):
+                return f"tool call #{index} arguments were not an object"
+        return None
+
+    @staticmethod
+    def _append_terminal_model_failure(content, detail):
+        prefix = content.strip() if isinstance(content, str) else ""
+        failure = f"[error] {detail}"
+        return f"{prefix}\n\n{failure}" if prefix else failure
+
     def _finalize_learning(self, content, feedback_notice):
         # Only the host is allowed to issue lifecycle notices. The model
         # copied an earlier real notice from conversation history and
         # fabricated incremented lesson ids (#16/#17) even though no such
         # database rows existed.
-        content = MODEL_LEARNING_NOTICE_RE.sub("", content or "").rstrip()
+        if isinstance(content, str):
+            content = MODEL_LEARNING_NOTICE_RE.sub("", content).rstrip()
+        content = ensure_visible_reply(
+            content, stage="finalizing the answer", tool_events=self._tool_events,
+        )
         self._record_auto_lessons(content)
         self._evaluate_lesson_uses(content)
         content = self._append_learning_notice(content, feedback_notice)
@@ -2338,24 +2356,6 @@ class Agent:
         hint_text = "\n".join(f"- {record['lesson']}" for record in lesson_hits) if lesson_hits else None
 
         tool_results = []
-
-        # Whether local work actually reached the configured upstream is a
-        # deterministic repository query, not something the language model
-        # should narrate or guess. The model repeatedly claimed it lacked Git
-        # access despite git_status/git_log being present, then still refused
-        # after the owner explicitly told it to run the check itself.
-        if (
-            _is_git_sync_status_request(user_input)
-            and "run_shell_command" in available_tools
-        ):
-            args = {"command": GIT_SYNC_STATUS_COMMAND}
-            self.on_tool_call("run_shell_command", args)
-            result = self._execute_tool("run_shell_command", args)
-            content = self._finalize_learning(
-                _format_git_sync_status(result), feedback_notice,
-            )
-            memory.save_message("assistant", content, session_id=self.session_id)
-            return content
 
         # A literal backtick command addressed to one SSH alias is fully
         # specified by the user. Execute that exact structured tool call
@@ -2513,18 +2513,94 @@ class Agent:
 
         seen = {}  # (name, args) -> (result, structured outcome) for this turn
         total_calls = 0
+        recovery_attempted = False
+        recovery_instruction = None
 
         for _ in range(MAX_STEPS):
             chat_messages = self.messages
+            additions = []
             if hint_text:
+                additions.append(f"[Relevant lessons from past mistakes:\n{hint_text}]")
+            if recovery_instruction:
+                additions.append(recovery_instruction)
+            if additions:
                 chat_messages = list(self.messages)
                 hinted = dict(chat_messages[user_message_index])
-                hinted["content"] = f"{hinted['content']}\n\n[Relevant lessons from past mistakes:\n{hint_text}]"
+                hinted["content"] = f"{hinted['content']}\n\n" + "\n\n".join(additions)
                 chat_messages[user_message_index] = hinted
             message = self._chat(chat_messages, tools=self.tool_schemas)
+            if not isinstance(message, dict):
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                }
             self.messages.append(message)
 
             tool_calls = message.get("tool_calls")
+            protocol_problem = self._tool_call_protocol_problem(message)
+            content = message.get("content", "")
+            response_problem = None
+            next_recovery_instruction = None
+            if protocol_problem:
+                response_problem = f"invalid tool-call data: {protocol_problem}"
+                next_recovery_instruction = INVALID_TOOL_CALL_RECOVERY
+            elif not tool_calls and not isinstance(content, str):
+                response_problem = (
+                    "a non-text assistant response "
+                    f"({type(content).__name__})"
+                )
+                next_recovery_instruction = EMPTY_RESPONSE_RECOVERY
+            elif not tool_calls and not (content or "").strip():
+                response_problem = "an empty assistant response"
+                next_recovery_instruction = EMPTY_RESPONSE_RECOVERY
+            elif (
+                not tool_calls
+                and not tool_results
+                and available_tools
+                and not (content or "").lstrip().lower().startswith("[error]")
+                and TOOL_DEFLECTION_RE.search(content or "")
+            ):
+                response_problem = "a capability deflection despite available tools"
+                next_recovery_instruction = TOOL_DEFLECTION_RECOVERY
+
+            if response_problem and not recovery_attempted:
+                self.messages.pop()
+                recovery_attempted = True
+                recovery_instruction = next_recovery_instruction
+                self.on_status(
+                    f"  [model returned {response_problem}; retrying tool selection once...]"
+                )
+                continue
+
+            if protocol_problem:
+                # The second malformed call cannot be allowed into the
+                # execution loop. Preserve any prose, replace the invalid
+                # protocol object with a visible terminal failure, and end
+                # the turn normally.
+                message.pop("tool_calls", None)
+                tool_calls = None
+                content = self._append_terminal_model_failure(
+                    content,
+                    "Liam retried after invalid tool-call data, but the retry "
+                    f"was also invalid ({protocol_problem}). No tool ran from it.",
+                )
+                message["content"] = content
+            elif response_problem and recovery_attempted:
+                if next_recovery_instruction == TOOL_DEFLECTION_RECOVERY:
+                    content = self._append_terminal_model_failure(
+                        content,
+                        "Liam retried tool selection but still did not call a "
+                        "tool. No action was performed.",
+                    )
+                    message["content"] = content
+                else:
+                    content = ensure_visible_reply(
+                        content,
+                        stage="retrying the model response",
+                        tool_events=self._tool_events,
+                    )
+                    message["content"] = content
+
             if not tool_calls:
                 content = message.get("content", "")
                 tool_results = self._auto_follow_search_links(tool_results)
@@ -2557,6 +2633,7 @@ class Agent:
                     self._capture_code_artifacts(content)
                 return content
 
+            recovery_instruction = None
             calls_this_response = 0
             for call in tool_calls:
                 if total_calls >= MAX_TOTAL_CALLS:
