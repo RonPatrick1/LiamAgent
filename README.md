@@ -93,7 +93,9 @@ For an exact command, use the desktop form ``On HOST, run `COMMAND` with
 sudo.`` Liam routes that form directly to `ssh_run_command` without asking the
 model to reconstruct SSH or password handling. The generic local shell tool
 rejects SSH clients and stdin-password sudo pipelines. When the request ends
-in `with sudo`, the backticks are optional.
+in `with sudo`, the backticks are optional. The natural non-sudo form `On
+HOST, run COMMAND.` is also routed directly; use backticks when terminal
+punctuation is intentionally part of the literal command.
 
 ## Persistent memory
 

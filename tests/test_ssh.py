@@ -232,6 +232,15 @@ class DesktopOnlySshTests(unittest.TestCase):
             "sudo": True,
         })
 
+    def test_plain_non_sudo_request_parses_without_backticks(self):
+        request = "On alien, run ollama pull llama3.1:8b."
+
+        self.assertEqual(core._parse_explicit_ssh_command(request), {
+            "host": "alien",
+            "command": "ollama pull llama3.1:8b",
+            "sudo": False,
+        })
+
     def test_generic_shell_rejects_ssh_and_password_sudo_pipelines(self):
         agent = self._agent("gui")
         implementation = mock.Mock(return_value="must not run")
@@ -330,6 +339,30 @@ class DesktopOnlySshTests(unittest.TestCase):
             "sudo": True,
         }
         self.assertEqual(result, "Ollama installed")
+        agent.on_tool_call.assert_called_once_with("ssh_run_command", expected)
+        agent._execute_tool.assert_called_once_with("ssh_run_command", expected)
+        agent.client.chat.assert_not_called()
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_plain_non_sudo_desktop_request_bypasses_model(
+        self, _match_lessons, _save_message,
+    ):
+        agent = self._agent("gui")
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="Model downloaded")
+        agent._finalize_learning = mock.Mock(return_value="Model downloaded")
+        agent.client.chat.side_effect = AssertionError("model must not route this request")
+        request = "On alien, run ollama pull llama3.1:8b."
+
+        result = agent.step(request)
+
+        expected = {
+            "host": "alien",
+            "command": "ollama pull llama3.1:8b",
+            "sudo": False,
+        }
+        self.assertEqual(result, "Model downloaded")
         agent.on_tool_call.assert_called_once_with("ssh_run_command", expected)
         agent._execute_tool.assert_called_once_with("ssh_run_command", expected)
         agent.client.chat.assert_not_called()

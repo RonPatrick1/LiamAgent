@@ -334,6 +334,12 @@ EXPLICIT_SSH_PLAIN_SUDO_COMMAND_RE = re.compile(
     r"(?:with|using)\s+sudo[.!]?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+EXPLICIT_SSH_PLAIN_COMMAND_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?on\s+"
+    r"(?P<host>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*,\s*"
+    r"(?:please\s+)?run\s+(?P<command>.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 SHELL_SSH_CLIENT_RE = re.compile(
     r"(?:^|[\s;&|()])(?:/(?:usr/)?bin/)?(?:ssh|scp|sftp)(?=\s|$)",
     re.IGNORECASE,
@@ -404,10 +410,21 @@ def _parse_explicit_ssh_command(text):
         # unambiguous boundary for an unquoted command. This accepts natural
         # desktop phrasing without making arbitrary prose look executable.
         match = EXPLICIT_SSH_PLAIN_SUDO_COMMAND_RE.fullmatch(text or "")
-        if not match:
-            return None
-        command = match.group("command").strip()
-        sudo = True
+        if match:
+            command = match.group("command").strip()
+            sudo = True
+        else:
+            # An anchored "On HOST, run ..." imperative is itself explicit
+            # authorization. Backticks remain useful when a literal command
+            # intentionally ends in punctuation; for normal chat sentences,
+            # discard the final prose period/exclamation mark.
+            match = EXPLICIT_SSH_PLAIN_COMMAND_RE.fullmatch(text or "")
+            if not match:
+                return None
+            command = match.group("command").strip()
+            if command.endswith((".", "!")):
+                command = command[:-1].rstrip()
+            sudo = False
     if not command:
         return None
     return {
