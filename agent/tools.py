@@ -401,7 +401,10 @@ def _sudo_remote_command(command):
         "sudo -S -p '' -v && "
         f"printf '%s\\n' {shlex.quote(SUDO_VALIDATED_MARKER)} && "
         "exec </dev/null && "
-        f"sudo -n -p '' -- sh -c {quoted_command}"
+        "sudo -n -p '' -- env "
+        "SYSTEMD_PAGER=cat SYSTEMD_COLORS=0 SYSTEMD_URLIFY=0 "
+        "PAGER=cat GIT_PAGER=cat TERM=dumb "
+        f"sh -c {quoted_command}"
     )
 
 
@@ -449,9 +452,15 @@ def ssh_run_command(host, command, timeout=60, sudo=False):
         )
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or ""
+        stderr = exc.stderr or ""
         if isinstance(output, bytes):
             output = output.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        if stderr:
+            output += f"\n[stderr]\n{stderr}"
         output = _redact_secret(output, password)
+        output = output.replace(SUDO_VALIDATED_MARKER, "").lstrip("\r\n")
         return (
             f"{output}\n[stderr]\nSSH command timed out after {timeout} seconds."
             "\n[exit code: 124]"

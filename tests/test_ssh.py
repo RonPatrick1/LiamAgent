@@ -68,7 +68,12 @@ class SshToolTests(unittest.TestCase):
         self.assertIn("-tt", argv)
         self.assertIn("sudo -S -p '' -v", remote_command)
         self.assertIn("exec </dev/null", remote_command)
-        self.assertIn("sudo -n -p '' -- sh -c", remote_command)
+        self.assertIn("sudo -n -p '' -- env", remote_command)
+        self.assertIn("SYSTEMD_PAGER=cat", remote_command)
+        self.assertIn("SYSTEMD_COLORS=0", remote_command)
+        self.assertIn("SYSTEMD_URLIFY=0", remote_command)
+        self.assertIn("PAGER=cat", remote_command)
+        self.assertIn("TERM=dumb", remote_command)
         self.assertNotIn(password, " ".join(argv))
         self.assertEqual(run.call_args.kwargs["input"], f"{password}\n")
         self.assertNotIn(password, result)
@@ -144,6 +149,27 @@ class SshToolTests(unittest.TestCase):
         self.assertTrue(result.startswith("Error:"))
         self.assertIn("[REDACTED]", result)
         self.assertNotIn(password, result)
+
+    def test_timeout_redacts_password_and_internal_validation_marker(self):
+        password = "timeout-secret"
+        expired = subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=70,
+            output=f"{password}\r\n{tools.SUDO_VALIDATED_MARKER}\r\n",
+            stderr="WARNING: terminal is not fully functional\n",
+        )
+        with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
+             mock.patch.object(tools, "_ssh_host_details", return_value=self._identity()), \
+             mock.patch.object(
+                 tools.ssh_secrets, "lookup_sudo_password", return_value=password,
+             ), \
+             mock.patch.object(tools.subprocess, "run", side_effect=expired):
+            result = tools.ssh_run_command("alien", "systemctl show ollama", sudo=True)
+
+        self.assertIn("timed out", result)
+        self.assertIn("terminal is not fully functional", result)
+        self.assertIn("[REDACTED]", result)
+        self.assertNotIn(password, result)
+        self.assertNotIn(tools.SUDO_VALIDATED_MARKER, result)
 
     def test_sudo_on_unknown_host_is_rejected_before_secret_lookup(self):
         with mock.patch.dict(tools.os.environ, {"LIAM_SSH_HOSTS": "alien"}), \
