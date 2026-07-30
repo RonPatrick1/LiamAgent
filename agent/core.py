@@ -327,6 +327,13 @@ EXPLICIT_SSH_COMMAND_RE = re.compile(
     r"(?P<sudo>\s+(?:with|using)\s+sudo)?[.!]?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+EXPLICIT_SSH_PLAIN_SUDO_COMMAND_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?on\s+"
+    r"(?P<host>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*,\s*"
+    r"(?:please\s+)?run\s+(?P<command>.+?)\s+"
+    r"(?:with|using)\s+sudo[.!]?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 SHELL_SSH_CLIENT_RE = re.compile(
     r"(?:^|[\s;&|()])(?:/(?:usr/)?bin/)?(?:ssh|scp|sftp)(?=\s|$)",
     re.IGNORECASE,
@@ -387,17 +394,26 @@ PARAM_ALIASES = {
 
 
 def _parse_explicit_ssh_command(text):
-    """Parse only the exact backtick form; prose remote tasks stay model-led."""
+    """Parse exact remote commands; prose remote tasks stay model-led."""
     match = EXPLICIT_SSH_COMMAND_RE.fullmatch(text or "")
-    if not match:
-        return None
-    command = match.group("command").strip()
+    if match:
+        command = match.group("command").strip()
+        sudo = bool(match.group("sudo"))
+    else:
+        # With an explicit trailing "with sudo", the suffix gives a safe,
+        # unambiguous boundary for an unquoted command. This accepts natural
+        # desktop phrasing without making arbitrary prose look executable.
+        match = EXPLICIT_SSH_PLAIN_SUDO_COMMAND_RE.fullmatch(text or "")
+        if not match:
+            return None
+        command = match.group("command").strip()
+        sudo = True
     if not command:
         return None
     return {
         "host": match.group("host"),
         "command": command,
-        "sudo": bool(match.group("sudo")),
+        "sudo": sudo,
     }
 
 

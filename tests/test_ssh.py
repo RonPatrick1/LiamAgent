@@ -220,6 +220,18 @@ class DesktopOnlySshTests(unittest.TestCase):
             "On alien, install Ollama and configure it for me."
         ))
 
+    def test_plain_sudo_request_parses_without_backticks(self):
+        request = (
+            "On alien, run curl -fsSL https://ollama.com/install.sh | sh "
+            "with sudo."
+        )
+
+        self.assertEqual(core._parse_explicit_ssh_command(request), {
+            "host": "alien",
+            "command": "curl -fsSL https://ollama.com/install.sh | sh",
+            "sudo": True,
+        })
+
     def test_generic_shell_rejects_ssh_and_password_sudo_pipelines(self):
         agent = self._agent("gui")
         implementation = mock.Mock(return_value="must not run")
@@ -280,6 +292,33 @@ class DesktopOnlySshTests(unittest.TestCase):
         agent.client.chat.side_effect = AssertionError("model must not route this request")
         request = (
             "On alien, run `curl -fsSL https://ollama.com/install.sh | sh` "
+            "with sudo."
+        )
+
+        result = agent.step(request)
+
+        expected = {
+            "host": "alien",
+            "command": "curl -fsSL https://ollama.com/install.sh | sh",
+            "sudo": True,
+        }
+        self.assertEqual(result, "Ollama installed")
+        agent.on_tool_call.assert_called_once_with("ssh_run_command", expected)
+        agent._execute_tool.assert_called_once_with("ssh_run_command", expected)
+        agent.client.chat.assert_not_called()
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_plain_sudo_desktop_request_also_bypasses_model(
+        self, _match_lessons, _save_message,
+    ):
+        agent = self._agent("gui")
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="Ollama installed")
+        agent._finalize_learning = mock.Mock(return_value="Ollama installed")
+        agent.client.chat.side_effect = AssertionError("model must not route this request")
+        request = (
+            "On alien, run curl -fsSL https://ollama.com/install.sh | sh "
             "with sudo."
         )
 
