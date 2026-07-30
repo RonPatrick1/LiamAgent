@@ -90,6 +90,17 @@ DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".liam_d
 # Matches agent/core.py's system-prompt instruction to use standard
 # Markdown image syntax for anything found via image_search.
 IMAGE_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
+HISTORY_COMMAND_RE = re.compile(
+    r"^\s*history(?:\s+(?P<argument>help|\d+))?\s*$", re.IGNORECASE,
+)
+
+HISTORY_HELP = """Command history shortcuts:
+  Up / Ctrl+P       previous entry
+  Down / Ctrl+N     next entry; restore unfinished draft at the end
+  Alt+< / Alt+>     oldest entry / newest unfinished draft
+  Alt+Up / Alt+Down previous / next entry matching the current prefix
+  Ctrl+R / Ctrl+S   reverse / forward incremental substring search
+  history [N]       show up to the latest 1,000 entries"""
 
 EXTERNAL_SESSION_PREFIXES = ("/matrix-room/", "/fredplayer-device/")
 
@@ -158,6 +169,126 @@ def _finished_once_status(routine, now=None):
     except (KeyError, TypeError, ValueError):
         return "Invalid schedule"
     return "Expired" if run_at <= (now or datetime.now()) else None
+
+
+def _parse_history_request(text):
+    match = HISTORY_COMMAND_RE.fullmatch(text or "")
+    if not match:
+        return None
+    argument = (match.group("argument") or "").lower()
+    if argument == "help":
+        return {"help": True, "limit": None}
+    limit = memory.COMMAND_HISTORY_LIMIT if not argument else int(argument)
+    return {
+        "help": False,
+        "limit": min(max(limit, 1), memory.COMMAND_HISTORY_LIMIT),
+    }
+
+
+def _format_command_history(rows):
+    if not rows:
+        return "No command history yet."
+    lines = []
+    for row in rows:
+        command = (row.get("command_text") or "").replace("\r", "")
+        command = command.replace("\n", "\\n")
+        lines.append(f"{row.get('id', 0):>6}  {command}")
+    return "\n".join(lines)
+
+
+class _CommandHistoryNavigator:
+    """Pure editing state for shell-style history recall and search."""
+
+    def __init__(self, entries=None, limit=memory.COMMAND_HISTORY_LIMIT):
+        self.limit = limit
+        self.entries = list(entries or [])[-limit:]
+        self.index = len(self.entries)
+        self.draft = ""
+        self.prefix_query = None
+        self.prefix_index = None
+
+    def reset_navigation(self, draft=""):
+        self.index = len(self.entries)
+        self.draft = draft
+        self.prefix_query = None
+        self.prefix_index = None
+
+    def record(self, text):
+        if text and text.strip():
+            self.entries.append(text)
+            self.entries = self.entries[-self.limit:]
+        self.reset_navigation()
+
+    def previous(self, current):
+        if not self.entries:
+            return None
+        if self.index == len(self.entries):
+            self.draft = current
+        self.index = max(self.index - 1, 0)
+        self.prefix_query = None
+        self.prefix_index = None
+        return self.entries[self.index]
+
+    def next(self, current):
+        if not self.entries or self.index == len(self.entries):
+            return None
+        if self.index < len(self.entries) - 1:
+            self.index += 1
+            return self.entries[self.index]
+        self.index = len(self.entries)
+        return self.draft
+
+    def oldest(self, current):
+        if not self.entries:
+            return None
+        if self.index == len(self.entries):
+            self.draft = current
+        self.index = 0
+        self.prefix_query = None
+        self.prefix_index = None
+        return self.entries[0]
+
+    def newest(self, current):
+        if self.index == len(self.entries):
+            return current
+        self.index = len(self.entries)
+        self.prefix_query = None
+        self.prefix_index = None
+        return self.draft
+
+    def prefix(self, current, direction):
+        if not self.entries:
+            return None
+        if self.prefix_query is None:
+            self.prefix_query = current
+            self.draft = current
+            self.prefix_index = len(self.entries) if direction < 0 else -1
+        start = self.prefix_index + direction
+        indices = (
+            range(start, -1, -1) if direction < 0
+            else range(start, len(self.entries))
+        )
+        for index in indices:
+            if self.entries[index].startswith(self.prefix_query):
+                self.prefix_index = index
+                self.index = index
+                return self.entries[index]
+        return None
+
+    def search(self, query, direction=-1, start=None):
+        if not self.entries:
+            return None
+        query = (query or "").casefold()
+        if direction < 0:
+            first = len(self.entries) - 1 if start is None else start - 1
+            indices = range(first, -1, -1)
+        else:
+            first = 0 if start is None else start + 1
+            indices = range(first, len(self.entries))
+        for index in indices:
+            if query in self.entries[index].casefold():
+                return index, self.entries[index]
+        return None
 
 
 def _move_window(window, x, y):
@@ -239,6 +370,17 @@ class LiamWindow(Gtk.ApplicationWindow):
         self._thinking_text_mark = None
         self._thinking_started_at = None
         self._thinking_label = None
+        history_rows = memory.load_command_history(memory.COMMAND_HISTORY_LIMIT)
+        self._command_history = _CommandHistoryNavigator(
+            [row["command_text"] for row in history_rows]
+        )
+        self._setting_history_text = False
+        self._history_search_popover = None
+        self._history_search_entry = None
+        self._history_search_label = None
+        self._history_search_index = None
+        self._history_search_origin = ""
+        self._history_search_direction = -1
 
         # Patrick Messenger's placement lifecycle, kept deliberately
         # separate from the rest of the UI state.
@@ -376,14 +518,15 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.pending_image_box.pack_start(remove_pending_button, False, False, 0)
         bottom.pack_start(self.pending_image_box, False, False, 0)
 
-        # A Gtk.Entry can't hold more than one line at all — Ctrl+Enter for
+        # A Gtk.Entry can't hold more than one line at all — Shift+Enter for
         # a newline needs a real multi-line widget. GTK delivers full key
         # events with modifier state, unlike a terminal, so Enter-vs-
-        # Ctrl+Enter is fully reliable here.
+        # Shift+Enter is fully reliable here.
         self.entry = Gtk.TextView()
         self.entry.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.entry.connect("key-press-event", self._on_entry_key_press)
         self.entry.connect("paste-clipboard", self._on_entry_paste_clipboard)
+        self.entry.get_buffer().connect("changed", self._on_entry_changed)
         entry_scroller = Gtk.ScrolledWindow()
         entry_scroller.set_hexpand(True)
         entry_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -2344,9 +2487,188 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.buffer.insert_pixbuf(self.buffer.get_end_iter(), pixbuf)
         self._scroll_to_bottom()
 
-    def _on_entry_key_press(self, _widget, event):
+    def _entry_text(self):
+        buf = self.entry.get_buffer()
+        return buf.get_text(*buf.get_bounds(), True)
+
+    def _set_entry_text(self, text):
+        self._setting_history_text = True
+        try:
+            buf = self.entry.get_buffer()
+            buf.set_text(text or "")
+            buf.place_cursor(buf.get_end_iter())
+        finally:
+            self._setting_history_text = False
+
+    def _on_entry_changed(self, _buffer):
+        if self._setting_history_text or self._history_search_popover is not None:
+            return
+        self._command_history.reset_navigation(self._entry_text())
+
+    def _entry_cursor_at_history_boundary(self, direction):
+        buf = self.entry.get_buffer()
+        if buf.get_has_selection():
+            return False
+        cursor = buf.get_iter_at_mark(buf.get_insert())
+        if direction < 0:
+            return cursor.get_line() == 0
+        return cursor.get_line() == buf.get_line_count() - 1
+
+    def _recall_history(self, action):
+        current = self._entry_text()
+        if action == "previous":
+            recalled = self._command_history.previous(current)
+        elif action == "next":
+            recalled = self._command_history.next(current)
+        elif action == "oldest":
+            recalled = self._command_history.oldest(current)
+        elif action == "newest":
+            recalled = self._command_history.newest(current)
+        elif action == "prefix-previous":
+            recalled = self._command_history.prefix(current, -1)
+        elif action == "prefix-next":
+            recalled = self._command_history.prefix(current, 1)
+        else:
+            recalled = None
+        if recalled is None:
+            return False
+        self._set_entry_text(recalled)
+        return True
+
+    def _update_history_search(self, direction=None, reset=False):
+        if self._history_search_entry is None:
+            return
+        direction = direction or self._history_search_direction
+        query = self._history_search_entry.get_text()
+        start = None if reset else self._history_search_index
+        found = self._command_history.search(query, direction, start)
+        mode = "reverse-i-search" if direction < 0 else "forward-i-search"
+        if found is None:
+            self._history_search_label.set_text(f"failed {mode}: {query}")
+            return
+        index, command = found
+        self._history_search_direction = direction
+        self._history_search_index = index
+        self._command_history.index = index
+        self._set_entry_text(command)
+        preview = command.replace("\r", "").replace("\n", "\\n")
+        self._history_search_label.set_text(f"{mode} `{query}`: {preview}")
+
+    def _on_history_search_changed(self, _entry):
+        self._history_search_index = None
+        self._update_history_search(reset=True)
+
+    def _close_history_search(self, restore=False):
+        popover = self._history_search_popover
+        if popover is None:
+            return
+        if restore:
+            self._set_entry_text(self._history_search_origin)
+            self._command_history.reset_navigation(self._history_search_origin)
+        self._history_search_popover = None
+        self._history_search_entry = None
+        self._history_search_label = None
+        self._history_search_index = None
+        popover.popdown()
+        popover.destroy()
+        self.entry.grab_focus()
+
+    def _on_history_search_closed(self, popover):
+        if self._history_search_popover is not popover:
+            return
+        self._history_search_popover = None
+        self._history_search_entry = None
+        self._history_search_label = None
+        self._history_search_index = None
+        self.entry.grab_focus()
+
+    def _on_history_search_key_press(self, _entry, event):
+        control = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        if control and event.keyval in (Gdk.KEY_r, Gdk.KEY_R):
+            self._update_history_search(-1)
+            return True
+        if control and event.keyval in (Gdk.KEY_s, Gdk.KEY_S):
+            self._update_history_search(1)
+            return True
+        if event.keyval == Gdk.KEY_Up:
+            self._update_history_search(-1)
+            return True
+        if event.keyval == Gdk.KEY_Down:
+            self._update_history_search(1)
+            return True
         if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            if event.state & Gdk.ModifierType.SHIFT_MASK:
+            self._close_history_search(restore=False)
+            return True
+        if event.keyval == Gdk.KEY_Escape:
+            self._close_history_search(restore=True)
+            return True
+        return False
+
+    def _open_history_search(self, direction):
+        if self._history_search_popover is not None:
+            self._update_history_search(direction)
+            return
+        self._history_search_origin = self._entry_text()
+        self._history_search_direction = direction
+        self._history_search_index = None
+
+        popover = Gtk.Popover.new(self.entry)
+        popover.set_position(Gtk.PositionType.TOP)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+        label = Gtk.Label(xalign=0)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        search_entry = Gtk.SearchEntry()
+        search_entry.set_placeholder_text("Search command history")
+        box.pack_start(label, False, False, 0)
+        box.pack_start(search_entry, False, False, 0)
+        popover.add(box)
+        popover.connect("closed", self._on_history_search_closed)
+
+        self._history_search_popover = popover
+        self._history_search_entry = search_entry
+        self._history_search_label = label
+        search_entry.connect("search-changed", self._on_history_search_changed)
+        search_entry.connect("key-press-event", self._on_history_search_key_press)
+        search_entry.set_text(self._history_search_origin)
+        self._update_history_search(direction, reset=True)
+        popover.show_all()
+        search_entry.grab_focus()
+
+    def _on_entry_key_press(self, _widget, event):
+        control = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
+        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+
+        if control and event.keyval in (Gdk.KEY_p, Gdk.KEY_P):
+            return self._recall_history("previous")
+        if control and event.keyval in (Gdk.KEY_n, Gdk.KEY_N):
+            return self._recall_history("next")
+        if control and event.keyval in (Gdk.KEY_r, Gdk.KEY_R):
+            self._open_history_search(-1)
+            return True
+        if control and event.keyval in (Gdk.KEY_s, Gdk.KEY_S):
+            self._open_history_search(1)
+            return True
+        if alt and event.keyval == Gdk.KEY_less:
+            return self._recall_history("oldest")
+        if alt and event.keyval == Gdk.KEY_greater:
+            return self._recall_history("newest")
+        if alt and event.keyval == Gdk.KEY_Up:
+            return self._recall_history("prefix-previous")
+        if alt and event.keyval == Gdk.KEY_Down:
+            return self._recall_history("prefix-next")
+        if not (control or alt or shift) and event.keyval == Gdk.KEY_Up:
+            if self._entry_cursor_at_history_boundary(-1):
+                return self._recall_history("previous")
+        if not (control or alt or shift) and event.keyval == Gdk.KEY_Down:
+            if self._entry_cursor_at_history_boundary(1):
+                return self._recall_history("next")
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if shift:
                 return False  # let GTK insert the newline normally
             self._on_send(_widget)
             return True  # consume — don't also insert a newline
@@ -2360,6 +2682,10 @@ class LiamWindow(Gtk.ApplicationWindow):
         image_path = self._pending_image_path
         if not text and not image_path:
             return
+        history_request = _parse_history_request(text) if text and not image_path else None
+        if text:
+            self._command_history.record(text)
+            memory.save_command_history(text, session_id=self.session_id)
         buf.set_text("")
         display_text = text or "Read any text in this image."
         if image_path:
@@ -2371,6 +2697,16 @@ class LiamWindow(Gtk.ApplicationWindow):
             with open(image_path, "rb") as f:
                 images_b64 = [base64.b64encode(f.read()).decode("ascii")]
         self._clear_pending_image()
+
+        if history_request is not None:
+            if history_request["help"]:
+                history_text = HISTORY_HELP
+            else:
+                rows = memory.load_command_history(history_request["limit"])
+                history_text = _format_command_history(rows)
+            self._append_message(history_text, "status")
+            self.entry.grab_focus()
+            return
 
         self._set_busy(True)
         self._start_thinking()

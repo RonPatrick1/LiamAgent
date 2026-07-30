@@ -31,9 +31,9 @@ a different Ollama model.
 
 ## GUI
 
-`LiamGUI.py` is a native GTK4/libadwaita desktop app — same `Agent` class,
+`LiamGUI.py` is a native GTK3 desktop app — same `Agent` class,
 same tools, same memory, just a window instead of a terminal. Requires
-`python3-gi` with GTK4 and libadwaita bindings (already present on a stock
+`python3-gi` with GTK3 bindings (already present on a stock
 Ubuntu GNOME desktop; not installable via pip).
 
 ```
@@ -42,6 +42,25 @@ python3 LiamGUI.py
 
 Same `--model`/`--confirm` flags as the CLI. With `--confirm`, tool
 confirmations show as a native dialog instead of a terminal prompt.
+
+## Desktop command history
+
+Every non-empty desktop input is stored in a dedicated MySQL
+`command_history` table. History is shared across Liam's desktop threads,
+persists across restarts, and is capped at the newest 1,000 entries. It is an
+editor feature and is never added to the model context merely because it was
+recalled or listed.
+
+- **Up / Ctrl+P** — previous entry
+- **Down / Ctrl+N** — next entry, restoring the unfinished draft at the end
+- **Alt+< / Alt+>** — oldest entry / newest unfinished draft
+- **Alt+Up / Alt+Down** — previous / next entry matching the current prefix
+- **Ctrl+R / Ctrl+S** — reverse / forward incremental substring search
+- `history` or `history N` — show a numbered listing locally without asking
+  the model (`history help` shows the shortcuts)
+
+History navigation only fills the editor. It never executes a recalled entry;
+the user must still press Enter or click Send.
 
 ## Web search
 
@@ -157,7 +176,7 @@ its deduplication fingerprint, or delete it completely.
 ## Layout
 
 - `LiamAgent.py` — CLI entry point.
-- `LiamGUI.py` — GTK4/libadwaita desktop entry point.
+- `LiamGUI.py` — GTK3 desktop entry point.
 - `agent/llm.py` — thin client for Ollama's `/api/chat` endpoint.
 - `agent/tools.py` — tool schemas and implementations (`read_file`,
   `write_file`, `list_directory`, `run_shell_command`, `web_search`).

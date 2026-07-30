@@ -12,6 +12,7 @@ import re
 import pymysql
 
 _REPETITION_RE = re.compile(r"(.{2,30}?)\1{6,}", re.DOTALL)
+COMMAND_HISTORY_LIMIT = 1000
 
 
 def _looks_corrupted(content):
@@ -67,6 +68,17 @@ def _ensure_schema(conn):
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 query TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS command_history (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                session_id INT NULL,
+                command_text MEDIUMTEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX command_history_session (session_id)
             )
             """
         )
@@ -348,6 +360,75 @@ def load_recent_messages(limit=20, session_id=None):
         return [{"role": role, "content": content} for role, content in reversed(rows)]
     except Exception as exc:
         print(f"[memory] failed to load history: {exc}")
+        return []
+
+
+def save_command_history(command_text, session_id=None):
+    """Persist one desktop input and retain only the newest 1,000 globally.
+
+    This is deliberately separate from conversational messages: shell-style
+    recall is a desktop editing feature and must not depend on how much chat
+    context is replayed to the model.
+    """
+    command_text = str(command_text or "")
+    if not command_text.strip():
+        return False
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO command_history (session_id, command_text) "
+                    "VALUES (%s, %s)",
+                    (session_id, command_text),
+                )
+                cur.execute(
+                    "SELECT id FROM command_history ORDER BY id DESC "
+                    "LIMIT 1 OFFSET %s",
+                    (COMMAND_HISTORY_LIMIT - 1,),
+                )
+                cutoff = cur.fetchone()
+                if cutoff:
+                    cur.execute(
+                        "DELETE FROM command_history WHERE id < %s",
+                        (cutoff[0],),
+                    )
+        finally:
+            conn.close()
+        return True
+    except Exception as exc:
+        print(f"[memory] failed to save command history: {exc}")
+        return False
+
+
+def load_command_history(limit=COMMAND_HISTORY_LIMIT):
+    """Return recent command rows oldest-first for editing and display."""
+    limit = min(max(int(limit), 1), COMMAND_HISTORY_LIMIT)
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, session_id, command_text, created_at "
+                    "FROM command_history ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        return [
+            {
+                "id": row[0],
+                "session_id": row[1],
+                "command_text": row[2],
+                "created_at": row[3],
+            }
+            for row in reversed(rows)
+        ]
+    except Exception as exc:
+        print(f"[memory] failed to load command history: {exc}")
         return []
 
 
