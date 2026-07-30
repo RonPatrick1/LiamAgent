@@ -89,6 +89,11 @@ process's standard input for `sudo -S -v`, and redacted from returned output.
 Removing a credential from Customize does not change the remote computer's
 sudo configuration. Liam never creates passwordless-sudo or sudoers entries.
 
+For an exact command, use the desktop form ``On HOST, run `COMMAND` with
+sudo.`` Liam routes that form directly to `ssh_run_command` without asking the
+model to reconstruct SSH or password handling. The generic local shell tool
+rejects SSH clients and stdin-password sudo pipelines.
+
 ## Persistent memory
 
 Liam remembers past conversations across restarts via a MySQL table

@@ -205,6 +205,65 @@ class DesktopOnlySshTests(unittest.TestCase):
         self.assertEqual(properties["sudo"]["type"], "boolean")
         self.assertNotIn("password", properties)
 
+    def test_explicit_backtick_request_parses_to_secure_ssh_tool_arguments(self):
+        request = (
+            "On alien, run `curl -fsSL https://ollama.com/install.sh | sh` "
+            "with sudo."
+        )
+
+        self.assertEqual(core._parse_explicit_ssh_command(request), {
+            "host": "alien",
+            "command": "curl -fsSL https://ollama.com/install.sh | sh",
+            "sudo": True,
+        })
+        self.assertIsNone(core._parse_explicit_ssh_command(
+            "On alien, install Ollama and configure it for me."
+        ))
+
+    def test_generic_shell_rejects_ssh_and_password_sudo_pipelines(self):
+        agent = self._agent("gui")
+        implementation = mock.Mock(return_value="must not run")
+        commands = (
+            "ssh ronpatrick@alien hostname",
+            "echo 'placeholder' | sudo -S id",
+        )
+
+        with mock.patch.dict(
+            core.TOOL_IMPL, {"run_shell_command": implementation}, clear=False,
+        ):
+            for command in commands:
+                result = agent._run_tool("run_shell_command", {"command": command})
+                self.assertIn("cannot invoke SSH clients or pipe a password", result)
+
+        implementation.assert_not_called()
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_explicit_desktop_request_bypasses_model_and_uses_secure_tool(
+        self, _match_lessons, _save_message,
+    ):
+        agent = self._agent("gui")
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="Ollama installed")
+        agent._finalize_learning = mock.Mock(return_value="Ollama installed")
+        agent.client.chat.side_effect = AssertionError("model must not route this request")
+        request = (
+            "On alien, run `curl -fsSL https://ollama.com/install.sh | sh` "
+            "with sudo."
+        )
+
+        result = agent.step(request)
+
+        expected = {
+            "host": "alien",
+            "command": "curl -fsSL https://ollama.com/install.sh | sh",
+            "sudo": True,
+        }
+        self.assertEqual(result, "Ollama installed")
+        agent.on_tool_call.assert_called_once_with("ssh_run_command", expected)
+        agent._execute_tool.assert_called_once_with("ssh_run_command", expected)
+        agent.client.chat.assert_not_called()
+
 
 class SshSecretTests(unittest.TestCase):
     def test_store_uses_libsecret_without_putting_password_in_attributes(self):

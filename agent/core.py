@@ -320,6 +320,21 @@ CANCEL_ROUTINE_CLAIM_RE = re.compile(
     r"(?:has\s+been|is)\s+(?:cancelled|canceled|stopped|disabled|removed|deleted)\b",
     re.IGNORECASE | re.DOTALL,
 )
+EXPLICIT_SSH_COMMAND_RE = re.compile(
+    r"^\s*(?:liam\s*[:,]?\s*)?on\s+"
+    r"(?P<host>[A-Za-z0-9][A-Za-z0-9_.-]*)\s*,\s*"
+    r"(?:please\s+)?run\s+`(?P<command>[^`]+)`"
+    r"(?P<sudo>\s+(?:with|using)\s+sudo)?[.!]?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+SHELL_SSH_CLIENT_RE = re.compile(
+    r"(?:^|[\s;&|()])(?:/(?:usr/)?bin/)?(?:ssh|scp|sftp)(?=\s|$)",
+    re.IGNORECASE,
+)
+SHELL_PASSWORD_SUDO_RE = re.compile(
+    r"\bsudo\s+-S(?:\s|$)|\b(?:echo|printf)\b[^|]{0,500}\|\s*sudo\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 FEEDBACK_GATE_RE = re.compile(
     r"\b(wrong|incorrect|mistake|actually|instead|next time|should(?:'ve| have)|"
@@ -369,6 +384,29 @@ PARAM_ALIASES = {
     "query_memory": {"query": "keyword", "search": "keyword"},
     "recall_notes": {"query": "keyword", "search": "keyword"},
 }
+
+
+def _parse_explicit_ssh_command(text):
+    """Parse only the exact backtick form; prose remote tasks stay model-led."""
+    match = EXPLICIT_SSH_COMMAND_RE.fullmatch(text or "")
+    if not match:
+        return None
+    command = match.group("command").strip()
+    if not command:
+        return None
+    return {
+        "host": match.group("host"),
+        "command": command,
+        "sudo": bool(match.group("sudo")),
+    }
+
+
+def _unsafe_generic_shell_command(command):
+    command = command or ""
+    return bool(
+        SHELL_SSH_CLIENT_RE.search(command)
+        or SHELL_PASSWORD_SUDO_RE.search(command)
+    )
 
 NOTE_MATCH_STOPWORDS = {
     "a", "about", "an", "anything", "everything", "my", "note", "notes",
@@ -805,6 +843,15 @@ class Agent:
             return f"Error: the '{name}' tool isn't available in this conversation."
         aliases = PARAM_ALIASES.get(name, {})
         args = {aliases.get(k, k): v for k, v in args.items()}
+        if name == "run_shell_command" and _unsafe_generic_shell_command(
+            args.get("command", "")
+        ):
+            return (
+                "Error: run_shell_command cannot invoke SSH clients or pipe a "
+                "password into sudo. From Liam's Ubuntu desktop app, use "
+                "ssh_run_command with an allowlisted host and sudo=true; the "
+                "credential must come only from GNOME Keyring."
+            )
         # base_dir/session_id are never part of a tool's JSON schema — the
         # model can't supply them itself — but this agent's own workdir/
         # session are injected transparently for any tool whose signature
@@ -2064,6 +2111,23 @@ class Agent:
         hint_text = "\n".join(f"- {record['lesson']}" for record in lesson_hits) if lesson_hits else None
 
         tool_results = []
+
+        # A literal backtick command addressed to one SSH alias is fully
+        # specified by the user. Execute that exact structured tool call
+        # instead of asking the model to reconstruct SSH/sudo plumbing (it
+        # previously chose run_shell_command and invented an echo-password
+        # pipeline despite the secure desktop SSH tool being available).
+        ssh_args = _parse_explicit_ssh_command(user_input)
+        if (
+            ssh_args is not None
+            and self.channel == "gui"
+            and "ssh_run_command" in available_tools
+        ):
+            self.on_tool_call("ssh_run_command", ssh_args)
+            result = self._execute_tool("ssh_run_command", ssh_args)
+            content = self._finalize_learning(result, feedback_notice)
+            memory.save_message("assistant", content, session_id=self.session_id)
+            return content
 
         schedule_args = self._parse_schedule_request(user_input)
         if schedule_args is not None and "schedule_routine" in available_tools:

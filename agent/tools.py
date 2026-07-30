@@ -1455,7 +1455,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_shell_command",
-            "description": "Run a shell command on the local machine and return its stdout/stderr/exit code.",
+            "description": (
+                "Run a shell command on this local machine and return its output. "
+                "Never invoke ssh/scp/sftp or pipe passwords into sudo here; remote "
+                "commands from the Ubuntu desktop must use ssh_run_command."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
