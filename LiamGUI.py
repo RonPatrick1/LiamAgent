@@ -1182,6 +1182,7 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         sudo_expander = Gtk.Expander(label="SSH sudo passwords (GNOME Keyring)")
         sudo_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        sudo_password_rows = []
         sudo_box.set_margin_top(8)
         sudo_box.set_margin_start(8)
         sudo_box.set_margin_end(8)
@@ -1235,8 +1236,8 @@ class LiamWindow(Gtk.ApplicationWindow):
             password_entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
             password_entry.set_placeholder_text("Sudo password")
             controls.pack_start(password_entry, True, True, 0)
-            save_password = Gtk.Button(label="Save / replace")
-            remove_password = Gtk.Button(label="Remove")
+            save_password = Gtk.Button(label=f"Save for {alias}")
+            remove_password = Gtk.Button(label=f"Remove from {alias}")
             controls.pack_start(save_password, False, False, 0)
             controls.pack_start(remove_password, False, False, 0)
             host_box.pack_start(controls, False, False, 0)
@@ -1250,7 +1251,10 @@ class LiamWindow(Gtk.ApplicationWindow):
                         identity["alias"], identity["hostname"],
                         identity["port"], identity["user"],
                     )
-                    label.set_text("Password stored" if stored else "No password stored")
+                    label.set_text(
+                        f"Password stored for {identity['alias']}"
+                        if stored else f"No password stored for {identity['alias']}"
+                    )
                 except ssh_secrets.SudoSecretError as exc:
                     label.set_text(str(exc))
 
@@ -1268,7 +1272,9 @@ class LiamWindow(Gtk.ApplicationWindow):
                     label.set_text(str(exc))
                     return
                 entry.set_text("")
-                label.set_text("Password saved in GNOME Keyring")
+                label.set_text(
+                    f"Password saved for {identity['alias']} in GNOME Keyring"
+                )
 
             def on_remove_password(
                 _button, identity=identity, entry=password_entry,
@@ -1284,12 +1290,14 @@ class LiamWindow(Gtk.ApplicationWindow):
                     return
                 entry.set_text("")
                 label.set_text(
-                    "Password removed" if removed else "No password was stored"
+                    f"Password removed from {identity['alias']}"
+                    if removed else f"No password was stored for {identity['alias']}"
                 )
 
             save_password.connect("clicked", on_save_password)
             remove_password.connect("clicked", on_remove_password)
             set_initial_status()
+            sudo_password_rows.append((identity, password_entry, credential_status))
             sudo_box.pack_start(host_box, False, False, 0)
 
         sudo_expander.add(sudo_box)
@@ -1310,6 +1318,27 @@ class LiamWindow(Gtk.ApplicationWindow):
 
         def on_response(dialog, response):
             if response == Gtk.ResponseType.OK:
+                # The dialog-level Save button must honor passwords typed into
+                # host rows. Previously only the small per-row button stored
+                # them, so a user could enter a password, click the prominent
+                # Save button, and reasonably believe it had been committed.
+                for identity, entry, label in sudo_password_rows:
+                    password = entry.get_text()
+                    if not password:
+                        continue
+                    try:
+                        ssh_secrets.store_sudo_password(
+                            identity["alias"], identity["hostname"],
+                            identity["port"], identity["user"], password,
+                        )
+                    except ssh_secrets.SudoSecretError as exc:
+                        label.set_text(str(exc))
+                        sudo_expander.set_expanded(True)
+                        return
+                    entry.set_text("")
+                    label.set_text(
+                        f"Password saved for {identity['alias']} in GNOME Keyring"
+                    )
                 start, end = instructions_buffer.get_bounds()
                 self.settings["model"] = model_combo.get_active_id()
                 self.settings["auto_confirm"] = auto_confirm_switch.get_active()

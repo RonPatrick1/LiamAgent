@@ -1,7 +1,8 @@
 from datetime import datetime
+import inspect
 import unittest
 
-from LiamGUI import _finished_once_status, _routine_display_prompt
+from LiamGUI import LiamWindow, _finished_once_status, _routine_display_prompt
 
 
 class RoutineDisplayTests(unittest.TestCase):
@@ -46,6 +47,22 @@ class RoutineDisplayTests(unittest.TestCase):
         self.assertEqual(_finished_once_status(expired, now), "Expired")
         self.assertIsNone(_finished_once_status(future, now))
         self.assertIsNone(_finished_once_status(recurring, now))
+
+
+class SshSettingsTests(unittest.TestCase):
+    def test_dialog_save_commits_typed_host_passwords(self):
+        source = inspect.getsource(LiamWindow._open_settings_dialog)
+
+        self.assertIn(
+            "for identity, entry, label in sudo_password_rows:", source,
+        )
+        self.assertGreaterEqual(source.count("ssh_secrets.store_sudo_password("), 2)
+
+    def test_sudo_controls_name_their_destination(self):
+        source = inspect.getsource(LiamWindow._open_settings_dialog)
+
+        self.assertIn('Gtk.Button(label=f"Save for {alias}")', source)
+        self.assertIn('f"Password saved for {identity[\'alias\']} ', source)
 
 
 if __name__ == "__main__":
