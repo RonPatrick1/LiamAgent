@@ -237,6 +237,37 @@ class DesktopOnlySshTests(unittest.TestCase):
 
         implementation.assert_not_called()
 
+    def test_credential_failure_discards_unsafe_model_workaround(self):
+        agent = self._agent("gui")
+        trusted_error = (
+            "Error: Sudo authentication failed for ronpatrick@alien. "
+            "Replace the stored password in Liam's desktop settings.\n"
+            "[exit code: 1]"
+        )
+        unsafe_model_reply = (
+            "Use ssh ronpatrick@alien \"echo 'your_correct_password' | "
+            "sudo -S id\""
+        )
+
+        result = agent._enforce_ssh_credential_failure(
+            unsafe_model_reply, [("ssh_run_command", trusted_error)],
+        )
+
+        self.assertEqual(result, trusted_error)
+        self.assertNotIn("your_correct_password", result)
+        self.assertNotIn("echo", result)
+
+    def test_noncredential_ssh_result_can_still_be_explained(self):
+        agent = self._agent("gui")
+        content = "The remote package was not found."
+
+        result = agent._enforce_ssh_credential_failure(
+            content,
+            [("ssh_run_command", "sh: package: not found\n[exit code: 127]")],
+        )
+
+        self.assertEqual(result, content)
+
     @mock.patch.object(core.memory, "save_message")
     @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
     def test_explicit_desktop_request_bypasses_model_and_uses_secure_tool(

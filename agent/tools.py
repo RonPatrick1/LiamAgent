@@ -1488,7 +1488,9 @@ TOOL_SCHEMAS = [
             "description": (
                 "Run one non-interactive shell command on an allowlisted local computer "
                 "over key-based SSH. This is available only inside Liam's Ubuntu desktop "
-                "app; use ssh_list_hosts to get valid aliases first."
+                "app; use ssh_list_hosts to get valid aliases first. If sudo credential "
+                "authentication fails, relay that error without suggesting passwords in "
+                "commands, chat, environment variables, or configuration files."
             ),
             "parameters": {
                 "type": "object",

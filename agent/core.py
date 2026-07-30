@@ -1806,6 +1806,27 @@ class Agent:
             f"anything said above, it did not succeed:]\n{failures[-1]}"
         )
 
+    @staticmethod
+    def _enforce_ssh_credential_failure(content, tool_results):
+        """Never let the model rewrite a trusted sudo credential error.
+
+        The secure SSH layer deliberately keeps the password out of model
+        context.  A live failure showed that the model could still follow a
+        safe authentication error with invented ``echo password | sudo``
+        advice.  For credential/keyring failures, discard all model-authored
+        prose and return only the already-redacted executor result.
+        """
+        for name, result in reversed(tool_results):
+            if name != "ssh_run_command":
+                continue
+            lowered = (result or "").lower()
+            if lowered.startswith((
+                "error: sudo authentication",
+                "error: sudo credential",
+            )):
+                return result
+        return content
+
     def _note_unperformed_memory_actions(self, content, tool_results):
         # A model can quote a real notice from an older turn. Remove that
         # stale host text before deciding whether this turn needs one, so
@@ -2302,6 +2323,7 @@ class Agent:
                 content = self._fix_image_claims(content, tool_results)
                 content = self._note_missing_generated_image(content, tool_results)
                 content = self._note_shell_failures(content, tool_results)
+                content = self._enforce_ssh_credential_failure(content, tool_results)
                 content = self._note_unperformed_memory_actions(content, tool_results)
                 content = self._note_unperformed_schedule(content, tool_results)
                 content = self._note_unperformed_cancellation(content, tool_results)
@@ -2383,6 +2405,7 @@ class Agent:
         content = self._fix_image_claims(content, tool_results)
         content = self._note_missing_generated_image(content, tool_results)
         content = self._note_shell_failures(content, tool_results)
+        content = self._enforce_ssh_credential_failure(content, tool_results)
         content = self._note_unperformed_memory_actions(content, tool_results)
         content = self._note_unperformed_schedule(content, tool_results)
         content = self._note_unperformed_cancellation(content, tool_results)
