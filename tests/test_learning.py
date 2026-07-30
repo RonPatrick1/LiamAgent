@@ -106,6 +106,72 @@ class ToolOutcomeTests(unittest.TestCase):
                          ("failure", "invalid_arguments"))
 
 
+class GitSyncRoutingTests(unittest.TestCase):
+    def test_push_status_question_is_distinct_from_push_command(self):
+        self.assertTrue(core._is_git_sync_status_request(
+            "Are all changes in this repo pushed up?"
+        ))
+        self.assertTrue(core._is_git_sync_status_request(
+            "Do I have any unpushed commits?"
+        ))
+        self.assertFalse(core._is_git_sync_status_request(
+            "Please push all changes in this repo."
+        ))
+        self.assertFalse(core._is_git_sync_status_request(
+            "How do I push these commits?"
+        ))
+
+    def test_porcelain_status_is_formatted_without_model_judgment(self):
+        raw = (
+            "# branch.oid abc123\n"
+            "# branch.head master\n"
+            "# branch.upstream origin/master\n"
+            "# branch.ab +2 -1\n"
+            "1 .M N... 100644 100644 100644 abc123 abc123 agent/core.py\n"
+            "[exit code: 0]"
+        )
+
+        result = core._format_git_sync_status(raw)
+
+        self.assertIn("All changes pushed: NO", result)
+        self.assertIn("Uncommitted paths: 1", result)
+        self.assertIn("Unpushed commits: 2", result)
+        self.assertIn("Remote-only commits not pulled: 1", result)
+        self.assertIn(".M agent/core.py", result)
+        self.assertNotIn("100644", result)
+
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    def test_push_status_question_runs_existing_shell_tool_directly(
+        self, _match_lessons, _save_message,
+    ):
+        agent = bare_agent(payload=RuntimeError("model must not be consulted"))
+        agent.messages = [{"role": "system", "content": "system"}]
+        agent.tool_schemas = [
+            schema for schema in core.TOOL_SCHEMAS
+            if schema["function"]["name"] == "run_shell_command"
+        ]
+        agent.on_tool_call = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value=(
+            "# branch.oid abc123\n"
+            "# branch.head master\n"
+            "# branch.upstream origin/master\n"
+            "# branch.ab +0 -0\n"
+            "[exit code: 0]"
+        ))
+
+        reply = agent.step("Are all changes in this repo pushed up?")
+
+        self.assertIn("All changes pushed: YES", reply)
+        agent.on_tool_call.assert_called_once_with(
+            "run_shell_command", {"command": core.GIT_SYNC_STATUS_COMMAND},
+        )
+        agent._execute_tool.assert_called_once_with(
+            "run_shell_command", {"command": core.GIT_SYNC_STATUS_COMMAND},
+        )
+        self.assertEqual(agent.client.calls, 0)
+
+
 class ImageRoutingTests(unittest.TestCase):
     def test_explicit_creation_requests_are_distinguished_from_questions_and_search(self):
         self.assertTrue(core.Agent._is_direct_image_request(

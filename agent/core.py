@@ -407,6 +407,85 @@ PARAM_ALIASES = {
 }
 
 
+def _is_git_sync_status_request(text):
+    """Recognize questions about local work reaching the tracked remote.
+
+    Deliberately exclude imperative push requests: this route only inspects
+    repository state and never authorizes a commit or push.
+    """
+    normalized = " ".join((text or "").lower().split())
+    if not re.search(r"\b(?:pushed|unpushed|push status|up to date with (?:the )?remote)\b", normalized):
+        return False
+    if re.search(r"\b(?:how (?:do|can|should) i|please push|push (?:all|my|the|these))\b", normalized):
+        return False
+    subject = re.search(
+        r"\b(?:repo(?:sitory)?|git|changes?|commits?|everything|anything|all)\b",
+        normalized,
+    )
+    question = re.search(
+        r"\b(?:are|is|have|has|did|do|what|which|check|verify|whether|status|any)\b",
+        normalized,
+    )
+    return bool(subject and question)
+
+
+GIT_SYNC_STATUS_COMMAND = "git fetch --quiet && git status --porcelain=v2 --branch"
+
+
+def _format_git_sync_status(result):
+    """Turn porcelain-v2 output into a literal, model-free answer."""
+    if not re.search(r"\[exit code: 0\]\s*$", result or ""):
+        return "I couldn't verify whether all changes are pushed.\n\n" + (result or "")
+
+    branch = "unknown"
+    upstream = None
+    ahead = behind = 0
+    changes = []
+    for line in (result or "").splitlines():
+        if line.startswith("# branch.head "):
+            branch = line.removeprefix("# branch.head ").strip()
+        elif line.startswith("# branch.upstream "):
+            upstream = line.removeprefix("# branch.upstream ").strip()
+        elif line.startswith("# branch.ab "):
+            match = re.fullmatch(r"# branch\.ab \+(\d+) -(\d+)", line)
+            if match:
+                ahead, behind = (int(value) for value in match.groups())
+        elif line and not line.startswith(("#", "[exit code:")):
+            if line.startswith("1 "):
+                fields = line.split(" ", 8)
+                changes.append(f"{fields[1]} {fields[8]}" if len(fields) == 9 else line)
+            elif line.startswith("2 "):
+                fields = line.split(" ", 9)
+                path = fields[9].replace("\t", " -> ") if len(fields) == 10 else line
+                changes.append(f"{fields[1]} {path}" if len(fields) == 10 else line)
+            elif line.startswith("u "):
+                fields = line.split(" ", 10)
+                changes.append(f"{fields[1]} {fields[10]}" if len(fields) == 11 else line)
+            else:
+                changes.append(line)
+
+    if upstream is None:
+        lines = [
+            "All changes pushed: UNKNOWN",
+            f"Branch: {branch}",
+            "Upstream: not configured",
+            f"Uncommitted paths: {len(changes)}",
+        ]
+    else:
+        all_pushed = not changes and ahead == 0
+        lines = [
+            f"All changes pushed: {'YES' if all_pushed else 'NO'}",
+            f"Branch: {branch}",
+            f"Upstream: {upstream}",
+            f"Uncommitted paths: {len(changes)}",
+            f"Unpushed commits: {ahead}",
+            f"Remote-only commits not pulled: {behind}",
+        ]
+    if changes:
+        lines.extend(["Working-tree changes:"] + changes[:50])
+    return "\n".join(lines)
+
+
 def _parse_explicit_ssh_command(text):
     """Parse exact remote commands; prose remote tasks stay model-led."""
     match = EXPLICIT_SSH_COMMAND_RE.fullmatch(text or "")
@@ -2259,6 +2338,24 @@ class Agent:
         hint_text = "\n".join(f"- {record['lesson']}" for record in lesson_hits) if lesson_hits else None
 
         tool_results = []
+
+        # Whether local work actually reached the configured upstream is a
+        # deterministic repository query, not something the language model
+        # should narrate or guess. The model repeatedly claimed it lacked Git
+        # access despite git_status/git_log being present, then still refused
+        # after the owner explicitly told it to run the check itself.
+        if (
+            _is_git_sync_status_request(user_input)
+            and "run_shell_command" in available_tools
+        ):
+            args = {"command": GIT_SYNC_STATUS_COMMAND}
+            self.on_tool_call("run_shell_command", args)
+            result = self._execute_tool("run_shell_command", args)
+            content = self._finalize_learning(
+                _format_git_sync_status(result), feedback_notice,
+            )
+            memory.save_message("assistant", content, session_id=self.session_id)
+            return content
 
         # A literal backtick command addressed to one SSH alias is fully
         # specified by the user. Execute that exact structured tool call

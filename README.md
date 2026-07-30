@@ -90,6 +90,12 @@ recalled or listed.
 History navigation only fills the editor. It never executes a recalled entry;
 the user must still press Enter or click Send.
 
+Repository push-status questions such as “Are all changes in this repo pushed
+up?” bypass the language model and run standard Git commands through the
+existing shell tool. Liam fetches the configured upstream, runs porcelain-v2
+status, then reports uncommitted paths, unpushed commits, and remote-only
+commits separately. This inspection never commits or pushes.
+
 ## Web search
 
 `web_search` uses the Brave Search API (api-dashboard.search.brave.com).
