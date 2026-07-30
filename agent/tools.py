@@ -24,6 +24,33 @@ SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SUDO_VALIDATED_MARKER = "__LIAM_SUDO_VALIDATED_7F6C3A2D__"
 DEFAULT_READ_MAX_CHARS = 20_000
 
+# Matches ANSI CSI sequences (cursor hide/show, synchronized-output mode,
+# cursor positioning, line clearing, etc.) that in-place progress bars
+# (ollama pull, apt, pip, ...) write when they assume stdout is a real
+# terminal. Captured through subprocess/SSH into a plain string, these
+# survive as literal garbage — proven live: an `ollama pull` log tailed
+# through ssh_run_command rendered as a wall of "[?25h", "[?2026l", "[1G"
+# text and Braille spinner glyphs instead of a clean progress line.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Za-z0-9]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _strip_terminal_noise(text):
+    """Strip ANSI control sequences, then collapse each \\r-redrawn line
+    down to its final state — the same thing a real terminal would show,
+    instead of every intermediate redraw of an in-place progress bar."""
+    if not text:
+        return text
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    cleaned = []
+    for line in text.split("\n"):
+        # A trailing CR is the ordinary first half of a CRLF line ending,
+        # not an in-place redraw. Remove it before looking for any remaining
+        # carriage returns that really do replace earlier progress text.
+        if line.endswith("\r"):
+            line = line[:-1]
+        cleaned.append(line.split("\r")[-1])
+    return "\n".join(cleaned)
+
 
 def _resolve(path, base_dir=None):
     path = os.path.expanduser(path)
@@ -309,6 +336,7 @@ def run_shell_command(command, base_dir=None, timeout=60):
     output = result.stdout
     if result.stderr:
         output += f"\n[stderr]\n{result.stderr}"
+    output = _strip_terminal_noise(output)
     output += f"\n[exit code: {result.returncode}]"
     return output[:20_000]
 
@@ -461,6 +489,7 @@ def ssh_run_command(host, command, timeout=60, sudo=False):
             output += f"\n[stderr]\n{stderr}"
         output = _redact_secret(output, password)
         output = output.replace(SUDO_VALIDATED_MARKER, "").lstrip("\r\n")
+        output = _strip_terminal_noise(output)
         return (
             f"{output}\n[stderr]\nSSH command timed out after {timeout} seconds."
             "\n[exit code: 124]"
@@ -494,6 +523,7 @@ def ssh_run_command(host, command, timeout=60, sudo=False):
                 if detail else f"{prefix}\n[exit code: {result.returncode}]"
             )[:20_000]
 
+    output = _strip_terminal_noise(output)
     output += f"\n[exit code: {result.returncode}]"
     return output[:20_000]
 
