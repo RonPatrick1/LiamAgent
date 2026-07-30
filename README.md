@@ -50,7 +50,8 @@ one document chunk plus the current question for relevance scanning. It does
 not receive Liam's tools or full conversation history.
 
 The example points directly at Alien's LAN address. Alien's Ollama service must
-set `OLLAMA_HOST=192.168.0.128:11434`; no SSH tunnel is required.
+set `OLLAMA_HOST=0.0.0.0:11434` so both Alien's local CLI and LAN clients can
+reach it; no SSH tunnel is required.
 
 Tool calls run without asking by default. Pass `--confirm` if you want to be
 prompted before write_file/run_shell_command calls. Use `--model` to point at
