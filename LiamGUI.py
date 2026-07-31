@@ -364,6 +364,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.session_id = None
         self.sessions = []
         self.busy = False
+        self._setting_plan_toggle = False
         self._thinking_active = False
         self._thinking_timer_id = None
         self._thinking_anchor_mark = None
@@ -424,6 +425,12 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.artifacts_toggle.set_tooltip_text("Artifacts")
         self.artifacts_toggle.connect("toggled", self._on_artifacts_toggled)
         headerbar.pack_end(self.artifacts_toggle)
+
+        self.plan_toggle = Gtk.ToggleButton(label="Plan")
+        self.plan_toggle.get_style_context().add_class("liam-toggle")
+        self.plan_toggle.set_tooltip_text("Plan without making changes")
+        self.plan_toggle.connect("toggled", self._on_plan_toggled)
+        headerbar.pack_end(self.plan_toggle)
 
         self.spinner = Gtk.Spinner()
         self.spinner.set_visible(False)
@@ -934,13 +941,15 @@ class LiamWindow(Gtk.ApplicationWindow):
         self._select_row_for_session(session["id"])
 
     def _build_agent_and_history(self, session_id, folder_path):
+        session = memory.get_session(session_id)
+        plan_mode = bool(session and session.get("plan_mode"))
         extra_folders = [f["folder_path"] for f in memory.list_session_folders(session_id)]
         agent = Agent(
             model=self.model, auto_confirm=self.auto_confirm,
             workdir=folder_path, session_id=session_id, extra_folders=extra_folders,
             custom_instructions=self.settings["custom_instructions"],
             channel="gui", actor_id="local-owner", is_owner=True,
-            learning_enabled=True,
+            learning_enabled=True, plan_mode=plan_mode,
         )
         history = memory.load_recent_messages(limit=REPLAY_LIMIT, session_id=session_id)
         return agent, history
@@ -951,6 +960,12 @@ class LiamWindow(Gtk.ApplicationWindow):
         agent.on_tool_call = self._on_tool_call
         agent.on_status = self._on_status
         agent.on_confirm = self._on_confirm
+
+        self._setting_plan_toggle = True
+        try:
+            self.plan_toggle.set_active(agent.plan_mode)
+        finally:
+            self._setting_plan_toggle = False
 
         memory.set_unread(session_id, False)
 
@@ -1524,6 +1539,12 @@ class LiamWindow(Gtk.ApplicationWindow):
         agent.on_tool_call = self._on_tool_call
         agent.on_status = self._on_status
         agent.on_confirm = self._on_confirm
+
+        self._setting_plan_toggle = True
+        try:
+            self.plan_toggle.set_active(agent.plan_mode)
+        finally:
+            self._setting_plan_toggle = False
 
     # --- lessons ---
 
@@ -2214,6 +2235,12 @@ class LiamWindow(Gtk.ApplicationWindow):
         if button.get_active():
             self._refresh_artifacts_list()
 
+    def _on_plan_toggled(self, button):
+        if self._setting_plan_toggle or self.session_id is None:
+            return
+        memory.set_plan_mode(self.session_id, button.get_active())
+        self._reload_current_agent()
+
     def _refresh_artifacts_list(self):
         for child in list(self.artifacts_list.get_children()):
             self.artifacts_list.remove(child)
@@ -2459,6 +2486,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.send_button.set_sensitive(not busy)
         self.session_list.set_sensitive(not busy)
         self.external_sessions_toggle.set_sensitive(not busy)
+        self.plan_toggle.set_sensitive(not busy)
         if not busy:
             # Re-enabling the entry doesn't give it back keyboard focus by
             # itself — without this, every reply leaves focus nowhere in

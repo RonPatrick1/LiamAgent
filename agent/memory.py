@@ -88,6 +88,7 @@ def _ensure_schema(conn):
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 title VARCHAR(255) NOT NULL,
                 folder_path VARCHAR(1024) NOT NULL,
+                plan_mode TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
@@ -300,6 +301,12 @@ def _ensure_schema(conn):
         cur.execute("SHOW COLUMNS FROM sessions LIKE 'group_id'")
         if not cur.fetchone():
             cur.execute("ALTER TABLE sessions ADD COLUMN group_id INT NULL")
+        cur.execute("SHOW COLUMNS FROM sessions LIKE 'plan_mode'")
+        if not cur.fetchone():
+            cur.execute(
+                "ALTER TABLE sessions ADD COLUMN plan_mode "
+                "TINYINT(1) NOT NULL DEFAULT 0"
+            )
         # Forking needs more than one thread able to share a folder_path —
         # drop the uniqueness this table was originally created with.
         cur.execute("SHOW INDEX FROM sessions WHERE Key_name = 'folder_path_unique'")
@@ -514,7 +521,7 @@ def get_session(session_id):
             _ensure_schema(conn)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, title, folder_path, pinned, unread, archived "
+                    "SELECT id, title, folder_path, pinned, unread, archived, plan_mode "
                     "FROM sessions WHERE id = %s",
                     (session_id,),
                 )
@@ -523,10 +530,11 @@ def get_session(session_id):
             conn.close()
         if not row:
             return None
-        id_, title, folder_path, pinned, unread, archived = row
+        id_, title, folder_path, pinned, unread, archived, plan_mode = row
         return {
             "id": id_, "title": title, "folder_path": folder_path,
-            "pinned": bool(pinned), "unread": bool(unread), "archived": bool(archived),
+            "pinned": bool(pinned), "unread": bool(unread),
+            "archived": bool(archived), "plan_mode": bool(plan_mode),
         }
     except Exception as exc:
         print(f"[memory] failed to get session: {exc}")
@@ -548,7 +556,7 @@ def list_sessions(include_archived=False):
                 where = "" if include_archived else "WHERE s.archived = 0"
                 cur.execute(
                     f"SELECT s.id, s.title, s.folder_path, s.last_active_at, s.pinned, "
-                    f"s.unread, s.archived, s.group_id, g.name "
+                    f"s.unread, s.archived, s.plan_mode, s.group_id, g.name "
                     f"FROM sessions s LEFT JOIN groups g ON s.group_id = g.id "
                     f"{where} "
                     f"ORDER BY s.pinned DESC, g.name IS NULL, g.name ASC, s.last_active_at DESC"
@@ -560,10 +568,11 @@ def list_sessions(include_archived=False):
             {
                 "id": id_, "title": title, "folder_path": folder_path,
                 "last_active_at": last_active_at,
-                "pinned": bool(pinned), "unread": bool(unread), "archived": bool(archived),
+                "pinned": bool(pinned), "unread": bool(unread),
+                "archived": bool(archived), "plan_mode": bool(plan_mode),
                 "group_id": group_id, "group_name": group_name,
             }
-            for id_, title, folder_path, last_active_at, pinned, unread, archived, group_id, group_name in rows
+            for id_, title, folder_path, last_active_at, pinned, unread, archived, plan_mode, group_id, group_name in rows
         ]
     except Exception as exc:
         print(f"[memory] failed to list sessions: {exc}")
@@ -617,6 +626,23 @@ def set_session_group(session_id, group_id):
         print(f"[memory] failed to set session group: {exc}")
 
 
+def set_plan_mode(session_id, enabled):
+    """Set whether one thread opens in read-only Plan mode."""
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sessions SET plan_mode = %s WHERE id = %s",
+                    (1 if enabled else 0, session_id),
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to set Plan mode: {exc}")
+
+
 def fork_session(session_id):
     """Duplicate a thread into a new, independent one pointed at the same
     folder — a real copy of its message history, not a reference to the
@@ -626,16 +652,19 @@ def fork_session(session_id):
         _ensure_schema(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT title, folder_path, group_id FROM sessions WHERE id = %s",
+                "SELECT title, folder_path, group_id, plan_mode "
+                "FROM sessions WHERE id = %s",
                 (session_id,),
             )
             row = cur.fetchone()
             if not row:
                 return None
-            title, folder_path, group_id = row
+            title, folder_path, group_id, plan_mode = row
             cur.execute(
-                "INSERT INTO sessions (title, folder_path, group_id) VALUES (%s, %s, %s)",
-                (f"{title} (fork)", folder_path, group_id),
+                "INSERT INTO sessions "
+                "(title, folder_path, group_id, plan_mode) "
+                "VALUES (%s, %s, %s, %s)",
+                (f"{title} (fork)", folder_path, group_id, plan_mode),
             )
             new_id = cur.lastrowid
             cur.execute(

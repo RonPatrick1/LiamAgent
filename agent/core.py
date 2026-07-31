@@ -127,6 +127,37 @@ a genuine full rewrite — never as the default way to make a small change.
 
 When you're done, give a clear, concise final answer in plain text."""
 
+PLAN_MODE_ALLOWED_TOOLS = {
+    "read_file",
+    "read_json",
+    "list_directory",
+    "search_text",
+    "find_files",
+    "file_info",
+    "diff_files",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_blame",
+}
+
+PLAN_MODE_SYSTEM_PROMPT = """
+
+PLAN MODE IS ACTIVE. Analyze and plan only; do not make changes or perform
+actions. Inspect the relevant repository files with the available read-only
+tools before proposing implementation work whenever the answer depends on the
+repository's actual contents. If read_file reports that a path is a directory,
+use list_directory or find_files instead of stopping and asking the user to
+supply the contents.
+
+Clearly separate observed facts from proposed changes. Identify the files and
+tests expected to change, along with risks and explicit non-goals. Never claim
+or imply that you edited files, ran commands, changed configuration, scheduled
+anything, saved a memory, or completed the proposed work. Tools not offered in
+Plan mode are unavailable; do not invent calls to them or ask for confirmation
+to use them.
+"""
+
 MAX_STEPS = 10
 MAX_CALLS_PER_RESPONSE = 5
 MAX_TOTAL_CALLS = 15
@@ -695,7 +726,7 @@ class Agent:
                  workdir=None, session_id=None, extra_folders=None,
                  custom_instructions=None, notes_session_id=None,
                  allowed_tools=None, channel="cli", actor_id="local-owner",
-                 is_owner=True, learning_enabled=True):
+                 is_owner=True, learning_enabled=True, plan_mode=False):
         """on_tool_call(name, args), on_confirm(name, args) -> bool, and
         on_status(message) are pluggable so any frontend (CLI, GUI, ...)
         can hook into the agent's progress and confirmation prompts
@@ -788,7 +819,8 @@ class Agent:
         self.channel = channel
         self.actor_id = actor_id
         self.is_owner = bool(is_owner)
-        self.learning_enabled = bool(learning_enabled)
+        self.plan_mode = bool(plan_mode)
+        self.learning_enabled = bool(learning_enabled) and not self.plan_mode
         self._current_user_input = ""
         self._tool_events = []
         self._lesson_uses = []
@@ -797,13 +829,15 @@ class Agent:
             offered_tools &= self.allowed_tools
         if self.channel != "gui":
             offered_tools -= DESKTOP_ONLY_TOOLS
+        if self.plan_mode:
+            offered_tools &= PLAN_MODE_ALLOWED_TOOLS
         self.tool_schemas = [
             schema for schema in TOOL_SCHEMAS
             if schema["function"]["name"] in offered_tools
         ]
         self.extra_folders = list(extra_folders or [])
         system_prompt = SYSTEM_PROMPT
-        if self.allowed_tools is not None or self.channel != "gui":
+        if self.allowed_tools is not None or self.channel != "gui" or self.plan_mode:
             disallowed = sorted(set(TOOL_IMPL) - offered_tools)
             if disallowed:
                 # Proven necessary, not precautionary: tested against a
@@ -835,6 +869,8 @@ class Agent:
             )
         if custom_instructions:
             system_prompt += f"\n\n{custom_instructions}"
+        if self.plan_mode:
+            system_prompt += PLAN_MODE_SYSTEM_PROMPT
         self.messages = [{"role": "system", "content": system_prompt}]
 
         notes = memory.load_recent_notes(session_id=self.notes_session_id)
@@ -1112,6 +1148,11 @@ class Agent:
     def _run_tool(self, name, args):
         if name not in TOOL_IMPL:
             return f"Error: unknown tool '{name}'. There is no such tool — the only tools that exist are: {', '.join(sorted(TOOL_IMPL))}."
+        if getattr(self, "plan_mode", False) and name not in PLAN_MODE_ALLOWED_TOOLS:
+            return (
+                f"Error: '{name}' is unavailable in Plan mode. Plan mode permits "
+                "read-only analysis only; no action was performed."
+            )
         if name in DESKTOP_ONLY_TOOLS and self.channel != "gui":
             return f"Error: the '{name}' tool is available only in Liam's Ubuntu desktop app."
         if self.allowed_tools is not None and name not in self.allowed_tools:
@@ -2756,7 +2797,10 @@ class Agent:
                 content = self._note_unperformed_cancellation(content, tool_results)
                 content = self._finalize_learning(content, feedback_notice)
                 memory.save_message("assistant", content, session_id=self.session_id)
-                if not any(name == "write_file" for name, _ in tool_results):
+                if (
+                    not getattr(self, "plan_mode", False)
+                    and not any(name == "write_file" for name, _ in tool_results)
+                ):
                     self._capture_code_artifacts(content)
                 return content
 
