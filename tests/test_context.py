@@ -294,6 +294,41 @@ class OllamaErrorTests(unittest.TestCase):
         self.assertEqual(payload["format"], "json")
         self.assertNotIn("tools", payload)
 
+    def test_per_call_response_format_overrides_client_default(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "role": "assistant",
+                "content": '{"title":"Plan"}',
+            },
+        }
+        schema = {
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+                "title": {
+                    "type": "string",
+                },
+            },
+        }
+        client = OllamaClient(response_format="json")
+
+        with mock.patch(
+            "agent.llm.requests.post",
+            return_value=response,
+        ) as post:
+            result = client.chat(
+                [{"role": "user", "content": "make a plan"}],
+                response_format=schema,
+            )
+
+        payload = post.call_args.kwargs["json"]
+
+        self.assertEqual(result["content"], '{"title":"Plan"}')
+        self.assertEqual(payload["format"], schema)
+
+
     def test_transport_error_is_machine_detectable_for_fallback(self):
         with mock.patch(
             "agent.llm.requests.post",

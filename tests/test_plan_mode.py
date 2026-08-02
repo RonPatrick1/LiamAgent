@@ -71,6 +71,18 @@ class PlanModeTests(unittest.TestCase):
             core.PLAN_MODE_ALLOWED_TOOLS,
         )
 
+    def test_listening_ports_is_available_in_plan_mode(self):
+        agent = self._build_agent(plan_mode=True)
+
+        self.assertIn(
+            "listening_ports",
+            self._offered_names(agent),
+        )
+        self.assertNotIn(
+            "listening_ports",
+            core.DANGEROUS_TOOLS,
+        )
+
     def test_mutating_tool_is_blocked_before_confirmation_or_execution(self):
         agent = self._build_agent(plan_mode=True)
         agent.on_confirm = mock.Mock(return_value=True)
@@ -126,6 +138,23 @@ class PlanModeTests(unittest.TestCase):
             )
         )
 
+    def test_system_prompt_identifies_exact_thread_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = self._build_agent(
+                plan_mode=True,
+                workdir=directory,
+            )
+
+        prompt = agent.messages[0]["content"]
+        self.assertIn(
+            f"This thread's working folder is {os.path.abspath(directory)}.",
+            prompt,
+        )
+        self.assertIn(
+            "Never substitute /tmp",
+            prompt,
+        )
+
     def test_existing_constructor_usage_defaults_to_normal_mode(self):
         agent = self._build_agent()
 
@@ -145,22 +174,31 @@ class PlanModeTests(unittest.TestCase):
         _save_message,
     ):
         requests = [
-            "On alien, run `uname -a`.",
-            "Schedule a test routine at 11:00am today to say hello.",
-            "Cancel routine #8.",
-            "Remember to ask about shared playlists.",
-            "Forget note #42.",
-            "What notes do you remember?",
-            "Create an image of a blue robot.",
+            ("On alien, run `uname -a`.", True),
+            (
+                "Schedule a test routine at 11:00am today to say hello.",
+                True,
+            ),
+            ("Cancel routine #8.", True),
+            ("Remember to ask about shared playlists.", True),
+            ("Forget note #42.", True),
+            ("What notes do you remember?", False),
+            ("Create an image of a blue robot.", True),
+            (
+                "Make a plan for putting together a local Fluxa webpage.",
+                True,
+            ),
+            ("Explain how local network ports work.", False),
         ]
 
-        for request in requests:
+        for request, requires_plan in requests:
             with self.subTest(request=request):
                 agent = self._build_agent(plan_mode=True)
                 agent.client = mock.Mock()
                 agent.client.chat.return_value = {
                     "content": "Plan-only response",
                 }
+                agent.on_status = mock.Mock()
                 agent.on_tool_call = mock.Mock()
                 agent._execute_tool = mock.Mock(
                     side_effect=AssertionError(
@@ -170,11 +208,10 @@ class PlanModeTests(unittest.TestCase):
 
                 reply = agent.step(request)
 
-                self.assertEqual(reply, "Plan-only response")
-                agent._execute_tool.assert_not_called()
+                self.assertEqual(
+                    agent.client.chat.call_count,
+                    3 if requires_plan else 1,
+                )
                 agent.on_tool_call.assert_not_called()
-                agent.client.chat.assert_called_once()
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+                agent._execute_tool.assert_not_called()
+                self.assertEqual(reply, "Plan-only response")

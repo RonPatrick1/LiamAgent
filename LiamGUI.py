@@ -365,6 +365,9 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.sessions = []
         self.busy = False
         self._setting_plan_toggle = False
+        self._current_plan = None
+        self._executing_plan_id = None
+        self._plan_cancel_event = None
         self._thinking_active = False
         self._thinking_timer_id = None
         self._thinking_anchor_mark = None
@@ -431,6 +434,31 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.plan_toggle.set_tooltip_text("Plan without making changes")
         self.plan_toggle.connect("toggled", self._on_plan_toggled)
         headerbar.pack_end(self.plan_toggle)
+
+        self.execute_plan_button = Gtk.Button(label="Run Plan")
+        self.execute_plan_button.get_style_context().add_class(
+            "liam-accent-button"
+        )
+        self.execute_plan_button.set_tooltip_text(
+            "Review, approve, and execute the latest completed plan"
+        )
+        self.execute_plan_button.connect(
+            "clicked",
+            self._on_execute_plan_clicked,
+        )
+        self.execute_plan_button.set_visible(False)
+        headerbar.pack_end(self.execute_plan_button)
+
+        self.cancel_plan_button = Gtk.Button(label="Stop")
+        self.cancel_plan_button.set_tooltip_text(
+            "Cancel approved-plan execution at the next safe checkpoint"
+        )
+        self.cancel_plan_button.connect(
+            "clicked",
+            self._on_cancel_plan_clicked,
+        )
+        self.cancel_plan_button.set_visible(False)
+        headerbar.pack_end(self.cancel_plan_button)
 
         self.spinner = Gtk.Spinner()
         self.spinner.set_visible(False)
@@ -967,6 +995,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         finally:
             self._setting_plan_toggle = False
 
+        self._refresh_plan_actions()
         memory.set_unread(session_id, False)
 
         self.buffer.set_text("")
@@ -1545,6 +1574,8 @@ class LiamWindow(Gtk.ApplicationWindow):
             self.plan_toggle.set_active(agent.plan_mode)
         finally:
             self._setting_plan_toggle = False
+
+        self._refresh_plan_actions()
 
     # --- lessons ---
 
@@ -2230,6 +2261,300 @@ class LiamWindow(Gtk.ApplicationWindow):
 
     # --- artifacts ---
 
+    def _refresh_plan_actions(self):
+        plan = (
+            memory.get_latest_plan(self.session_id)
+            if self.session_id is not None
+            else None
+        )
+        self._current_plan = plan
+
+        ready_statuses = {"draft", "failed", "approved"}
+        ready = bool(
+            plan
+            and plan.get("status") in ready_statuses
+        )
+
+        if ready:
+            label = {
+                "draft": "Run Plan",
+                "failed": "Retry Plan",
+                "approved": "Resume Plan",
+            }[plan["status"]]
+            self.execute_plan_button.set_label(label)
+
+        self.execute_plan_button.set_visible(ready)
+        self.execute_plan_button.set_sensitive(
+            ready and not self.busy
+        )
+
+        executing = self._executing_plan_id is not None
+        cancel_requested = bool(
+            self._plan_cancel_event is not None
+            and self._plan_cancel_event.is_set()
+        )
+        self.cancel_plan_button.set_visible(executing)
+        self.cancel_plan_button.set_sensitive(
+            executing
+            and self.busy
+            and not cancel_requested
+        )
+
+    def _on_execute_plan_clicked(self, _button):
+        if self.busy or self.session_id is None:
+            return
+
+        plan = memory.get_latest_plan(self.session_id)
+        if not plan or plan.get("status") not in {
+            "draft",
+            "failed",
+            "approved",
+        }:
+            self._append_message(
+                "No completed plan is currently ready to run.",
+                "status",
+            )
+            self._refresh_plan_actions()
+            return
+
+        dialog = Gtk.Dialog(
+            title="Approve Plan",
+            transient_for=self,
+        )
+        dialog.set_default_size(720, 460)
+        dialog.add_buttons(
+            "Cancel",
+            Gtk.ResponseType.CANCEL,
+            "Approve & Run",
+            Gtk.ResponseType.OK,
+        )
+
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+        box.pack_start(
+            Gtk.Label(
+                label=(
+                    "Review the exact stored plan below. Approving it "
+                    "authorizes Liam to begin its implementation and "
+                    "validation cycles."
+                ),
+                xalign=0,
+            ),
+            False,
+            False,
+            0,
+        )
+
+        details = plan.get("content", "")
+        if plan.get("result"):
+            details += (
+                "\n\nPrevious execution result:\n"
+                + str(plan["result"])
+            )
+
+        plan_buffer = Gtk.TextBuffer()
+        plan_buffer.set_text(details)
+        plan_view = Gtk.TextView(buffer=plan_buffer)
+        plan_view.set_editable(False)
+        plan_view.set_cursor_visible(False)
+        plan_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        plan_view.set_left_margin(8)
+        plan_view.set_right_margin(8)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        scroller.set_vexpand(True)
+        scroller.add(plan_view)
+        box.pack_start(scroller, True, True, 0)
+
+        plan_id = plan["id"]
+
+        def on_response(current_dialog, response):
+            current_dialog.destroy()
+            if response == Gtk.ResponseType.OK:
+                self._start_approved_plan(plan_id)
+
+        dialog.connect("response", on_response)
+        dialog.show_all()
+
+    def _start_approved_plan(self, plan_id):
+        if self.busy or self.session_id is None:
+            return
+
+        plan = memory.get_plan(plan_id)
+        if not plan:
+            self._append_message(
+                f"FAIL: plan #{plan_id} was not found.",
+                "assistant",
+                use_markup=True,
+            )
+            self._refresh_plan_actions()
+            return
+
+        if plan.get("session_id") != self.session_id:
+            self._append_message(
+                f"FAIL: plan #{plan_id} belongs to a different thread.",
+                "assistant",
+                use_markup=True,
+            )
+            self._refresh_plan_actions()
+            return
+
+        status = plan.get("status")
+        if status in {"draft", "failed"}:
+            try:
+                changed = memory.transition_plan(
+                    plan_id,
+                    status,
+                    "approved",
+                )
+            except Exception as exc:
+                changed = False
+                transition_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                transition_error = None
+
+            if not changed:
+                detail = (
+                    f" ({transition_error})"
+                    if transition_error
+                    else ""
+                )
+                self._append_message(
+                    f"FAIL: plan #{plan_id} could not be approved"
+                    f"{detail}.",
+                    "assistant",
+                    use_markup=True,
+                )
+                self._refresh_plan_actions()
+                return
+        elif status != "approved":
+            self._append_message(
+                f"FAIL: plan #{plan_id} has status {status!r} "
+                "and cannot be started.",
+                "assistant",
+                use_markup=True,
+            )
+            self._refresh_plan_actions()
+            return
+
+        memory.set_plan_mode(self.session_id, False)
+        self._reload_current_agent()
+        agent = self.agent
+
+        if agent is None or getattr(agent, "plan_mode", False):
+            self._append_message(
+                "FAIL: Liam could not rebuild a normal-mode agent for "
+                "approved-plan execution.",
+                "assistant",
+                use_markup=True,
+            )
+            self._refresh_plan_actions()
+            return
+
+        cancel_event = threading.Event()
+        self._executing_plan_id = plan_id
+        self._plan_cancel_event = cancel_event
+
+        self._set_busy(True)
+        self._start_thinking()
+        self._refresh_plan_actions()
+
+        try:
+            worker = threading.Thread(
+                target=self._run_approved_plan,
+                args=(agent, plan_id, cancel_event),
+                daemon=True,
+            )
+            worker.start()
+        except Exception as exc:
+            self._stop_thinking()
+            self._executing_plan_id = None
+            self._plan_cancel_event = None
+            self._set_busy(False)
+            self._append_message(
+                "FAIL: approved-plan execution could not start "
+                f"({type(exc).__name__}: {exc}).",
+                "assistant",
+                use_markup=True,
+            )
+            self._refresh_plan_actions()
+
+    def _on_cancel_plan_clicked(self, _button):
+        event = self._plan_cancel_event
+        if event is None or event.is_set():
+            return
+
+        event.set()
+        self.cancel_plan_button.set_sensitive(False)
+        self._append_message(
+            "Cancellation requested. Liam will stop at the next "
+            "safe checkpoint.",
+            "status",
+        )
+
+    def _run_approved_plan(
+        self,
+        agent,
+        plan_id,
+        cancel_event,
+    ):
+        try:
+            reply = agent.execute_plan(
+                plan_id,
+                cancel_event=cancel_event,
+            )
+        except Exception as exc:
+            reply = (
+                "FAIL: Liam crashed while executing the approved plan "
+                f"({type(exc).__name__}: {exc})."
+            )
+
+        reply = ensure_visible_reply(
+            reply,
+            stage="executing the approved plan",
+        )
+        GLib.idle_add(
+            self._finish_plan_execution,
+            reply,
+            plan_id,
+            cancel_event,
+        )
+
+    def _finish_plan_execution(
+        self,
+        reply,
+        plan_id,
+        cancel_event,
+    ):
+        if (
+            self._executing_plan_id != plan_id
+            or self._plan_cancel_event is not cancel_event
+        ):
+            return False
+
+        self._stop_thinking()
+        self._append_message(
+            reply,
+            "assistant",
+            use_markup=True,
+        )
+        self._executing_plan_id = None
+        self._plan_cancel_event = None
+        self._set_busy(False)
+        self._refresh_plan_actions()
+        return False
+
     def _on_artifacts_toggled(self, button):
         self.artifacts_box.set_visible(button.get_active())
         if button.get_active():
@@ -2487,6 +2812,47 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.session_list.set_sensitive(not busy)
         self.external_sessions_toggle.set_sensitive(not busy)
         self.plan_toggle.set_sensitive(not busy)
+
+        execute_button = getattr(
+            self,
+            "execute_plan_button",
+            None,
+        )
+        if execute_button is not None:
+            ready = bool(
+                getattr(self, "_current_plan", None)
+                and self._current_plan.get("status")
+                in {"draft", "failed", "approved"}
+            )
+            execute_button.set_sensitive(
+                ready and not busy
+            )
+
+        cancel_button = getattr(
+            self,
+            "cancel_plan_button",
+            None,
+        )
+        cancel_event = getattr(
+            self,
+            "_plan_cancel_event",
+            None,
+        )
+        if cancel_button is not None:
+            cancel_button.set_sensitive(
+                bool(
+                    busy
+                    and getattr(
+                        self,
+                        "_executing_plan_id",
+                        None,
+                    )
+                    is not None
+                    and cancel_event is not None
+                    and not cancel_event.is_set()
+                )
+            )
+
         if not busy:
             # Re-enabling the entry doesn't give it back keyboard focus by
             # itself — without this, every reply leaves focus nowhere in
@@ -2895,8 +3261,14 @@ class LiamWindow(Gtk.ApplicationWindow):
 
     def _finish_reply(self, reply, image_map=None):
         self._stop_thinking()
-        self._append_message(reply, "assistant", use_markup=True, image_map=image_map)
+        self._append_message(
+            reply,
+            "assistant",
+            use_markup=True,
+            image_map=image_map,
+        )
         self._set_busy(False)
+        self._refresh_plan_actions()
         return False
 
 

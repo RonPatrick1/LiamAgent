@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import shlex
+import socket
 import subprocess
 import time
 import urllib.parse
@@ -222,6 +223,122 @@ def file_info(path, base_dir=None):
     if lines is not None:
         info.append(f"lines: {lines}")
     return "\n".join(info)
+
+
+def _decode_proc_net_address(value, family):
+    raw = bytes.fromhex(value)
+
+    if family == socket.AF_INET:
+        raw = raw[::-1]
+    elif family == socket.AF_INET6:
+        raw = b"".join(
+            raw[index:index + 4][::-1]
+            for index in range(0, len(raw), 4)
+        )
+    else:
+        raise ValueError(f"Unsupported address family: {family}")
+
+    return socket.inet_ntop(family, raw)
+
+
+def _listening_socket_records(proc_root="/proc/net"):
+    records = []
+
+    sources = (
+        ("tcp", "tcp", socket.AF_INET),
+        ("tcp6", "tcp6", socket.AF_INET6),
+    )
+
+    for protocol, filename, family in sources:
+        path = os.path.join(proc_root, filename)
+
+        try:
+            with open(path, "r", errors="replace") as handle:
+                lines = handle.readlines()
+        except FileNotFoundError:
+            continue
+
+        for line in lines[1:]:
+            fields = line.split()
+
+            if len(fields) < 4 or fields[3] != "0A":
+                continue
+
+            try:
+                encoded_address, encoded_port = fields[1].split(":", 1)
+                address = _decode_proc_net_address(
+                    encoded_address,
+                    family,
+                )
+                port = int(encoded_port, 16)
+            except (ValueError, OSError):
+                continue
+
+            records.append((protocol, address, port))
+
+    return records
+
+
+def listening_ports(
+    candidate_start=8000,
+    candidate_end=8999,
+    suggestion_count=10,
+):
+    """List current TCP listeners and unused candidate web-server ports."""
+    candidate_start = int(candidate_start)
+    candidate_end = int(candidate_end)
+    suggestion_count = int(suggestion_count)
+
+    if not 1024 <= candidate_start <= 65535:
+        raise ValueError(
+            "candidate_start must be between 1024 and 65535"
+        )
+    if not candidate_start <= candidate_end <= 65535:
+        raise ValueError(
+            "candidate_end must be between candidate_start and 65535"
+        )
+    if not 1 <= suggestion_count <= 20:
+        raise ValueError(
+            "suggestion_count must be between 1 and 20"
+        )
+
+    records = sorted(
+        _listening_socket_records(),
+        key=lambda item: (item[2], item[0], item[1]),
+    )
+    used_ports = {port for _protocol, _address, port in records}
+
+    lines = ["Current TCP listeners:"]
+
+    if records:
+        lines.extend(
+            f"- {protocol} {address}:{port}"
+            for protocol, address, port in records
+        )
+    else:
+        lines.append("- None found in /proc/net/tcp or /proc/net/tcp6")
+
+    suggestions = [
+        port
+        for port in range(candidate_start, candidate_end + 1)
+        if port not in used_ports
+    ][:suggestion_count]
+
+    lines.append(
+        "Suggested currently-unused unprivileged TCP ports "
+        f"from {candidate_start}-{candidate_end}: "
+        + (
+            ", ".join(str(port) for port in suggestions)
+            if suggestions
+            else "none"
+        )
+    )
+    lines.append(
+        "These suggestions are absent from the current TCP listener "
+        "table; availability must still be rechecked when the server starts."
+    )
+
+    return "\n".join(lines)
 
 
 def diff_files(path_a, path_b, base_dir=None):
@@ -1147,6 +1264,7 @@ TOOL_IMPL = {
     "search_text": search_text,
     "find_files": find_files,
     "file_info": file_info,
+    "listening_ports": listening_ports,
     "diff_files": diff_files,
     "read_json": read_json,
     "make_directory": make_directory,
@@ -1320,6 +1438,42 @@ TOOL_SCHEMAS = [
                     "path": {"type": "string", "description": "Directory to search under. Defaults to the current directory."},
                 },
                 "required": ["name_pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "listening_ports",
+            "description": (
+                "Read the kernel TCP listener tables and report concrete "
+                "listening addresses and ports, plus currently-unused "
+                "unprivileged candidate ports for a local web server. "
+                "This is read-only and does not start, stop, or modify services."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_start": {
+                        "type": "integer",
+                        "description": (
+                            "First candidate port to consider. Defaults to 8000."
+                        ),
+                    },
+                    "candidate_end": {
+                        "type": "integer",
+                        "description": (
+                            "Last candidate port to consider. Defaults to 8999."
+                        ),
+                    },
+                    "suggestion_count": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum candidate ports to return. Defaults to 10."
+                        ),
+                    },
+                },
+                "required": [],
             },
         },
     },

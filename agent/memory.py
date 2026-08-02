@@ -128,6 +128,25 @@ def _ensure_schema(conn):
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS plans (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                session_id INT NOT NULL,
+                content MEDIUMTEXT NOT NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'draft',
+                result MEDIUMTEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+                approved_at TIMESTAMP NULL,
+                started_at TIMESTAMP NULL,
+                completed_at TIMESTAMP NULL,
+                INDEX plans_session_created (session_id, created_at),
+                INDEX plans_session_status (session_id, status)
+            )
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS routines (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 session_id INT NOT NULL,
@@ -1063,6 +1082,149 @@ def get_search_usage():
     if billable:
         summary += f" ~{billable} over the free tier, roughly ${cost:.2f} billable."
     return summary
+
+
+
+PLAN_TRANSITIONS = {
+    "draft": {"approved", "cancelled"},
+    "approved": {"running", "cancelled"},
+    "running": {"passed", "failed", "cancelled"},
+    "failed": {"approved"},
+    "passed": set(),
+    "cancelled": set(),
+}
+
+_PLAN_SELECT_COLUMNS = (
+    "id, session_id, content, status, result, created_at, updated_at, "
+    "approved_at, started_at, completed_at"
+)
+
+
+def _plan_from_row(row):
+    if not row:
+        return None
+    (
+        id_, session_id, content, status, result, created_at, updated_at,
+        approved_at, started_at, completed_at,
+    ) = row
+    return {
+        "id": id_,
+        "session_id": session_id,
+        "content": content,
+        "status": status,
+        "result": result,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "approved_at": approved_at,
+        "started_at": started_at,
+        "completed_at": completed_at,
+    }
+
+
+def create_plan(session_id, content):
+    """Store a new unapproved plan draft for one thread."""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Plan content must be a non-empty string.")
+
+    conn = _connect()
+    try:
+        _ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO plans (session_id, content, status) "
+                "VALUES (%s, %s, 'draft')",
+                (session_id, content.strip()),
+            )
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_plan(plan_id):
+    """Return one stored plan, or None when it does not exist."""
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_PLAN_SELECT_COLUMNS} "
+                    "FROM plans WHERE id = %s",
+                    (plan_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        return _plan_from_row(row)
+    except Exception as exc:
+        print(f"[memory] failed to get plan: {exc}")
+        return None
+
+
+def get_latest_plan(session_id):
+    """Return the newest stored plan for one thread."""
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_PLAN_SELECT_COLUMNS} "
+                    "FROM plans WHERE session_id = %s "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        return _plan_from_row(row)
+    except Exception as exc:
+        print(f"[memory] failed to get latest plan: {exc}")
+        return None
+
+
+def transition_plan(plan_id, expected_status, new_status, result=None):
+    """Atomically move a plan through an allowed lifecycle transition."""
+    allowed = PLAN_TRANSITIONS.get(expected_status)
+    if allowed is None:
+        raise ValueError(f"Unknown current plan status: {expected_status}")
+    if new_status not in allowed:
+        raise ValueError(
+            f"Invalid plan transition: {expected_status} -> {new_status}"
+        )
+
+    assignments = ["status = %s"]
+    params = [new_status]
+
+    if result is not None:
+        assignments.append("result = %s")
+        params.append(result)
+
+    timestamp_column = {
+        "approved": "approved_at",
+        "running": "started_at",
+        "passed": "completed_at",
+        "failed": "completed_at",
+        "cancelled": "completed_at",
+    }.get(new_status)
+
+    if timestamp_column:
+        assignments.append(f"{timestamp_column} = CURRENT_TIMESTAMP")
+
+    params.extend((plan_id, expected_status))
+
+    conn = _connect()
+    try:
+        _ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE plans SET {', '.join(assignments)} "
+                "WHERE id = %s AND status = %s",
+                tuple(params),
+            )
+            return cur.rowcount == 1
+    finally:
+        conn.close()
 
 
 def add_artifact(session_id, kind, label, content):

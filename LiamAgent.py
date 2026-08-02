@@ -3,6 +3,8 @@
 
 import argparse
 import os
+import signal
+import threading
 import subprocess
 import sys
 
@@ -132,6 +134,162 @@ def _run_routine(routine_id):
         routines.set_enabled(routine_id, False)
 
 
+def _resolve_cli_session(args):
+    """Resolve the exact persisted GUI/CLI thread selected by the user."""
+    if args.session_id is not None:
+        session = memory.get_session(args.session_id)
+        if session is None:
+            raise LookupError(
+                f"No Liam session exists with id {args.session_id}."
+            )
+        return session
+
+    workdir = os.path.abspath(
+        os.path.expanduser(args.workdir or os.getcwd())
+    )
+    session_id = memory.get_or_create_session(workdir)
+    session = memory.get_session(session_id)
+
+    if session is None:
+        raise LookupError(
+            f"Liam could not load the session for {workdir}."
+        )
+
+    return session
+
+
+def _print_sessions():
+    sessions = memory.list_sessions(include_archived=True)
+
+    if not sessions:
+        print("No Liam sessions found.")
+        return
+
+    for session in sessions:
+        flags = []
+
+        if session.get("plan_mode"):
+            flags.append("plan")
+        if session.get("archived"):
+            flags.append("archived")
+        if session.get("pinned"):
+            flags.append("pinned")
+
+        flag_text = ",".join(flags) if flags else "normal"
+        print(
+            f'{session["id"]}\t[{flag_text}]\t'
+            f'{session["title"]}\t{session["folder_path"]}'
+        )
+
+
+def _run_cli_request(agent, user_input):
+    try:
+        reply = ensure_visible_reply(
+            agent.step(user_input),
+            stage="processing the CLI request",
+            tool_events=agent._tool_events,
+        )
+    except Exception as exc:
+        reply = (
+            f"[error] Liam failed while processing the CLI request "
+            f"({type(exc).__name__}): {exc}"
+        )
+
+    print("\nLiam>")
+    print(reply)
+    print()
+
+
+def _approve_cli_plan(session_id, plan_id):
+    """Explicitly approve one stored Plan for the selected session."""
+    plan = memory.get_plan(plan_id)
+
+    if not plan:
+        return f"FAIL: plan #{plan_id} was not found."
+
+    if plan.get("session_id") != session_id:
+        return (
+            f"FAIL: plan #{plan_id} belongs to a different thread."
+        )
+
+    status = plan.get("status")
+
+    if status in {"draft", "failed"}:
+        try:
+            changed = memory.transition_plan(
+                plan_id,
+                status,
+                "approved",
+            )
+        except Exception as exc:
+            return (
+                f"FAIL: plan #{plan_id} could not be approved "
+                f"({type(exc).__name__}: {exc})."
+            )
+
+        if not changed:
+            return (
+                f"FAIL: plan #{plan_id} could not transition from "
+                f"{status!r} to 'approved'."
+            )
+    elif status != "approved":
+        return (
+            f"FAIL: plan #{plan_id} has status {status!r} "
+            "and cannot be approved and run."
+        )
+
+    try:
+        memory.set_plan_mode(session_id, False)
+    except Exception as exc:
+        return (
+            "FAIL: the session could not leave Plan mode before "
+            f"execution ({type(exc).__name__}: {exc})."
+        )
+
+    return None
+
+
+def _run_cli_plan(agent, plan_id):
+    """Run the existing approved-Plan executor in the foreground."""
+    cancel_event = threading.Event()
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    def request_cancel(_signum, _frame):
+        if cancel_event.is_set():
+            return
+
+        cancel_event.set()
+        print(
+            "\nCancellation requested. Liam will stop at the next "
+            "safe checkpoint."
+        )
+
+    signal.signal(signal.SIGINT, request_cancel)
+
+    try:
+        try:
+            reply = agent.execute_plan(
+                plan_id,
+                cancel_event=cancel_event,
+            )
+        except Exception as exc:
+            reply = (
+                "FAIL: Liam crashed while executing the approved plan "
+                f"({type(exc).__name__}: {exc})."
+            )
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+
+    reply = ensure_visible_reply(
+        reply,
+        stage="executing the approved plan",
+    )
+
+    print("\nLiam>")
+    print(reply)
+    print()
+
+
 def main():
     saved = liam_settings.load()
     parser = argparse.ArgumentParser(description="Liam - a local CLI agent on Ollama")
@@ -145,11 +303,120 @@ def main():
         "--routine", type=int, metavar="ID",
         help="Run a scheduled routine headlessly (used by its systemd timer, not for interactive use) and exit",
     )
+    session_selector = parser.add_mutually_exclusive_group()
+    session_selector.add_argument(
+        "--session-id",
+        type=int,
+        metavar="ID",
+        help=(
+            "Use the exact persisted Liam thread with this session ID, "
+            "including its GUI history, folders, plans, and Plan-mode state."
+        ),
+    )
+    session_selector.add_argument(
+        "--workdir",
+        metavar="PATH",
+        help=(
+            "Use the persisted Liam thread associated with this folder. "
+            "Defaults to the current directory."
+        ),
+    )
+    cli_action = parser.add_mutually_exclusive_group()
+    cli_action.add_argument(
+        "--prompt",
+        metavar="TEXT",
+        help=(
+            "Process one request and exit instead of opening the "
+            "interactive REPL."
+        ),
+    )
+    cli_action.add_argument(
+        "--run-plan",
+        type=int,
+        metavar="ID",
+        help=(
+            "Explicitly approve and immediately run this stored Plan "
+            "in the selected session."
+        ),
+    )
+    cli_action.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help=(
+            "List persisted Liam session IDs, states, titles, and "
+            "folder paths, then exit."
+        ),
+    )
     args = parser.parse_args()
 
     if args.routine is not None:
         _run_routine(args.routine)
         return
+
+    if args.list_sessions:
+        _print_sessions()
+        return
+
+    try:
+        session = _resolve_cli_session(args)
+    except LookupError as exc:
+        print(f"[error] {exc}")
+        return
+
+    session_id = session["id"]
+    workdir = session["folder_path"]
+
+    if args.run_plan is not None:
+        approval_error = _approve_cli_plan(
+            session_id,
+            args.run_plan,
+        )
+
+        if approval_error:
+            print(approval_error)
+            return
+
+        session = dict(session)
+        session["plan_mode"] = False
+
+    extra_folders = [
+        folder["folder_path"]
+        for folder in memory.list_session_folders(session_id)
+    ]
+    agent = Agent(
+        model=args.model,
+        auto_confirm=not args.confirm,
+        workdir=workdir,
+        session_id=session_id,
+        extra_folders=extra_folders,
+        custom_instructions=saved["custom_instructions"],
+        channel="cli",
+        actor_id="local-owner",
+        is_owner=True,
+        learning_enabled=True,
+        plan_mode=bool(session.get("plan_mode")),
+    )
+    print(
+        f'Liam agent ready for session #{session_id} '
+        f'("{session["title"]}", model: {args.model}, '
+        f'Plan mode: {"on" if agent.plan_mode else "off"}).'
+    )
+
+    if args.run_plan is not None:
+        _run_cli_plan(agent, args.run_plan)
+        return
+
+    if args.prompt is not None:
+        user_input = args.prompt.strip()
+
+        if not user_input:
+            print("[error] --prompt must contain a non-empty request.")
+            return
+
+        _run_cli_request(agent, user_input)
+        return
+
+    print("Type 'help' for commands, 'exit' to quit.\n")
 
     # prompt_toolkit handles bracketed paste correctly: a pasted multi-line
     # block gets inserted as literal text (newlines included), and only a
@@ -158,17 +425,6 @@ def main():
     # It requires a real terminal, though, so piped/non-interactive input
     # (scripts, tests) falls back to plain input() instead.
     prompt_fn = _make_prompt_fn()
-
-    workdir = os.getcwd()
-    session_id = memory.get_or_create_session(workdir)
-    extra_folders = [f["folder_path"] for f in memory.list_session_folders(session_id)]
-    agent = Agent(
-        model=args.model, auto_confirm=not args.confirm, workdir=workdir, session_id=session_id,
-        extra_folders=extra_folders, custom_instructions=saved["custom_instructions"],
-        channel="cli", actor_id="local-owner", is_owner=True,
-        learning_enabled=True,
-    )
-    print(f"Liam agent ready (model: {args.model}). Type 'help' for commands, 'exit' to quit.\n")
 
     while True:
         try:
@@ -187,19 +443,7 @@ def main():
             print()
             continue
 
-        try:
-            reply = ensure_visible_reply(
-                agent.step(user_input), stage="processing the CLI request",
-                tool_events=agent._tool_events,
-            )
-        except Exception as exc:
-            reply = (
-                f"[error] Liam failed while processing the CLI request "
-                f"({type(exc).__name__}): {exc}"
-            )
-        print("\nLiam>")
-        print(reply)
-        print()
+        _run_cli_request(agent, user_input)
 
 
 if __name__ == "__main__":

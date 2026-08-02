@@ -16,7 +16,7 @@ class OllamaClient:
         self.options = dict(options or {})
         self.response_format = response_format
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, response_format=None):
         payload = {
             "model": self.model,
             "messages": messages,
@@ -26,8 +26,13 @@ class OllamaClient:
             payload["keep_alive"] = self.keep_alive
         if self.options:
             payload["options"] = self.options
-        if self.response_format is not None:
-            payload["format"] = self.response_format
+        effective_response_format = (
+            self.response_format
+            if response_format is None
+            else response_format
+        )
+        if effective_response_format is not None:
+            payload["format"] = effective_response_format
         if tools:
             payload["tools"] = tools
         try:
