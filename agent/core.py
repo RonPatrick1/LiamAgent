@@ -22,6 +22,17 @@ from .contracts import (
 )
 from . import memory, routines
 
+
+PLAN_REQUEST_CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["requires_plan"],
+    "properties": {
+        "requires_plan": {"type": "boolean"},
+    },
+}
+
+
 SYSTEM_PROMPT = """You are Liam, a local autonomous agent running on a \
 configured local model via Ollama. You can use tools to read and write files, run shell commands, \
 search the web, check real weather, fetch and read real webpages, and \
@@ -4354,6 +4365,68 @@ class Agent:
 
         return None
 
+    def _semantic_plan_required_for_request(self, user_input):
+        """Classify Plan-mode intent without relying on English verb lists.
+
+        The model proposes one boolean under a strict JSON schema. A malformed
+        classifier response defaults conservatively to requiring a plan, so
+        Plan mode cannot silently fall back to unsupported prose.
+        """
+        response = self._helper_chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Decide whether the current request requires a "
+                        "structured implementation plan. Return exactly one "
+                        "JSON object matching the supplied schema. Return true "
+                        "when the user asks Liam to inspect, assess, design, "
+                        "fix, improve, change, create, remove, configure, "
+                        "implement, execute, or prepare concrete implementation "
+                        "steps for a project, system, file, application, or "
+                        "other target. This includes indirect wording such as "
+                        "looking through a project and explaining how Liam "
+                        "would improve it. Return false for pure factual "
+                        "questions, explanations, conversation, recall, or "
+                        "read-only information requests that do not ask for a "
+                        "proposed project or system change."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": user_input or "",
+                },
+            ],
+            response_format=PLAN_REQUEST_CLASSIFICATION_SCHEMA,
+        )
+
+        payload = self._parse_json_object(
+            response.get("content", "")
+        )
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("requires_plan"), bool)
+        ):
+            self.on_status(
+                "  [Plan request classifier returned invalid structured "
+                "output; requiring a plan conservatively]"
+            )
+            return True
+
+        return payload["requires_plan"]
+
+    def _plan_draft_required_for_request(self, user_input):
+        """Return whether active Plan mode must produce a saved plan draft.
+
+        The legacy detector remains a positive fast path for compatibility.
+        A negative regex result is not authoritative: semantic structured
+        classification decides requests expressed with different wording.
+        """
+        if self._plan_required_for_request(user_input):
+            return True
+
+        return self._semantic_plan_required_for_request(user_input)
+
     def _plan_required_for_request(self, user_input):
         """Return True only for a concrete request to change something."""
         if self._is_direct_note_recall_request(user_input):
@@ -6201,7 +6274,7 @@ class Agent:
         tool_results = []
         plan_required = (
             turn_plan_mode
-            and self._plan_required_for_request(user_input)
+            and self._plan_draft_required_for_request(user_input)
         )
 
         # A literal backtick command addressed to one SSH alias is fully

@@ -198,6 +198,9 @@ class PlanModeTests(unittest.TestCase):
                 agent.client.chat.return_value = {
                     "content": "Plan-only response",
                 }
+                agent._helper_chat = mock.Mock(return_value={
+                    "content": '{"requires_plan": false}',
+                })
                 agent.on_status = mock.Mock()
                 agent.on_tool_call = mock.Mock()
                 agent._execute_tool = mock.Mock(
