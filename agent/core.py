@@ -772,7 +772,7 @@ PLAN_ACTION_REQUEST_RE = re.compile(
     r"(?:i\s+want\s+(?:you\s+)?to\s+))?"
     r"(?:add|build|cancel|change|configure|copy|create|delete|deploy|"
     r"design|draw|edit|execute|fix|forget|generate|implement|install|"
-    r"make|modify|move|paint|plan|publish|remember|remove|rename|"
+    r"make|modify|move|paint|plan|play|publish|remember|remove|rename|"
     r"render|replace|restart|run|schedule|set\s+up|start|stop|"
     r"update|write)\b",
     re.IGNORECASE | re.DOTALL,
@@ -4017,6 +4017,62 @@ class Agent:
             for event in events or []
         )
 
+    def _has_pending_action_promise(self):
+        """Return True when an earlier executable request remains unresolved
+        because Liam answered with promises instead of a real tool call.
+
+        The current assistant response is already appended to self.messages
+        when this runs, so exclude it and inspect the preceding conversation.
+        A real tool message or a later non-promise assistant response closes
+        the pending promise chain.
+        """
+        messages = list(getattr(self, "messages", None) or [])
+
+        if (
+            messages
+            and isinstance(messages[-1], dict)
+            and messages[-1].get("role") == "assistant"
+        ):
+            messages = messages[:-1]
+
+        saw_promise = False
+
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+
+            role = message.get("role")
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = ""
+
+            if role == "tool":
+                if saw_promise:
+                    return False
+                continue
+
+            if role == "assistant":
+                if (
+                    ACTION_PROMISE_RE.search(content)
+                    or INERT_ACTION_CODE_RE.search(content)
+                ):
+                    saw_promise = True
+                    continue
+
+                if saw_promise:
+                    return False
+
+                continue
+
+            if (
+                role == "user"
+                and saw_promise
+                and self._plan_required_for_request(content)
+            ):
+                return True
+
+        return False
+
     def _response_requires_real_tool(self, user_input, content):
         user_input = user_input or ""
         content = content or ""
@@ -4027,7 +4083,10 @@ class Agent:
         if user_input.lstrip().startswith(APPROVED_PLAN_STEP_PREFIXES):
             return True
 
-        if not self._plan_required_for_request(user_input):
+        if (
+            not self._plan_required_for_request(user_input)
+            and not self._has_pending_action_promise()
+        ):
             return False
 
         return bool(

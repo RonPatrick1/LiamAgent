@@ -86,6 +86,156 @@ class ActionToolRequirementTests(unittest.TestCase):
 
         self.assertFalse(required)
 
+    def test_pending_action_survives_non_action_followup(self):
+        followups = (
+            "Did you run that command?",
+            "bullshit",
+        )
+
+        for followup in followups:
+            with self.subTest(followup=followup):
+                agent = core.Agent.__new__(core.Agent)
+                agent.plan_mode = False
+                agent.messages = [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Play /var/www/AMusic/song.flac using ogg123."
+                        ),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "I will run the command now.",
+                    },
+                    {
+                        "role": "user",
+                        "content": followup,
+                    },
+                ]
+
+                required = agent._response_requires_real_tool(
+                    followup,
+                    "I will use run_shell_command to execute it now.",
+                )
+
+                self.assertTrue(required)
+
+    def test_pending_action_allows_honest_nonexecution_report(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = False
+        agent.messages = [
+            {
+                "role": "user",
+                "content": "Run printf action-ran.",
+            },
+            {
+                "role": "assistant",
+                "content": "I will run the command now.",
+            },
+            {
+                "role": "user",
+                "content": "Did you run that command?",
+            },
+        ]
+
+        required = agent._response_requires_real_tool(
+            "Did you run that command?",
+            "No. I did not run the command.",
+        )
+
+        self.assertFalse(required)
+
+    @mock.patch.object(core.memory, "load_recent_notes", return_value=[])
+    @mock.patch.object(core.memory, "load_recent_messages", return_value=[])
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "get_latest_plan", return_value=None)
+    def test_pending_action_followup_recovery_executes_real_tool(
+        self,
+        _get_latest_plan,
+        _save_message,
+        _match_lessons,
+        _load_messages,
+        _load_notes,
+    ):
+        import tempfile
+
+        client = mock.Mock()
+        client.chat.side_effect = [
+            {
+                "role": "assistant",
+                "content": "I will use run_shell_command now.",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "run_shell_command",
+                            "arguments": {
+                                "command": "printf action-ran"
+                            },
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "The command completed.",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(core, "OllamaClient", return_value=client):
+                agent = core.Agent(
+                    channel="gui",
+                    plan_mode=False,
+                    workdir=directory,
+                    session_id=53,
+                )
+
+            agent.messages = [
+                {
+                    "role": "user",
+                    "content": "Run printf action-ran.",
+                },
+                {
+                    "role": "assistant",
+                    "content": "I will run the command now.",
+                },
+            ]
+
+            recovery_schema = next(
+                schema
+                for schema in agent.tool_schemas
+                if schema["function"]["name"] == "run_shell_command"
+            )
+            agent._select_recovery_tool_schemas = mock.Mock(
+                return_value=[recovery_schema]
+            )
+            agent.on_tool_call = mock.Mock()
+
+            def execute_tool(name, args):
+                agent._tool_events.append({
+                    "tool": name,
+                    "status": "success",
+                    "args": args,
+                    "result": "action-ran",
+                })
+                return "action-ran"
+
+            agent._execute_tool = mock.Mock(side_effect=execute_tool)
+
+            result = agent.step("Did you run that command?")
+
+        self.assertEqual(result, "The command completed.")
+        agent._execute_tool.assert_called_once_with(
+            "run_shell_command",
+            {"command": "printf action-ran"},
+        )
+        self.assertEqual(client.chat.call_count, 3)
+
     @mock.patch.object(core.memory, "load_recent_notes", return_value=[])
     @mock.patch.object(core.memory, "load_recent_messages", return_value=[])
     @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
