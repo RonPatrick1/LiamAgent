@@ -270,6 +270,17 @@ MAX_STEPS = 10
 MAX_CALLS_PER_RESPONSE = 5
 MAX_TOTAL_CALLS = 15
 
+MICRO_PLAN_MAX_DISCOVERY_CALLS = 6
+MICRO_PLAN_MAX_FILE_READS = 4
+MICRO_PLAN_SYNTHESIS_INSTRUCTION = (
+    "The bounded discovery micro-plan is complete. Do not call any tools and "
+    "do not create another micro-plan. Using only the inspected evidence "
+    "provided below, return the requested durable approval plan as exactly "
+    "one complete liam-plan JSON block. Include concrete files and actionable "
+    "steps. Record unresolved facts in risks or discovery steps instead of "
+    "inventing them."
+)
+
 PLAN_EXECUTION_NO_PROGRESS_LIMIT = 3
 
 PLAN_PROGRESS_ACTION_TOOLS = (
@@ -3387,6 +3398,61 @@ class Agent:
             or getattr(self, "_turn_plan_mode", False)
         )
 
+    @staticmethod
+    def _start_micro_plan(existing=None):
+        """Create one local-only discovery checklist for the current turn."""
+        if existing is not None:
+            raise RuntimeError(
+                "nested micro-plans are not allowed"
+            )
+
+        return {
+            "steps": (
+                "Inspect the project structure.",
+                "Inspect only the most relevant documentation and source files.",
+                "Synthesize one durable approval plan from observed evidence.",
+            ),
+            "discovery_calls": 0,
+            "file_reads": 0,
+            "synthesis_required": False,
+        }
+
+    @staticmethod
+    def _micro_plan_instruction(micro_plan, final=False):
+        if final:
+            return MICRO_PLAN_SYNTHESIS_INSTRUCTION
+
+        return (
+            "Host-owned ephemeral micro-plan for this turn only:\n"
+            "1. Inspect the project structure.\n"
+            "2. Inspect only the most relevant documentation and source "
+            "files.\n"
+            "3. Produce one durable liam-plan for approval.\n"
+            "This checklist is not persistent, cannot create a child "
+            "micro-plan, and grants no additional tool permissions. "
+            f"Discovery is limited to {MICRO_PLAN_MAX_DISCOVERY_CALLS} tool "
+            f"calls and {MICRO_PLAN_MAX_FILE_READS} read_file calls. "
+            f"Used so far: {micro_plan['discovery_calls']} tool calls and "
+            f"{micro_plan['file_reads']} read_file calls."
+        )
+
+    @staticmethod
+    def _advance_micro_plan(micro_plan, tool_name):
+        if micro_plan is None or micro_plan["synthesis_required"]:
+            return
+
+        micro_plan["discovery_calls"] += 1
+        if tool_name == "read_file":
+            micro_plan["file_reads"] += 1
+
+        if (
+            micro_plan["discovery_calls"]
+            >= MICRO_PLAN_MAX_DISCOVERY_CALLS
+            or micro_plan["file_reads"]
+            >= MICRO_PLAN_MAX_FILE_READS
+        ):
+            micro_plan["synthesis_required"] = True
+
     def _plan_reuse_evidence_ports(self):
         """Ports proven, this turn, to already be correctly answering a
         real HTTP request — via fetch_url or a run_shell_command curl —
@@ -6342,6 +6408,11 @@ class Agent:
             turn_plan_mode
             and self._plan_draft_required_for_request(user_input)
         )
+        micro_plan = (
+            self._start_micro_plan()
+            if plan_required
+            else None
+        )
 
         # A literal backtick command addressed to one SSH alias is fully
         # specified by the user. Execute that exact structured tool call
@@ -6515,18 +6586,48 @@ class Agent:
         recovery_response_format = None
 
         for _ in range(MAX_STEPS):
+            micro_plan_synthesis = bool(
+                micro_plan is not None
+                and micro_plan["synthesis_required"]
+                and not recovery_instruction
+            )
+            chat_response_format = recovery_response_format
+
             if recovery_instruction:
                 chat_messages = self._focused_recovery_messages(
                     user_message_index, recovery_instruction,
                 )
                 chat_tools = recovery_tool_schemas
+            elif micro_plan_synthesis:
+                synthesis_instruction = self._micro_plan_instruction(
+                    micro_plan,
+                    final=True,
+                )
+                evidence_context = self._plan_recovery_evidence_context()
+                if evidence_context:
+                    synthesis_instruction += (
+                        "\n\nInspected evidence:\n"
+                        + evidence_context
+                    )
+                chat_messages = self._focused_recovery_messages(
+                    user_message_index,
+                    synthesis_instruction,
+                )
+                chat_tools = []
+                chat_response_format = PLAN_DRAFT_JSON_SCHEMA
             else:
                 chat_messages = self.messages
                 chat_tools = turn_tool_schemas
-            if not recovery_instruction and (
-                hint_text
-                or getattr(self, "_turn_plan_mode", False)
-                or contract_instruction
+
+            if (
+                not recovery_instruction
+                and not micro_plan_synthesis
+                and (
+                    hint_text
+                    or getattr(self, "_turn_plan_mode", False)
+                    or contract_instruction
+                    or micro_plan is not None
+                )
             ):
                 chat_messages = list(self.messages)
                 hinted = dict(chat_messages[user_message_index])
@@ -6545,6 +6646,12 @@ class Agent:
                         "thread's saved mode:\n"
                         f"{PLAN_MODE_SYSTEM_PROMPT.strip()}]"
                     )
+                if micro_plan is not None:
+                    additions.append(
+                        "["
+                        + self._micro_plan_instruction(micro_plan)
+                        + "]"
+                    )
                 hinted["content"] = (
                     f"{hinted['content']}\n\n"
                     + "\n\n".join(additions)
@@ -6553,7 +6660,7 @@ class Agent:
             message = self._chat(
                 chat_messages,
                 tools=chat_tools,
-                response_format=recovery_response_format,
+                response_format=chat_response_format,
             )
             if not isinstance(message, dict):
                 message = {
@@ -6562,7 +6669,7 @@ class Agent:
                 }
 
             if (
-                recovery_response_format is PLAN_DRAFT_JSON_SCHEMA
+                chat_response_format is PLAN_DRAFT_JSON_SCHEMA
                 and isinstance(message.get("content"), str)
             ):
                 raw_plan = message["content"].strip()
@@ -6590,6 +6697,17 @@ class Agent:
             self.messages.append(message)
 
             tool_calls = message.get("tool_calls")
+            if micro_plan_synthesis and tool_calls:
+                self.on_status(
+                    "  [rejected tool call from tool-free micro-plan "
+                    "synthesis; retrying durable-plan output only...]"
+                )
+                message = dict(message)
+                message.pop("tool_calls", None)
+                message["content"] = message.get("content", "")
+                self.messages[-1] = message
+                tool_calls = None
+
             protocol_problem = self._tool_call_protocol_problem(message)
             content = message.get("content", "")
             plan_draft_problem = None
@@ -7144,6 +7262,17 @@ class Agent:
                 total_calls += 1
                 calls_this_response += 1
                 self.messages.append({"role": "tool", "content": result})
+                self._advance_micro_plan(micro_plan, name)
+
+                if (
+                    micro_plan is not None
+                    and micro_plan["synthesis_required"]
+                ):
+                    self.on_status(
+                        "  [micro-plan discovery budget complete; "
+                        "forcing tool-free durable-plan synthesis...]"
+                    )
+                    break
 
             if total_calls >= MAX_TOTAL_CALLS:
                 break
@@ -7169,6 +7298,65 @@ class Agent:
             and any(name in GROUNDING_TOOLS for name, _ in tool_results)
         ):
             content = self._synthesize(user_input, tool_results)
+        elif plan_required:
+            synthesis_instruction = self._micro_plan_instruction(
+                micro_plan,
+                final=True,
+            )
+            evidence_context = self._plan_recovery_evidence_context()
+            if evidence_context:
+                synthesis_instruction += (
+                    "\n\nInspected evidence:\n"
+                    + evidence_context
+                )
+
+            final_message = self._chat(
+                self._focused_recovery_messages(
+                    user_message_index,
+                    synthesis_instruction,
+                ),
+                tools=[],
+                response_format=PLAN_DRAFT_JSON_SCHEMA,
+            )
+            if not isinstance(final_message, dict):
+                final_message = {
+                    "role": "assistant",
+                    "content": "",
+                }
+
+            raw_plan = final_message.get("content", "")
+            if isinstance(raw_plan, str):
+                raw_plan = raw_plan.strip()
+            else:
+                raw_plan = ""
+
+            canonical_plan, plan_problem = _extract_plan_draft(raw_plan)
+            if canonical_plan is None and plan_problem is None:
+                try:
+                    plan_value = json.loads(raw_plan)
+                except (TypeError, ValueError):
+                    plan_value = None
+                if isinstance(plan_value, dict):
+                    raw_plan = (
+                        "```liam-plan\n"
+                        + json.dumps(plan_value, sort_keys=True)
+                        + "\n```"
+                    )
+                    canonical_plan, plan_problem = _extract_plan_draft(
+                        raw_plan
+                    )
+
+            if canonical_plan is None:
+                reason = plan_problem or "missing required liam-plan block"
+                content = (
+                    "[Plan draft not saved after final tool-free "
+                    f"micro-plan synthesis: {reason}.]"
+                )
+            else:
+                content = raw_plan
+
+            final_message["content"] = content
+            self.messages.append(final_message)
         else:
             content = "(stopped: reached the reasoning step limit without a final answer)"
         content = self._note_refused_tools(content, tool_results)
