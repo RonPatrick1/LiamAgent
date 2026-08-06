@@ -25,6 +25,53 @@ class ActionToolRequirementTests(unittest.TestCase):
 
         self.assertTrue(required)
 
+    def test_use_ogg_to_play_is_an_action_request(self):
+        agent = core.Agent.__new__(core.Agent)
+
+        self.assertTrue(
+            agent._plan_required_for_request(
+                "Can you use ogg to play this file?"
+            )
+        )
+
+    def test_explicit_run_shell_request_selects_exact_tool(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = False
+        agent.tool_schemas = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_shell_command",
+                    "description": "Run a shell command.",
+                    "parameters": {},
+                },
+            },
+        ]
+
+        selected = agent._explicit_requested_tool_schemas(
+            (
+                "Look back at the run_shell_command you used and "
+                "do that with this file."
+            ),
+            agent.tool_schemas,
+        )
+
+        self.assertEqual(
+            [
+                schema["function"]["name"]
+                for schema in selected
+            ],
+            ["run_shell_command"],
+        )
+
     def test_action_promise_requires_real_tool(self):
         agent = core.Agent.__new__(core.Agent)
 
@@ -235,6 +282,115 @@ class ActionToolRequirementTests(unittest.TestCase):
             {"command": "printf action-ran"},
         )
         self.assertEqual(client.chat.call_count, 3)
+
+    @mock.patch.object(core.memory, "load_recent_notes", return_value=[])
+    @mock.patch.object(core.memory, "load_recent_messages", return_value=[])
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "get_latest_plan", return_value=None)
+    def test_wrong_read_tool_cannot_complete_play_action(
+        self,
+        _get_latest_plan,
+        _save_message,
+        _match_lessons,
+        _load_messages,
+        _load_notes,
+    ):
+        import tempfile
+
+        path = "/media/example/Ride.flac"
+
+        client = mock.Mock()
+        client.chat.side_effect = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": path},
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "The file contents do not show whether it can play."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "run_shell_command",
+                            "arguments": {
+                                "command": f'ogg123 "{path}"'
+                            },
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "Playback started.",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(core, "OllamaClient", return_value=client):
+                agent = core.Agent(
+                    channel="gui",
+                    plan_mode=False,
+                    workdir=directory,
+                    session_id=54,
+                )
+
+            run_schema = next(
+                schema
+                for schema in agent.tool_schemas
+                if schema["function"]["name"]
+                == "run_shell_command"
+            )
+            agent._select_recovery_tool_schemas = mock.Mock(
+                return_value=[run_schema]
+            )
+            agent.on_tool_call = mock.Mock()
+
+            def execute_tool(name, args):
+                if name == "read_file":
+                    result = "binary media data"
+                elif name == "run_shell_command":
+                    result = "Playing Ride.flac\n[exit code: 0]"
+                else:
+                    self.fail(f"unexpected tool: {name}")
+
+                agent._tool_events.append({
+                    "tool": name,
+                    "status": "success",
+                    "args": args,
+                    "result": result,
+                })
+                return result
+
+            agent._execute_tool = mock.Mock(side_effect=execute_tool)
+
+            result = agent.step(
+                f"Can you use ogg to play this file?\n{path}"
+            )
+
+        self.assertEqual(result, "Playback started.")
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in agent._execute_tool.call_args_list
+            ],
+            ["read_file", "run_shell_command"],
+        )
+        self.assertEqual(client.chat.call_count, 4)
 
     @mock.patch.object(core.memory, "load_recent_notes", return_value=[])
     @mock.patch.object(core.memory, "load_recent_messages", return_value=[])

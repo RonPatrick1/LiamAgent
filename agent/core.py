@@ -92,9 +92,13 @@ commands you show them are exactly right. Do the whole thing yourself,
 then report the real outcome.
 
 Use tools when you need information you don't have or need to take action.
-A filename or path the user mentions (like "config.py" or "notes.txt") is
-almost always a local file to read with read_file — never invent a URL or
-use web_search/fetch_url for something that's just sitting on disk. Only
+A filename or path the user mentions is a local target, but that does not
+automatically make read_file the correct tool. Use read_file when the user
+asks to inspect or read textual contents. For actions such as playing,
+executing, copying, moving, converting, or deleting a file, use the
+corresponding action tool instead. Never read binary media as a substitute
+for performing the requested action. Never invent a URL or use
+web_search/fetch_url for something that's just sitting on disk. Only
 reach for web_search for anything time-sensitive or beyond your training
 data — don't guess. For weather questions specifically, use get_weather,
 not web_search — search results are just links and snippets with no real
@@ -253,6 +257,19 @@ PLAN_PROGRESS_ACTION_TOOLS = (
         - {"run_shell_command", "ssh_run_command"}
     )
     | {"generate_image", "remember"}
+)
+
+ACTION_ATTEMPT_TOOLS = (
+    PLAN_PROGRESS_ACTION_TOOLS
+    | {
+        "run_shell_command",
+        "ssh_run_command",
+        "generate_image",
+        "remember",
+        "forget",
+        "schedule_routine",
+        "cancel_routine",
+    }
 )
 
 PLAN_STEP_ACTION_RE = re.compile(
@@ -774,7 +791,7 @@ PLAN_ACTION_REQUEST_RE = re.compile(
     r"design|draw|edit|execute|fix|forget|generate|implement|install|"
     r"make|modify|move|paint|plan|play|publish|remember|remove|rename|"
     r"render|replace|restart|run|schedule|set\s+up|start|stop|"
-    r"update|write)\b",
+    r"update|use|write)\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -1281,6 +1298,15 @@ ACTION_FOLLOWUP_REQUEST_RE = re.compile(
     r"(?:it|that|this\b.*|again\b.*|the\b.*))"
     r"[.!?\s]*$",
     re.IGNORECASE | re.DOTALL,
+)
+EXPLICIT_TOOL_ACTION_CONTEXT_RE = re.compile(
+    r"\b(?:call|copy|delete|do(?:\s+(?:it|that|this))?|edit|execute|"
+    r"install|move|play|run|start|stop|use|write)\b",
+    re.IGNORECASE,
+)
+PAST_TOOL_ACTION_QUESTION_RE = re.compile(
+    r"^\s*(?:(?:why|when)\s+)?(?:did|have|has)\s+you\b",
+    re.IGNORECASE,
 )
 # Only data-lookup tools get routed through isolated synthesis — their
 # result is meant to answer a factual question. Action tools (remember,
@@ -2240,6 +2266,39 @@ class Agent:
             label = "Current user request" if index == len(requests) - 1 else "Earlier user request"
             lines.append(f"{label}:\n{content}")
         return "\n\n".join(lines)
+
+    @staticmethod
+    def _explicit_requested_tool_schemas(user_input, tool_schemas):
+        """Return an explicitly named available tool for an action request.
+
+        Merely asking about a tool or asking whether it ran is informational
+        and must not trigger execution. A concrete action phrase plus an exact
+        available tool name is treated as an intentional routing constraint.
+        """
+        user_input = user_input or ""
+
+        if PAST_TOOL_ACTION_QUESTION_RE.search(user_input):
+            return []
+
+        if not EXPLICIT_TOOL_ACTION_CONTEXT_RE.search(user_input):
+            return []
+
+        selected = []
+        for schema in tool_schemas or []:
+            function = schema.get("function") or {}
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+
+            if re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(name)}"
+                rf"(?![A-Za-z0-9_])",
+                user_input,
+                re.IGNORECASE,
+            ):
+                selected.append(schema)
+
+        return selected[:1]
 
     def _select_recovery_tool_schemas(
         self,
@@ -4017,6 +4076,14 @@ class Agent:
             for event in events or []
         )
 
+    @staticmethod
+    def _has_action_tool_attempt(events):
+        return any(
+            isinstance(event, dict)
+            and event.get("tool") in ACTION_ATTEMPT_TOOLS
+            for event in events or []
+        )
+
     def _has_pending_action_promise(self):
         """Return True when an earlier executable request remains unresolved
         because Liam answered with promises instead of a real tool call.
@@ -5739,6 +5806,16 @@ class Agent:
             schema["function"]["name"]
             for schema in turn_tool_schemas
         }
+        explicit_requested_tool_schemas = (
+            self._explicit_requested_tool_schemas(
+                user_input,
+                turn_tool_schemas,
+            )
+        )
+        explicit_requested_tool_names = {
+            schema["function"]["name"]
+            for schema in explicit_requested_tool_schemas
+        }
         lesson_hits = memory.match_lesson_records(
             user_input, workspace=self.workdir, channel=self.channel,
             available_tools=available_tools, limit=3,
@@ -6161,6 +6238,32 @@ class Agent:
                 next_recovery_instruction = EMPTY_RESPONSE_RECOVERY
             elif (
                 not tool_calls
+                and available_tools
+                and not self._plan_mode_active()
+                and (
+                    self._plan_required_for_request(user_input)
+                    or explicit_requested_tool_names
+                )
+                and not (
+                    any(
+                        isinstance(event, dict)
+                        and event.get("tool")
+                        in explicit_requested_tool_names
+                        for event in self._tool_events
+                    )
+                    if explicit_requested_tool_names
+                    else self._has_action_tool_attempt(
+                        self._tool_events
+                    )
+                )
+            ):
+                response_problem = (
+                    "an executable action request that ended without "
+                    "the required action tool call"
+                )
+                next_recovery_instruction = ACTION_TOOL_RECOVERY
+            elif (
+                not tool_calls
                 and not tool_results
                 and available_tools
                 and not (content or "").lstrip().lower().startswith("[error]")
@@ -6303,10 +6406,25 @@ class Agent:
                         recovery_response_format = PLAN_DRAFT_JSON_SCHEMA
                 else:
                     recovery_attempted = True
-                    recovery_tool_schemas = self._select_recovery_tool_schemas(
-                        user_message_index,
-                        tool_schemas=turn_tool_schemas,
-                    )
+                    if explicit_requested_tool_schemas:
+                        recovery_tool_schemas = (
+                            explicit_requested_tool_schemas
+                        )
+                        label = ", ".join(
+                            schema["function"]["name"]
+                            for schema in recovery_tool_schemas
+                        )
+                        self.on_status(
+                            "  [focused recovery tools: "
+                            f"{label} (explicitly requested)]"
+                        )
+                    else:
+                        recovery_tool_schemas = (
+                            self._select_recovery_tool_schemas(
+                                user_message_index,
+                                tool_schemas=turn_tool_schemas,
+                            )
+                        )
                     recovery_response_format = None
                 if plan_draft_problem:
                     if plan_evidence_recovery_needed:
@@ -6443,6 +6561,7 @@ class Agent:
                         content = auto_proposed
                 if (
                     not self._plan_mode_active()
+                    and not self._has_action_tool_attempt(self._tool_events)
                     and any(name in GROUNDING_TOOLS for name, _ in tool_results)
                 ):
                     content = self._synthesize(user_input, tool_results)
@@ -6533,6 +6652,7 @@ class Agent:
             content = auto_proposed
         elif (
             not self._plan_mode_active()
+            and not self._has_action_tool_attempt(self._tool_events)
             and any(name in GROUNDING_TOOLS for name, _ in tool_results)
         ):
             content = self._synthesize(user_input, tool_results)
