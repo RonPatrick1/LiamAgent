@@ -248,6 +248,107 @@ class MicroPlanningTests(unittest.TestCase):
         )
         create_plan.assert_called_once()
 
+    def test_forced_synthesis_removes_only_extra_placeholder_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index in range(core.MICRO_PLAN_MAX_FILE_READS):
+                path = os.path.join(directory, f"observed{index}.txt")
+                with open(path, "w") as handle:
+                    handle.write(f"observed project content {index}")
+                paths.append(path)
+
+            payload = plan_payload()
+            payload["validation"].append({
+                "command": "test -f TODO",
+                "expected": "The additional project file exists.",
+            })
+
+            responses = [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": path},
+                        },
+                    }],
+                }
+                for path in paths
+            ]
+            responses.append({
+                "role": "assistant",
+                "content": json.dumps(payload),
+            })
+
+            client = mock.Mock()
+            client.chat.side_effect = responses
+            create_plan = mock.Mock(return_value=94)
+            agent = self.build_agent(
+                client,
+                directory,
+                create_plan,
+            )
+
+            reply = agent.step(
+                "Make a plan to fix the project in this folder."
+            )
+
+        self.assertEqual(
+            client.chat.call_count,
+            core.MICRO_PLAN_MAX_FILE_READS + 1,
+        )
+        self.assertIn("```liam-plan", reply)
+        self.assertNotIn("TODO", reply)
+        self.assertIn(
+            "[Plan draft #94 is ready for approval.]",
+            reply,
+        )
+        create_plan.assert_called_once()
+        stored_call = repr(create_plan.call_args)
+        self.assertIn(
+            "python3 -m unittest discover -s tests -t .",
+            stored_call,
+        )
+        self.assertNotIn("TODO", stored_call)
+
+    def test_placeholder_is_not_silently_removed_before_synthesis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            invalid_payload = plan_payload()
+            invalid_payload["validation"].append({
+                "command": "test -f TODO",
+                "expected": "The additional project file exists.",
+            })
+
+            client = mock.Mock()
+            client.chat.side_effect = [
+                {
+                    "role": "assistant",
+                    "content": json.dumps(invalid_payload),
+                },
+                {
+                    "role": "assistant",
+                    "content": json.dumps(plan_payload()),
+                },
+            ]
+            create_plan = mock.Mock(return_value=95)
+            agent = self.build_agent(
+                client,
+                directory,
+                create_plan,
+            )
+
+            reply = agent.step(
+                "Make a plan to fix the project in this folder."
+            )
+
+        self.assertEqual(client.chat.call_count, 2)
+        self.assertIn(
+            "[Plan draft #95 is ready for approval.]",
+            reply,
+        )
+        create_plan.assert_called_once()
+
     def test_step_limit_gets_one_final_tool_free_synthesis(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "README.md")

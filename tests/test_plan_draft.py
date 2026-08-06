@@ -88,6 +88,60 @@ class PlanDraftParserTests(unittest.TestCase):
             error,
         )
 
+    def test_placeholder_validation_is_removed_when_another_remains(self):
+        payload = valid_plan()
+        payload["validation"].append({
+            "command": "test -f TODO",
+            "expected": "The additional file exists.",
+        })
+        content = fenced(payload)
+
+        _canonical, error = core._extract_plan_draft(content)
+        repaired = core._remove_placeholder_validation_check(
+            content,
+            error,
+        )
+
+        self.assertIsNotNone(repaired)
+        canonical, repaired_error = core._extract_plan_draft(
+            repaired
+        )
+        self.assertIsNone(repaired_error)
+        repaired_payload = json.loads(canonical)
+        self.assertEqual(
+            repaired_payload["validation"],
+            [payload["validation"][0]],
+        )
+
+    def test_only_placeholder_validation_is_not_removed(self):
+        payload = valid_plan()
+        payload["validation"] = [{
+            "command": "test -f TODO",
+            "expected": "The file exists.",
+        }]
+        content = fenced(payload)
+
+        _canonical, error = core._extract_plan_draft(content)
+        repaired = core._remove_placeholder_validation_check(
+            content,
+            error,
+        )
+
+        self.assertIsNone(repaired)
+
+    def test_non_validation_placeholder_is_not_removed(self):
+        payload = valid_plan()
+        payload["steps"] = ["Modify TODO after inspection."]
+        content = fenced(payload)
+
+        _canonical, error = core._extract_plan_draft(content)
+        repaired = core._remove_placeholder_validation_check(
+            content,
+            error,
+        )
+
+        self.assertIsNone(repaired)
+
     def test_file_changing_step_requires_concrete_files(self):
         payload = valid_plan()
         payload["files"] = []

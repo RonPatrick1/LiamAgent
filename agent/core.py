@@ -1120,6 +1120,53 @@ RECOVERY_SYSTEM_PROMPT = (
 )
 
 
+def _remove_placeholder_validation_check(content, error):
+    """Drop one unusable placeholder check only when another check remains."""
+    if not isinstance(content, str) or not isinstance(error, str):
+        return None
+
+    match = re.fullmatch(
+        r"validation\[(\d+)\]\.(?:command|expected) "
+        r"contains unresolved placeholder .+",
+        error,
+    )
+    if match is None:
+        return None
+
+    blocks = PLAN_BLOCK_RE.findall(content)
+    if len(blocks) != 1:
+        return None
+
+    try:
+        payload = json.loads(blocks[0])
+    except (TypeError, ValueError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    validation = payload.get("validation")
+    if not isinstance(validation, list) or len(validation) <= 1:
+        return None
+
+    index = int(match.group(1))
+    if index < 0 or index >= len(validation):
+        return None
+
+    del validation[index]
+
+    repaired = (
+        "```liam-plan\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + "\n```"
+    )
+    canonical, repaired_error = _extract_plan_draft(repaired)
+    if canonical is None or repaired_error is not None:
+        return None
+
+    return repaired
+
+
 def ensure_visible_reply(content, *, stage="request", tool_events=None):
     """Never let a caller mistake an absent model reply for success.
 
@@ -6724,6 +6771,32 @@ class Agent:
                 canonical_plan, plan_draft_problem = (
                     _extract_plan_draft(content)
                 )
+
+                if (
+                    micro_plan is not None
+                    and micro_plan["synthesis_required"]
+                    and canonical_plan is None
+                    and plan_draft_problem is not None
+                ):
+                    repaired_content = (
+                        _remove_placeholder_validation_check(
+                            content,
+                            plan_draft_problem,
+                        )
+                    )
+                    if repaired_content is not None:
+                        self.on_status(
+                            "  [removed one placeholder validation check; "
+                            "at least one concrete validation remains...]"
+                        )
+                        content = repaired_content
+                        message = dict(message)
+                        message["content"] = content
+                        self.messages[-1] = message
+                        canonical_plan, plan_draft_problem = (
+                            _extract_plan_draft(content)
+                        )
+
                 file_evidence_problem = None
                 if canonical_plan is not None:
                     original_content = content
