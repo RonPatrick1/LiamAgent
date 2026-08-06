@@ -6,6 +6,7 @@ credentials come from the environment (.env).
 """
 
 import hashlib
+import json
 import os
 import re
 
@@ -345,6 +346,397 @@ def _ensure_schema(conn):
             # designated to share it — see agent/server.py). A real value
             # here isolates a bucket's notes from every other bucket's.
             cur.execute("ALTER TABLE notes ADD COLUMN session_id INT NULL")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS action_contracts (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                session_id INT NOT NULL,
+                source_text MEDIUMTEXT NOT NULL,
+                source_fingerprint CHAR(64) NOT NULL,
+                operation VARCHAR(255) NOT NULL,
+                required_capability VARCHAR(128) NOT NULL,
+                completion_mode VARCHAR(64) NOT NULL,
+                preferred_tool VARCHAR(128) NULL,
+                targets_json MEDIUMTEXT NOT NULL,
+                constraints_json MEDIUMTEXT NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                matched_event_id BIGINT NULL,
+                failure_reason TEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP NULL,
+                INDEX action_contracts_session_status (
+                    session_id,
+                    status,
+                    id
+                ),
+                INDEX action_contracts_source_fingerprint (
+                    source_fingerprint
+                )
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS action_tool_events (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                contract_id BIGINT NULL,
+                session_id INT NOT NULL,
+                tool_name VARCHAR(128) NOT NULL,
+                status VARCHAR(32) NOT NULL,
+                reason VARCHAR(128) NULL,
+                capabilities_json MEDIUMTEXT NOT NULL,
+                effect_kind VARCHAR(64) NULL,
+                targets_json MEDIUMTEXT NOT NULL,
+                args_json MEDIUMTEXT NOT NULL,
+                evidence_json MEDIUMTEXT NOT NULL,
+                display_result MEDIUMTEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX action_tool_events_contract (
+                    contract_id,
+                    id
+                ),
+                INDEX action_tool_events_session (
+                    session_id,
+                    id
+                )
+            )
+            """
+        )
+
+
+ACTION_CONTRACT_UNRESOLVED_STATUSES = {
+    "pending",
+    "running",
+    "needs_clarification",
+}
+
+ACTION_CONTRACT_TERMINAL_STATUSES = {
+    "succeeded",
+    "failed",
+    "cancelled",
+    "superseded",
+}
+
+ACTION_CONTRACT_TRANSITIONS = {
+    "pending": {
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "superseded",
+        "needs_clarification",
+    },
+    "running": {
+        "succeeded",
+        "failed",
+        "cancelled",
+        "superseded",
+    },
+    "needs_clarification": {
+        "pending",
+        "cancelled",
+        "superseded",
+    },
+    "succeeded": set(),
+    "failed": set(),
+    "cancelled": set(),
+    "superseded": set(),
+}
+
+_ACTION_CONTRACT_SELECT_COLUMNS = (
+    "id, session_id, source_text, source_fingerprint, operation, "
+    "required_capability, completion_mode, preferred_tool, targets_json, "
+    "constraints_json, status, matched_event_id, failure_reason, "
+    "created_at, updated_at, completed_at"
+)
+
+
+def _decode_contract_json(value):
+    try:
+        decoded = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _action_contract_from_row(row):
+    if not row:
+        return None
+
+    (
+        contract_id,
+        session_id,
+        source_text,
+        source_fingerprint,
+        operation,
+        required_capability,
+        completion_mode,
+        preferred_tool,
+        targets_json,
+        constraints_json,
+        status,
+        matched_event_id,
+        failure_reason,
+        created_at,
+        updated_at,
+        completed_at,
+    ) = row
+
+    return {
+        "id": contract_id,
+        "session_id": session_id,
+        "source_text": source_text,
+        "source_fingerprint": source_fingerprint,
+        "operation": operation,
+        "required_capability": required_capability,
+        "completion_mode": completion_mode,
+        "preferred_tool": preferred_tool,
+        "targets": _decode_contract_json(targets_json),
+        "constraints": _decode_contract_json(constraints_json),
+        "status": status,
+        "matched_event_id": matched_event_id,
+        "failure_reason": failure_reason,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "completed_at": completed_at,
+    }
+
+
+def create_action_contract(session_id, source_text, contract):
+    """Persist one host-validated action contract.
+
+    Creating a new contract atomically supersedes any unresolved contract for
+    the same session. A session therefore has at most one active obligation.
+    """
+    if session_id is None:
+        raise ValueError("Action contracts require a session_id.")
+    if not isinstance(source_text, str) or not source_text.strip():
+        raise ValueError("Action contracts require exact source text.")
+    if not isinstance(contract, dict):
+        raise ValueError("Action contract must be an object.")
+
+    required = (
+        "operation",
+        "required_capability",
+        "completion_mode",
+        "targets",
+        "constraints",
+        "status",
+    )
+    missing = [
+        field
+        for field in required
+        if field not in contract
+    ]
+    if missing:
+        raise ValueError(
+            "Action contract is missing: " + ", ".join(missing)
+        )
+
+    status = contract["status"]
+    if status not in ACTION_CONTRACT_UNRESOLVED_STATUSES:
+        raise ValueError(
+            f"New action contract status must be unresolved, got {status!r}."
+        )
+
+    fingerprint = hashlib.sha256(
+        f"{session_id}\0{source_text}".encode("utf-8")
+    ).hexdigest()
+
+    conn = _connect()
+    try:
+        _ensure_schema(conn)
+        conn.begin()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE action_contracts "
+                "SET status = 'superseded', completed_at = CURRENT_TIMESTAMP "
+                "WHERE session_id = %s "
+                "AND status IN ('pending', 'running', 'needs_clarification')",
+                (session_id,),
+            )
+            cur.execute(
+                "INSERT INTO action_contracts ("
+                "session_id, source_text, source_fingerprint, operation, "
+                "required_capability, completion_mode, preferred_tool, "
+                "targets_json, constraints_json, status"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    session_id,
+                    source_text,
+                    fingerprint,
+                    contract["operation"],
+                    contract["required_capability"],
+                    contract["completion_mode"],
+                    contract.get("preferred_tool"),
+                    json.dumps(
+                        contract.get("targets") or {},
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        contract.get("constraints") or {},
+                        sort_keys=True,
+                    ),
+                    status,
+                ),
+            )
+            contract_id = cur.lastrowid
+        conn.commit()
+        return contract_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_action_contract(contract_id):
+    """Return one persisted contract by id."""
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_ACTION_CONTRACT_SELECT_COLUMNS} "
+                    "FROM action_contracts WHERE id = %s",
+                    (contract_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        return _action_contract_from_row(row)
+    except Exception as exc:
+        print(f"[memory] failed to get action contract: {exc}")
+        return None
+
+
+def get_active_action_contract(session_id):
+    """Return the one unresolved contract for a session, if any."""
+    if session_id is None:
+        return None
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_ACTION_CONTRACT_SELECT_COLUMNS} "
+                    "FROM action_contracts "
+                    "WHERE session_id = %s "
+                    "AND status IN "
+                    "('pending', 'running', 'needs_clarification') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        return _action_contract_from_row(row)
+    except Exception as exc:
+        print(f"[memory] failed to get active action contract: {exc}")
+        return None
+
+
+def transition_action_contract(
+    contract_id,
+    expected_status,
+    new_status,
+    matched_event_id=None,
+    failure_reason=None,
+):
+    """Atomically apply one valid host-owned lifecycle transition."""
+    allowed = ACTION_CONTRACT_TRANSITIONS.get(expected_status)
+    if allowed is None:
+        raise ValueError(
+            f"Unknown action contract status: {expected_status}"
+        )
+    if new_status not in allowed:
+        raise ValueError(
+            "Invalid action contract transition: "
+            f"{expected_status} -> {new_status}"
+        )
+
+    assignments = [
+        "status = %s",
+        "matched_event_id = %s",
+        "failure_reason = %s",
+    ]
+    params = [
+        new_status,
+        matched_event_id,
+        failure_reason,
+    ]
+
+    if new_status in ACTION_CONTRACT_TERMINAL_STATUSES:
+        assignments.append("completed_at = CURRENT_TIMESTAMP")
+
+    params.extend((contract_id, expected_status))
+
+    conn = _connect()
+    try:
+        _ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE action_contracts SET {', '.join(assignments)} "
+                "WHERE id = %s AND status = %s",
+                tuple(params),
+            )
+            return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def record_action_tool_event(session_id, event, contract_id=None):
+    """Persist structured machine evidence from one actual tool call."""
+    if session_id is None:
+        return None
+    if not isinstance(event, dict):
+        raise ValueError("Action tool event must be an object.")
+
+    conn = _connect()
+    try:
+        _ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO action_tool_events ("
+                "contract_id, session_id, tool_name, status, reason, "
+                "capabilities_json, effect_kind, targets_json, args_json, "
+                "evidence_json, display_result"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    contract_id,
+                    session_id,
+                    event.get("tool") or "",
+                    event.get("status") or "failure",
+                    event.get("reason"),
+                    json.dumps(
+                        event.get("capabilities") or [],
+                        sort_keys=True,
+                    ),
+                    event.get("effect_kind"),
+                    json.dumps(
+                        event.get("targets") or {},
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        event.get("args") or {},
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        event.get("evidence") or {},
+                        sort_keys=True,
+                    ),
+                    str(event.get("result") or ""),
+                ),
+            )
+            return cur.lastrowid
+    finally:
+        conn.close()
+
 
 
 def save_message(role, content, session_id=None):
@@ -868,6 +1260,14 @@ def delete_session(session_id):
         try:
             _ensure_schema(conn)
             with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM action_tool_events WHERE session_id = %s",
+                    (session_id,),
+                )
+                cur.execute(
+                    "DELETE FROM action_contracts WHERE session_id = %s",
+                    (session_id,),
+                )
                 cur.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
                 cur.execute("DELETE FROM session_folders WHERE session_id = %s", (session_id,))
                 cur.execute("DELETE FROM sessions WHERE id = %s", (session_id,))

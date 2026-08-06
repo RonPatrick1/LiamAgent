@@ -65,6 +65,7 @@ from agent import memory, routines, ssh_secrets  # noqa: E402
 from agent import tools as agent_tools  # noqa: E402
 from agent import settings as liam_settings  # noqa: E402
 from agent.core import Agent, ensure_visible_reply  # noqa: E402
+from agent.contracts import PersistentActionContractStore  # noqa: E402
 from agent.llm import DEFAULT_MODEL  # noqa: E402
 
 APP_ID = "com.ronpatrick.Liam"
@@ -1141,6 +1142,7 @@ class LiamWindow(Gtk.ApplicationWindow):
             channel="gui", actor_id="local-owner", is_owner=True,
             learning_enabled=True, plan_mode=plan_mode,
             sudo_enabled=sudo_enabled,
+            action_contract_store=PersistentActionContractStore(),
         )
         history = memory.load_recent_messages(limit=REPLAY_LIMIT, session_id=session_id)
         return agent, history

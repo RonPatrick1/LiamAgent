@@ -11,8 +11,14 @@ from datetime import datetime, timedelta
 
 from .llm import OllamaClient, DEFAULT_MODEL
 from .tools import (
-    TOOL_SCHEMAS, TOOL_IMPL, DANGEROUS_TOOLS, DESKTOP_ONLY_TOOLS,
-    GENERATED_DIR, _resolve,
+    TOOL_SCHEMAS, TOOL_IMPL, TOOL_DEFINITIONS, DANGEROUS_TOOLS,
+    DESKTOP_ONLY_TOOLS, GENERATED_DIR, _resolve,
+)
+from .contracts import (
+    ACTION_CONTRACT_PROPOSAL_SCHEMA,
+    build_tool_event,
+    event_satisfies_contract,
+    validate_contract_proposal,
 )
 from . import memory, routines
 
@@ -1955,7 +1961,7 @@ class Agent:
                  custom_instructions=None, notes_session_id=None,
                  allowed_tools=None, channel="cli", actor_id="local-owner",
                  is_owner=True, learning_enabled=True, plan_mode=False,
-                 sudo_enabled=False):
+                 sudo_enabled=False, action_contract_store=None):
         """on_tool_call(name, args), on_confirm(name, args) -> bool, and
         on_status(message) are pluggable so any frontend (CLI, GUI, ...)
         can hook into the agent's progress and confirmation prompts
@@ -2044,6 +2050,18 @@ class Agent:
         self.workdir = os.path.abspath(os.path.expanduser(workdir)) if workdir else os.getcwd()
         self.session_id = session_id
         self.notes_session_id = notes_session_id
+        self.action_contract_store = action_contract_store
+        self._active_action_contract = None
+        if action_contract_store is not None and session_id is not None:
+            try:
+                self._active_action_contract = (
+                    action_contract_store.get_active(session_id)
+                )
+            except Exception as exc:
+                self.on_status(
+                    "  [action contract store unavailable while loading "
+                    f"session state: {exc}]"
+                )
         self.allowed_tools = set(allowed_tools) if allowed_tools is not None else None
         self.channel = channel
         self.actor_id = actor_id
@@ -2641,24 +2659,290 @@ class Agent:
 
         return updated_content, normalized_plan, updated_problem
 
-    def _helper_chat(self, messages, *, structured=True):
-        """Run a small structured or plain-text preprocessing job.
-
-        A remote 8B helper keeps these hidden preprocessing calls off Liam's
-        much larger primary model. If the helper is absent or unavailable,
-        fall back to the primary client so preprocessing never blocks a chat.
-        """
+    def _helper_chat(
+        self,
+        messages,
+        *,
+        structured=True,
+        response_format=None,
+    ):
+        """Run a small structured or plain-text preprocessing job."""
         attribute = "helper_client" if structured else "helper_text_client"
         helper = getattr(self, attribute, self.client)
-        response = helper.chat(messages)
+        kwargs = (
+            {}
+            if response_format is None
+            else {"response_format": response_format}
+        )
+        response = helper.chat(messages, **kwargs)
+
         if response.get("_liam_error") and helper is not self.client:
             status = getattr(self, "on_status", None)
             if status:
-                status("  [Remote helper unavailable; using Liam's local model for this preprocessing step...]")
-            response = self.client.chat(messages)
+                status(
+                    "  [Remote helper unavailable; using Liam's local model "
+                    "for this preprocessing step...]"
+                )
+            response = self.client.chat(messages, **kwargs)
+
         response = dict(response)
         response.pop("_liam_error", None)
         return response
+
+    def _offered_action_tool_names(self):
+        return {
+            schema["function"]["name"]
+            for schema in getattr(self, "tool_schemas", ())
+            if (
+                isinstance(schema, dict)
+                and isinstance(schema.get("function"), dict)
+                and schema["function"].get("name")
+            )
+        }
+
+    def _action_contract_catalog(self):
+        catalog = []
+
+        for name in sorted(self._offered_action_tool_names()):
+            definition = TOOL_DEFINITIONS.get(name)
+            if definition is None:
+                continue
+
+            catalog.append({
+                "tool": name,
+                "capabilities": list(
+                    definition.get("capabilities", ())
+                ),
+                "completion_modes": list(
+                    definition.get("completion_modes", ())
+                ),
+                "target_fields": list(
+                    definition.get("target_fields", ())
+                ),
+            })
+
+        return catalog
+
+    def _propose_action_contract(self, user_input, existing=None):
+        catalog = self._action_contract_catalog()
+        if not catalog:
+            return None
+
+        existing_context = ""
+        if isinstance(existing, dict):
+            existing_context = (
+                "\n\nEARLIER CONTRACT REQUIRING CLARIFICATION:\n"
+                + json.dumps(
+                    {
+                        key: existing.get(key)
+                        for key in (
+                            "operation",
+                            "required_capability",
+                            "completion_mode",
+                            "preferred_tool",
+                            "targets",
+                            "status",
+                        )
+                    },
+                    sort_keys=True,
+                )
+            )
+
+        response = self._helper_chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify only the current user request as an "
+                        "executable tool action or a non-action. Return one "
+                        "JSON object matching the supplied schema. Mark a "
+                        "request actionable only when the user asks Liam to "
+                        "perform something through an available tool. Select "
+                        "only capabilities, completion modes, tools, and "
+                        "target fields from the host catalog. Preserve exact "
+                        "paths, commands, URLs, names, and argument values "
+                        "from the request. Return an empty constraints object. "
+                        "Set needs_clarification only when execution cannot "
+                        "be safely identified. The host independently "
+                        "validates every field."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "CURRENT REQUEST:\n"
+                        + user_input
+                        + existing_context
+                        + "\n\nHOST TOOL CATALOG:\n"
+                        + json.dumps(catalog, sort_keys=True)
+                    ),
+                },
+            ],
+            response_format=ACTION_CONTRACT_PROPOSAL_SCHEMA,
+        )
+
+        proposal = self._parse_json_object(
+            response.get("content", "")
+        )
+        if proposal is None:
+            self.on_status(
+                "  [action contract classifier returned invalid JSON; "
+                "existing safeguards remain active]"
+            )
+            return None
+
+        try:
+            return validate_contract_proposal(
+                proposal,
+                TOOL_DEFINITIONS,
+                offered_tool_names=self._offered_action_tool_names(),
+            )
+        except ValueError as exc:
+            self.on_status(
+                "  [action contract proposal rejected by host validation: "
+                f"{exc}]"
+            )
+            return None
+
+    def _prepare_action_contract(self, user_input):
+        store = getattr(self, "action_contract_store", None)
+        session_id = getattr(self, "session_id", None)
+        existing = getattr(self, "_active_action_contract", None)
+
+        if (
+            store is None
+            or session_id is None
+            or self._plan_mode_active()
+        ):
+            return existing
+
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") in {"pending", "running"}
+        ):
+            return existing
+
+        clarification_contract = (
+            existing
+            if (
+                isinstance(existing, dict)
+                and existing.get("status") == "needs_clarification"
+            )
+            else None
+        )
+
+        contract = self._propose_action_contract(
+            user_input,
+            existing=clarification_contract,
+        )
+        if contract is None:
+            return clarification_contract
+
+        try:
+            contract_id = store.create(
+                session_id,
+                user_input,
+                contract,
+            )
+            persisted = store.get(contract_id)
+        except Exception as exc:
+            self.on_status(
+                "  [validated action contract could not be persisted: "
+                f"{exc}]"
+            )
+            return clarification_contract
+
+        if not isinstance(persisted, dict):
+            persisted = dict(contract)
+            persisted.update({
+                "id": contract_id,
+                "session_id": session_id,
+                "source_text": user_input,
+            })
+
+        self._active_action_contract = persisted
+        return persisted
+
+    @staticmethod
+    def _action_contract_instruction(contract):
+        if not isinstance(contract, dict):
+            return ""
+
+        status = contract.get("status")
+        if status not in {
+            "pending",
+            "running",
+            "needs_clarification",
+        }:
+            return ""
+
+        payload = {
+            key: contract.get(key)
+            for key in (
+                "id",
+                "operation",
+                "required_capability",
+                "completion_mode",
+                "preferred_tool",
+                "targets",
+                "status",
+            )
+        }
+
+        if status == "needs_clarification":
+            direction = (
+                "Ask only for information required to execute this contract. "
+                "Do not claim execution."
+            )
+        else:
+            direction = (
+                "Execute this contract using real tools. Only a matching "
+                "successful host-observed tool event completes it. Read-only "
+                "prerequisites and model prose do not complete it."
+            )
+
+        return (
+            "[AUTHORITATIVE HOST ACTION CONTRACT]\n"
+            + json.dumps(payload, sort_keys=True)
+            + "\n"
+            + direction
+            + "\n[/AUTHORITATIVE HOST ACTION CONTRACT]"
+        )
+
+    def _enforce_action_contract_status(self, content):
+        contract = getattr(self, "_active_action_contract", None)
+        if not isinstance(contract, dict):
+            return content
+
+        status = contract.get("status")
+        if status not in {
+            "pending",
+            "running",
+            "needs_clarification",
+        }:
+            return content
+
+        contract_id = contract.get("id", "?")
+        operation = contract.get("operation") or "requested action"
+
+        if status == "needs_clarification":
+            notice = (
+                f"[action contract #{contract_id} needs clarification: "
+                f"{operation} has not been executed.]"
+            )
+        else:
+            notice = (
+                f"[action contract #{contract_id} remains {status}: no "
+                "matching successful tool event completed "
+                f"{operation}.]"
+            )
+
+        body = content if isinstance(content, str) else ""
+        return (
+            f"{body.rstrip()}\n\n{notice}"
+            if body.strip()
+            else notice
+        )
 
     def _discard_transient_tool_history(self):
         """Keep final conversation, not prior turns' tool protocol payloads."""
@@ -2911,7 +3195,7 @@ class Agent:
             status, reason = "failure", "invalid_arguments"
 
         family = self._command_family(args.get("command")) if name == "run_shell_command" else None
-        return {
+        outcome = {
             "tool": name,
             "args": dict(args),
             "result": result,
@@ -2923,11 +3207,90 @@ class Agent:
             "signature": self._failure_signature(reason, result)
             if status in {"failure", "noop"} else None,
         }
+        return build_tool_event(
+            name,
+            args,
+            result,
+            outcome,
+            TOOL_DEFINITIONS,
+        )
+
+    def _persist_and_match_action_event(self, event):
+        """Persist one actual tool event and apply host-owned contract matching."""
+        store = getattr(self, "action_contract_store", None)
+        session_id = getattr(self, "session_id", None)
+        contract = getattr(self, "_active_action_contract", None)
+
+        if store is None or session_id is None:
+            return
+
+        contract_id = (
+            contract.get("id")
+            if isinstance(contract, dict)
+            else None
+        )
+        if contract_id is not None:
+            event["contract_id"] = contract_id
+
+        try:
+            event_id = store.record_event(
+                session_id,
+                event,
+                contract_id=contract_id,
+            )
+        except Exception as exc:
+            self.on_status(
+                "  [failed to persist authoritative tool evidence: "
+                f"{exc}]"
+            )
+            return
+
+        event["persistent_event_id"] = event_id
+
+        if (
+            not isinstance(contract, dict)
+            or contract.get("status") not in {"pending", "running"}
+            or not event_satisfies_contract(contract, event)
+        ):
+            event["contract_match"] = False
+            return
+
+        expected_status = contract["status"]
+
+        try:
+            transitioned = store.transition(
+                contract_id,
+                expected_status,
+                "succeeded",
+                matched_event_id=event_id,
+            )
+        except Exception as exc:
+            self.on_status(
+                "  [tool evidence matched the active contract but its "
+                f"completion could not be persisted: {exc}]"
+            )
+            event["contract_match"] = False
+            return
+
+        if not transitioned:
+            self.on_status(
+                "  [tool evidence matched the active contract but its "
+                "stored status changed before completion]"
+            )
+            event["contract_match"] = False
+            return
+
+        completed = dict(contract)
+        completed["status"] = "succeeded"
+        completed["matched_event_id"] = event_id
+        self._active_action_contract = completed
+        event["contract_match"] = True
 
     def _execute_tool(self, name, args):
         result = self._run_tool(name, args)
         event = self._classify_tool_outcome(name, args, result)
         self._tool_events.append(event)
+        self._persist_and_match_action_event(event)
 
         if (
             name == "read_file"
@@ -2943,6 +3306,7 @@ class Agent:
                 listing,
             )
             self._tool_events.append(listing_event)
+            self._persist_and_match_action_event(listing_event)
 
             if listing_event.get("status") == "success":
                 return (
@@ -5743,6 +6107,7 @@ class Agent:
         content = ensure_visible_reply(
             content, stage="finalizing the answer", tool_events=self._tool_events,
         )
+        content = self._enforce_action_contract_status(content)
         self._record_auto_lessons(content)
         self._evaluate_lesson_uses(content)
         content = self._append_learning_notice(content, feedback_notice)
@@ -5783,6 +6148,11 @@ class Agent:
         self.messages.append(user_message)
         user_message_index = len(self.messages) - 1
         memory.save_message("user", user_input, session_id=self.session_id)
+
+        active_contract = self._prepare_action_contract(user_input)
+        contract_instruction = self._action_contract_instruction(
+            active_contract
+        )
 
         # Lessons learned from past mistakes, retrieved by keyword match
         # rather than baked permanently into SYSTEM_PROMPT (which would
@@ -6015,11 +6385,15 @@ class Agent:
                 chat_messages = self.messages
                 chat_tools = turn_tool_schemas
             if not recovery_instruction and (
-                hint_text or getattr(self, "_turn_plan_mode", False)
+                hint_text
+                or getattr(self, "_turn_plan_mode", False)
+                or contract_instruction
             ):
                 chat_messages = list(self.messages)
                 hinted = dict(chat_messages[user_message_index])
                 additions = []
+                if contract_instruction:
+                    additions.append(contract_instruction)
                 if hint_text:
                     additions.append(
                         "[Relevant lessons from past mistakes:\n"

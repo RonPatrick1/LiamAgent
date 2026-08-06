@@ -446,6 +446,55 @@ def git_add(path, base_dir=None):
     return _run_git(["add", path], base_dir)
 
 
+def start_process(argv, base_dir=None):
+    """Start one intentionally long-running local process without a shell.
+
+    argv must be a non-empty list of executable/argument strings. The process
+    is detached into its own session and its output is discarded so Liam does
+    not block waiting for an interactive player, server, or worker to exit.
+    """
+    if not isinstance(argv, list) or not argv:
+        return "Error: argv must be a non-empty list of strings."
+
+    if any(
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        for value in argv
+    ):
+        return (
+            "Error: every argv item must be a non-empty string without "
+            "NUL characters."
+        )
+
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=base_dir or None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return f"Error: executable not found: {argv[0]}"
+    except OSError as exc:
+        return f"Error: could not start process: {exc}"
+
+    # Popen succeeding only proves that fork/exec was attempted. Give an
+    # immediately failing executable a brief chance to report its exit so it
+    # cannot be recorded as a successful persistent start.
+    time.sleep(0.1)
+    return_code = process.poll()
+    if return_code is not None:
+        return (
+            f"Error: process exited immediately with code {return_code}: "
+            f"{shlex.join(argv)}"
+        )
+
+    return f"Started process PID {process.pid}: {shlex.join(argv)}"
+
+
 def run_shell_command(command, base_dir=None, timeout=60, sudo=False):
     """sudo=True runs the command elevated on THIS machine, using the local
     sudo password stored in GNOME Keyring (agent/ssh_secrets.py) — same
@@ -1358,6 +1407,7 @@ TOOL_IMPL = {
     "git_log": git_log,
     "git_blame": git_blame,
     "git_add": git_add,
+    "start_process": start_process,
     "run_shell_command": run_shell_command,
     "ssh_list_hosts": ssh_list_hosts,
     "ssh_run_command": ssh_run_command,
@@ -1382,6 +1432,250 @@ TOOL_IMPL = {
 
 # These tools are offered only by LiamGUI.py. Agent also enforces this at
 # execution time, so hiding a schema is not the sole security boundary.
+TOOL_DEFINITIONS = {
+    "read_file": {
+        "capabilities": ("filesystem.read",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path",),
+    },
+    "write_file": {
+        "capabilities": ("filesystem.write",),
+        "effect_kind": "resource_updated",
+        "completion_modes": ("resource_updated",),
+        "target_fields": ("path",),
+    },
+    "edit_file": {
+        "capabilities": ("filesystem.edit",),
+        "effect_kind": "resource_updated",
+        "completion_modes": ("resource_updated",),
+        "target_fields": ("path",),
+    },
+    "list_directory": {
+        "capabilities": ("filesystem.list",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path",),
+    },
+    "search_text": {
+        "capabilities": ("filesystem.search",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("pattern", "path"),
+    },
+    "find_files": {
+        "capabilities": ("filesystem.search",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("name_pattern", "path"),
+    },
+    "file_info": {
+        "capabilities": ("filesystem.stat",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path",),
+    },
+    "listening_ports": {
+        "capabilities": ("network.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": (),
+    },
+    "diff_files": {
+        "capabilities": ("filesystem.diff",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path_a", "path_b"),
+    },
+    "read_json": {
+        "capabilities": ("filesystem.read",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path", "query"),
+    },
+    "make_directory": {
+        "capabilities": ("filesystem.create",),
+        "effect_kind": "resource_created",
+        "completion_modes": ("resource_created",),
+        "target_fields": ("path",),
+    },
+    "copy_path": {
+        "capabilities": ("filesystem.copy",),
+        "effect_kind": "resource_created",
+        "completion_modes": ("resource_created",),
+        "target_fields": ("src", "dst"),
+    },
+    "move_path": {
+        "capabilities": ("filesystem.move",),
+        "effect_kind": "resource_updated",
+        "completion_modes": ("resource_updated",),
+        "target_fields": ("src", "dst"),
+    },
+    "delete_path": {
+        "capabilities": ("filesystem.delete",),
+        "effect_kind": "resource_deleted",
+        "completion_modes": ("resource_deleted",),
+        "target_fields": ("path",),
+    },
+    "git_status": {
+        "capabilities": ("git.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": (),
+    },
+    "git_diff": {
+        "capabilities": ("git.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path",),
+    },
+    "git_log": {
+        "capabilities": ("git.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path",),
+    },
+    "git_blame": {
+        "capabilities": ("git.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("path",),
+    },
+    "git_add": {
+        "capabilities": ("git.stage",),
+        "effect_kind": "resource_updated",
+        "completion_modes": ("resource_updated",),
+        "target_fields": ("path",),
+    },
+    "start_process": {
+        "capabilities": ("process.start",),
+        "effect_kind": "process_started",
+        "completion_modes": ("process_started",),
+        "target_fields": ("argv",),
+    },
+    "run_shell_command": {
+        "capabilities": ("process.execute",),
+        "effect_kind": "process_exited",
+        "completion_modes": ("process_exited",),
+        "target_fields": ("command",),
+    },
+    "ssh_list_hosts": {
+        "capabilities": ("ssh.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": (),
+    },
+    "ssh_run_command": {
+        "capabilities": ("process.execute.remote",),
+        "effect_kind": "process_exited",
+        "completion_modes": ("process_exited",),
+        "target_fields": ("host", "command"),
+    },
+    "get_weather": {
+        "capabilities": ("weather.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("location",),
+    },
+    "web_search": {
+        "capabilities": ("web.search",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("query",),
+    },
+    "image_search": {
+        "capabilities": ("image.search",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("query",),
+    },
+    "generate_image": {
+        "capabilities": ("image.generate",),
+        "effect_kind": "resource_created",
+        "completion_modes": ("resource_created",),
+        "target_fields": ("prompt",),
+    },
+    "fetch_url": {
+        "capabilities": ("web.fetch",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("url",),
+    },
+    "query_memory": {
+        "capabilities": ("memory.query",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("keyword",),
+    },
+    "remember": {
+        "capabilities": ("memory.create",),
+        "effect_kind": "resource_created",
+        "completion_modes": ("resource_created",),
+        "target_fields": ("content",),
+    },
+    "recall_notes": {
+        "capabilities": ("memory.read",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("keyword",),
+    },
+    "forget": {
+        "capabilities": ("memory.delete",),
+        "effect_kind": "resource_deleted",
+        "completion_modes": ("resource_deleted",),
+        "target_fields": ("note_id", "keyword"),
+    },
+    "search_usage": {
+        "capabilities": ("usage.observe",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": (),
+    },
+    "schedule_routine": {
+        "capabilities": ("schedule.create",),
+        "effect_kind": "resource_created",
+        "completion_modes": ("resource_created",),
+        "target_fields": ("prompt", "schedule_kind", "schedule_value"),
+    },
+    "list_my_routines": {
+        "capabilities": ("schedule.read",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": (),
+    },
+    "cancel_routine": {
+        "capabilities": ("schedule.delete",),
+        "effect_kind": "resource_deleted",
+        "completion_modes": ("resource_deleted",),
+        "target_fields": ("routine_id",),
+    },
+    "propose_lesson": {
+        "capabilities": ("lesson.propose",),
+        "effect_kind": "resource_created",
+        "completion_modes": ("resource_created",),
+        "target_fields": ("keywords",),
+    },
+    "fredplayer_list_library": {
+        "capabilities": ("fredplayer.library.read",),
+        "effect_kind": "state_observed",
+        "completion_modes": ("state_observed",),
+        "target_fields": ("artist",),
+    },
+    "fredplayer_save_playlist": {
+        "capabilities": ("fredplayer.playlist.write",),
+        "effect_kind": "resource_updated",
+        "completion_modes": ("resource_updated",),
+        "target_fields": ("playlist_name",),
+    },
+    "fredplayer_propose_playlist": {
+        "capabilities": ("fredplayer.playlist.propose",),
+        "effect_kind": "resource_created",
+        "completion_modes": ("resource_created",),
+        "target_fields": ("playlist_name",),
+    },
+}
+
+
 DESKTOP_ONLY_TOOLS = {"ssh_list_hosts", "ssh_run_command"}
 
 # Tools that mutate the filesystem, execute arbitrary commands, or delete
@@ -1399,7 +1693,7 @@ DESKTOP_ONLY_TOOLS = {"ssh_list_hosts", "ssh_run_command"}
 # diff_files, read_json, git_status/diff/log/blame) are deliberately NOT
 # here — they can't change anything, same tier as read_file/list_directory.
 DANGEROUS_TOOLS = {
-    "write_file", "edit_file", "run_shell_command", "forget", "schedule_routine",
+    "write_file", "edit_file", "start_process", "run_shell_command", "forget", "schedule_routine",
     "cancel_routine", "propose_lesson", "make_directory", "copy_path", "move_path",
     "delete_path", "git_add", "ssh_run_command",
     # Mutates the FredPlayer server the same way write_file mutates the
@@ -1723,6 +2017,38 @@ TOOL_SCHEMAS = [
                     "path": {"type": "string", "description": "File or path to stage."},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_process",
+            "description": (
+                "Start an intentionally long-running local process and return "
+                "after verifying that it remained alive briefly. Use this for "
+                "media players, development servers, workers, and other "
+                "processes that should continue after the tool call. Pass an "
+                "argument list directly; this tool does not invoke a shell."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                        },
+                        "description": (
+                            "Executable followed by its arguments, for example "
+                            "['ogg123', '/media/music/song.flac']."
+                        ),
+                    },
+                },
+                "required": ["argv"],
             },
         },
     },

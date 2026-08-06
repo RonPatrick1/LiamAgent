@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import memory, routines
 from . import tools as tools_module
 from .core import Agent, ensure_visible_reply
+from .contracts import PersistentActionContractStore
 from .llm import DEFAULT_MODEL
 from .tools import DESKTOP_ONLY_TOOLS, TOOL_IMPL
 
@@ -92,6 +93,7 @@ def handle_chat(room_id, sender_id, message):
         allowed_tools=None if is_owner else SAFE_TOOLS,
         channel="matrix", actor_id=sender_id, is_owner=is_owner,
         learning_enabled=True,
+        action_contract_store=PersistentActionContractStore(),
     )
     return ensure_visible_reply(
         agent.step(message), stage="answering the Patrick Messenger request",
@@ -135,6 +137,7 @@ def handle_fredplayer_ask(device_id, message):
         allowed_tools=SAFE_TOOLS,
         channel="fredplayer", actor_id=device_id, is_owner=False,
         learning_enabled=False,
+        action_contract_store=PersistentActionContractStore(),
         # Proven necessary: the local model would sometimes end its turn
         # with confident prose ("I've created a playlist called...")
         # without ever calling fredplayer_propose_playlist — the app then

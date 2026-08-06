@@ -34,6 +34,7 @@ _load_dotenv()
 
 from agent import memory, routines, settings as liam_settings
 from agent.core import Agent, ensure_visible_reply
+from agent.contracts import PersistentActionContractStore
 from agent.llm import DEFAULT_MODEL
 from agent.tools import TOOL_IMPL, TOOL_SCHEMAS
 
@@ -98,6 +99,7 @@ def _run_routine(routine_id):
             extra_folders=extra_folders, custom_instructions=saved["custom_instructions"],
             channel="routine", actor_id="system-routine", is_owner=True,
             learning_enabled=False, allowed_tools=routine_allowed_tools,
+            action_contract_store=PersistentActionContractStore(),
         )
         reply = ensure_visible_reply(
             agent.step(routine["prompt"]), stage=f"running routine #{routine_id}",
@@ -395,6 +397,7 @@ def main():
         is_owner=True,
         learning_enabled=True,
         plan_mode=bool(session.get("plan_mode")),
+        action_contract_store=PersistentActionContractStore(),
     )
     print(
         f'Liam agent ready for session #{session_id} '
