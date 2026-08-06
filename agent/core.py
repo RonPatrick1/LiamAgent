@@ -208,6 +208,10 @@ include exactly one fenced liam-plan JSON block using this shape:
 }
 ```
 
+Do not use directory wildcards or glob expressions in files. Validation
+commands that depend on an existing service must name that service in an
+assumptions entry backed by successful same-turn tool evidence.
+
 assumptions is optional and omitted entirely when a plan has nothing to reuse.
 Use it whenever the plan relies on some existing state instead of
 (re)creating it — a server already running, a package or compiler already
@@ -385,6 +389,9 @@ PLAN_BLOCK_RE = re.compile(
     r"\x60\x60\x60liam-plan\s*(.*?)\x60\x60\x60",
     re.IGNORECASE | re.DOTALL,
 )
+PLAN_GLOB_PATH_RE = re.compile(r"[*?[]")
+
+
 PLAN_REQUIRED_KEYS = {
     "title",
     "objective",
@@ -921,6 +928,9 @@ PLAN_DRAFT_RECOVERY = (
     "unrelated files use it. "
     "Return a corrected answer with exactly one liam-plan JSON block. It must "
     "include title, objective, files, steps, validation, non_goals, and risks. "
+    "Do not use wildcard or glob file targets. A validation command that "
+    "checks an existing service must be supported by a same-turn verified "
+    "assumptions entry naming that service. "
     "validation must be a non-empty list of objects containing command and "
     "expected strings. Each command must exit 0 only when its check passes "
     "and nonzero when it fails; do not use || echo, || true, or ; true to "
@@ -1606,7 +1616,14 @@ def _extract_plan_draft(content):
         for value in values:
             if not isinstance(value, str) or not value.strip():
                 return None, f"{field} must contain only non-empty strings"
-            cleaned.append(value.strip())
+            value = value.strip()
+            if field == "files" and PLAN_GLOB_PATH_RE.search(value):
+                return (
+                    None,
+                    "files must contain concrete paths, not wildcard or glob "
+                    f"targets: {value!r}",
+                )
+            cleaned.append(value)
         payload[field] = cleaned
 
     if not payload["steps"]:
@@ -3403,14 +3420,17 @@ class Agent:
         detector the next time it comes up, the way the web-server case
         originally did."""
         problems = []
+
         for item in payload.get("assumptions") or []:
             if not isinstance(item, dict):
                 continue
+
             claim = item.get("claim", "")
             verified_by = item.get("verified_by", "")
             tool_name, _, needle = verified_by.partition(":")
             tool_name = tool_name.strip()
             needle = needle.strip()
+
             matched = any(
                 event.get("tool") == tool_name
                 and event.get("status") == "success"
@@ -3421,12 +3441,14 @@ class Agent:
                 )
                 for event in getattr(self, "_tool_events", [])
             )
+
             if not matched:
                 problems.append(
                     f"assumption {claim!r} claims verification via "
                     f"{verified_by!r}, but no successful {tool_name!r} tool "
                     "event containing that evidence exists this turn"
                 )
+
         return problems
 
     def _plan_file_evidence_problem(self, canonical_plan):
@@ -3678,6 +3700,50 @@ class Agent:
             step for step in steps
             if isinstance(step, str)
         )
+
+        validation = payload.get("validation") or []
+        assumptions = [
+            item
+            for item in payload.get("assumptions", []) or []
+            if isinstance(item, dict)
+        ]
+
+        for check in validation:
+            if not isinstance(check, dict):
+                continue
+
+            command = check.get("command")
+            if not isinstance(command, str):
+                continue
+
+            service_match = re.search(
+                r"\bsystemctl(?:\s+--[A-Za-z0-9_-]+(?:=\S+)?)*"
+                r"\s+(?:status|is-active|is-enabled|show)\s+"
+                r"([A-Za-z0-9@_.-]+)",
+                command,
+                re.IGNORECASE,
+            )
+            if service_match is None:
+                continue
+
+            service = service_match.group(1)
+            service_lower = service.lower()
+            supported = any(
+                service_lower
+                in (
+                    str(item.get("claim", ""))
+                    + " "
+                    + str(item.get("verified_by", ""))
+                ).lower()
+                for item in assumptions
+            )
+
+            if not supported:
+                semantic_problems.append(
+                    "validation command references service "
+                    f"{service!r} without a same-turn verified assumption "
+                    "naming that service"
+                )
 
         referenced_declared = set()
         for declared, resolved in declared_local:
