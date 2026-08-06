@@ -1,0 +1,1479 @@
+import unittest
+from unittest import mock
+
+from agent import core
+
+
+class ActionToolRequirementTests(unittest.TestCase):
+    def test_approved_plan_response_requires_real_tool(self):
+        agent = core.Agent.__new__(core.Agent)
+
+        required = agent._response_requires_real_tool(
+            "[APPROVED PLAN EXECUTION]\nModify index.html.",
+            "I updated the file.",
+        )
+
+        self.assertTrue(required)
+
+    def test_fake_edit_syntax_requires_real_tool(self):
+        agent = core.Agent.__new__(core.Agent)
+
+        required = agent._response_requires_real_tool(
+            "Change the copyright year in index.html to 2026.",
+            "```python\nedit_file(path='index.html')\n```",
+        )
+
+        self.assertTrue(required)
+
+    def test_action_promise_requires_real_tool(self):
+        agent = core.Agent.__new__(core.Agent)
+
+        required = agent._response_requires_real_tool(
+            "Run pkill ogg123.",
+            "I will now execute the command.",
+        )
+
+        self.assertTrue(required)
+
+    def test_terse_action_followups_require_tool_for_promise(self):
+        agent = core.Agent.__new__(core.Agent)
+
+        requests = (
+            "do it",
+            "run it",
+            "well run the pkill command you just described",
+            "fucking run the pkill command",
+            'do this: run_shell_command({"command": "pkill ogg123"})',
+            "try again and run it",
+        )
+
+        for user_input in requests:
+            with self.subTest(user_input=user_input):
+                required = agent._response_requires_real_tool(
+                    user_input,
+                    "I will use the run_shell_command tool now.",
+                )
+                self.assertTrue(required)
+
+    def test_action_followup_can_report_concrete_blocker(self):
+        agent = core.Agent.__new__(core.Agent)
+
+        required = agent._response_requires_real_tool(
+            "do it",
+            "I cannot identify which command you mean.",
+        )
+
+        self.assertFalse(required)
+
+    def test_informational_answer_does_not_require_tool(self):
+        agent = core.Agent.__new__(core.Agent)
+
+        required = agent._response_requires_real_tool(
+            "What year is shown in index.html?",
+            "The file shows 2023.",
+        )
+
+        self.assertFalse(required)
+
+    def test_plan_mode_draft_does_not_require_execution_tool(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = True
+
+        required = agent._response_requires_real_tool(
+            "Make a plan to create a local webpage.",
+            "```liam-plan\n{\"title\": \"Create webpage\"}\n```",
+        )
+
+        self.assertFalse(required)
+
+    @mock.patch.object(core.memory, "load_recent_notes", return_value=[])
+    @mock.patch.object(core.memory, "load_recent_messages", return_value=[])
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "get_latest_plan", return_value=None)
+    def test_action_promise_recovery_executes_real_tool(
+        self,
+        _get_latest_plan,
+        _save_message,
+        _match_lessons,
+        _load_messages,
+        _load_notes,
+    ):
+        import tempfile
+
+        client = mock.Mock()
+        client.chat.side_effect = [
+            {
+                "role": "assistant",
+                "content": "I will run the command now.",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "run_shell_command",
+                            "arguments": {"command": "printf action-ran"},
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "The command completed.",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(core, "OllamaClient", return_value=client):
+                agent = core.Agent(
+                    channel="gui",
+                    plan_mode=False,
+                    workdir=directory,
+                    session_id=51,
+                )
+
+            recovery_schema = next(
+                schema
+                for schema in agent.tool_schemas
+                if schema["function"]["name"] == "run_shell_command"
+            )
+            agent._select_recovery_tool_schemas = mock.Mock(
+                return_value=[recovery_schema]
+            )
+            agent.on_tool_call = mock.Mock()
+
+            def execute_tool(name, args):
+                self.assertEqual(name, "run_shell_command")
+                self.assertEqual(args, {"command": "printf action-ran"})
+                agent._tool_events.append({
+                    "tool": name,
+                    "status": "success",
+                    "args": args,
+                    "result": "action-ran",
+                })
+                return "action-ran"
+
+            agent._execute_tool = mock.Mock(side_effect=execute_tool)
+
+            result = agent.step("Run printf action-ran.")
+
+        self.assertEqual(result, "The command completed.")
+        agent._execute_tool.assert_called_once_with(
+            "run_shell_command",
+            {"command": "printf action-ran"},
+        )
+        self.assertEqual(client.chat.call_count, 3)
+        self.assertEqual(
+            agent._tool_events,
+            [
+                {
+                    "tool": "run_shell_command",
+                    "status": "success",
+                    "args": {"command": "printf action-ran"},
+                    "result": "action-ran",
+                }
+            ],
+        )
+
+    @mock.patch.object(core.memory, "load_recent_notes", return_value=[])
+    @mock.patch.object(core.memory, "load_recent_messages", return_value=[])
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "get_latest_plan", return_value=None)
+    def test_repeated_action_promise_returns_host_failure(
+        self,
+        _get_latest_plan,
+        _save_message,
+        _match_lessons,
+        _load_messages,
+        _load_notes,
+    ):
+        import tempfile
+
+        client = mock.Mock()
+        client.chat.side_effect = [
+            {
+                "role": "assistant",
+                "content": "I will run the command now.",
+            },
+            {
+                "role": "assistant",
+                "content": "I will use run_shell_command now.",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(core, "OllamaClient", return_value=client):
+                agent = core.Agent(
+                    channel="gui",
+                    plan_mode=False,
+                    workdir=directory,
+                    session_id=52,
+                )
+
+            recovery_schema = next(
+                schema
+                for schema in agent.tool_schemas
+                if schema["function"]["name"] == "run_shell_command"
+            )
+            agent._select_recovery_tool_schemas = mock.Mock(
+                return_value=[recovery_schema]
+            )
+            agent._execute_tool = mock.Mock()
+
+            result = agent.step("Run printf action-ran.")
+
+        self.assertIn(
+            "Liam retried tool selection but still did not call a tool.",
+            result,
+        )
+        self.assertIn("No action was performed.", result)
+        agent._execute_tool.assert_not_called()
+        self.assertEqual(client.chat.call_count, 2)
+
+    @mock.patch.object(core.memory, "load_recent_notes", return_value=[])
+    @mock.patch.object(core.memory, "load_recent_messages", return_value=[])
+    @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
+    @mock.patch.object(core.memory, "save_message")
+    @mock.patch.object(core.memory, "get_latest_plan", return_value=None)
+    @mock.patch.object(core.memory, "create_plan", return_value=92)
+    def test_explicit_plan_request_uses_temporary_plan_mode(
+        self,
+        create_plan,
+        _get_latest_plan,
+        _save_message,
+        _match_lessons,
+        _load_messages,
+        _load_notes,
+    ):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "settings.txt")
+            with open(path, "w") as handle:
+                handle.write("year=2023\n")
+
+            payload = {
+                "title": "Update year",
+                "objective": "Update the configured year to 2026.",
+                "files": [path],
+                "steps": [
+                    f"Inspect {path}.",
+                    f"Edit {path} so year is 2026.",
+                ],
+                "validation": [
+                    {
+                        "command": f"grep -q '^year=2026$' {path}",
+                        "expected": "The file contains year=2026.",
+                    }
+                ],
+                "non_goals": [
+                    f"Do not modify files outside of {directory}."
+                ],
+                "risks": ["The expected original line may be absent."],
+            }
+
+            client = mock.Mock()
+            client.chat.side_effect = [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "read_file",
+                                "arguments": {"path": path},
+                            }
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": (
+                        "```liam-plan\n"
+                        + json.dumps(payload)
+                        + "\n```"
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": "Four.",
+                },
+            ]
+
+            with mock.patch.object(
+                core,
+                "OllamaClient",
+                return_value=client,
+            ):
+                agent = core.Agent(
+                    channel="gui",
+                    plan_mode=False,
+                    workdir=directory,
+                    session_id=42,
+                )
+
+                reply = agent.step(
+                    "Make a new plan to examine settings.txt and "
+                    "update the year to 2026."
+                )
+
+                self.assertIn(
+                    "[Plan draft #92 is ready for approval.]",
+                    reply,
+                )
+                self.assertFalse(agent.plan_mode)
+                create_plan.assert_called_once()
+
+                first_tools = {
+                    schema["function"]["name"]
+                    for schema in client.chat.call_args_list[0].kwargs["tools"]
+                }
+                self.assertIn("read_file", first_tools)
+                self.assertNotIn("edit_file", first_tools)
+                self.assertTrue(
+                    first_tools.issubset(core.PLAN_MODE_ALLOWED_TOOLS)
+                )
+
+                ordinary_reply = agent.step("What is two plus two?")
+
+                self.assertEqual(ordinary_reply, "Four.")
+                self.assertFalse(agent._turn_plan_mode)
+                third_tools = {
+                    schema["function"]["name"]
+                    for schema in client.chat.call_args_list[2].kwargs["tools"]
+                }
+                self.assertIn("edit_file", third_tools)
+
+    def test_explicit_plan_request_variants_are_narrowly_recognized(self):
+        self.assertTrue(
+            core.Agent._is_explicit_plan_request(
+                "Make a plan to update settings.txt."
+            )
+        )
+        self.assertTrue(
+            core.Agent._is_explicit_plan_request(
+                "Make a new plan to update settings.txt."
+            )
+        )
+        self.assertTrue(
+            core.Agent._is_explicit_plan_request(
+                "Create a new implementation plan for the website."
+            )
+        )
+        self.assertFalse(
+            core.Agent._is_explicit_plan_request(
+                "Explain the new plan to me."
+            )
+        )
+        self.assertFalse(
+            core.Agent._is_explicit_plan_request(
+                "We may need a new plan later."
+            )
+        )
+
+    def test_directory_read_automatically_uses_list_directory(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            expected = os.path.join(directory, "style.css")
+            with open(expected, "w") as handle:
+                handle.write("body {}\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent.plan_mode = False
+            agent._turn_plan_mode = False
+            agent.channel = "gui"
+            agent.allowed_tools = None
+            agent.notes_session_id = None
+            agent.session_id = None
+            agent._current_user_input = ""
+            agent._read_paths_this_turn = set()
+            agent._tool_events = []
+            agent.auto_confirm = True
+            agent.on_confirm = lambda _name, _args: True
+            agent.on_tool_call = mock.Mock()
+
+            result = agent._execute_tool(
+                "read_file",
+                {"path": directory},
+            )
+
+            self.assertIn("automatically used list_directory", result)
+            self.assertIn("style.css", result)
+            agent.on_tool_call.assert_called_once_with(
+                "list_directory",
+                {"path": directory},
+            )
+            self.assertEqual(
+                [event["status"] for event in agent._tool_events],
+                ["failure", "success"],
+            )
+            self.assertEqual(
+                [event["tool"] for event in agent._tool_events],
+                ["read_file", "list_directory"],
+            )
+
+    def test_plan_rejects_declared_file_without_step_reference(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            style_path = os.path.join(directory, "style.css")
+
+            with open(index_path, "w") as handle:
+                handle.write("<html></html>\n")
+            with open(style_path, "w") as handle:
+                handle.write("body {}\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                index_path,
+                style_path,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [
+                    index_path,
+                    style_path,
+                ],
+                "steps": [
+                    "Update the copyright year in index.html.",
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn("no implementation step reference", problem)
+            self.assertIn("style.css", problem)
+
+    def test_declared_filename_does_not_match_longer_extension(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            style_path = os.path.join(directory, "style.css")
+
+            with open(index_path, "w") as handle:
+                handle.write("<html></html>\n")
+            with open(style_path, "w") as handle:
+                handle.write("body {}\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                index_path,
+                style_path,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [
+                    index_path,
+                    style_path,
+                ],
+                "steps": [
+                    "Update index.html.bak but do not change the originals.",
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_plan_generic_steps_without_named_files_remain_allowed(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = os.path.join(directory, "first.txt")
+            second = os.path.join(directory, "second.txt")
+
+            for path in (first, second):
+                with open(path, "w") as handle:
+                    handle.write("content\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                first,
+                second,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [first, second],
+                "steps": [
+                    "Apply the minimum required code changes.",
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_plan_rejects_unaddressed_missing_html_dependency(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            with open(index_path, "w") as handle:
+                handle.write(
+                    '<html><script src="script.js"></script></html>\n'
+                )
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {index_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [index_path],
+                "steps": [
+                    "Update the copyright year in index.html.",
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn("missing local dependency", problem)
+            self.assertIn("script.js", problem)
+
+    def test_plan_allows_missing_html_dependency_when_addressed(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            with open(index_path, "w") as handle:
+                handle.write(
+                    '<html><script src="script.js"></script></html>\n'
+                )
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {index_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [index_path],
+                "steps": [
+                    "Update the copyright year in index.html.",
+                    (
+                        "Remove the broken script.js reference from "
+                        "index.html."
+                    ),
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_interactive_javascript_requires_integration_validation(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            style_path = os.path.join(directory, "style.css")
+            script_path = os.path.join(directory, "script.js")
+
+            with open(index_path, "w") as handle:
+                handle.write(
+                    '<button id="theme-toggle">Toggle</button>'
+                    '<script src="script.js"></script>\n'
+                )
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                index_path,
+                style_path,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [
+                    index_path,
+                    style_path,
+                    script_path,
+                ],
+                "steps": [
+                    "Reference index.html while preserving its existing button.",
+                    "Reference style.css while preserving its theme rules.",
+                    (
+                        "Create script.js and implement JavaScript to toggle "
+                        "the theme when the button is clicked."
+                    ),
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -q 'toggleDarkMode()' "
+                            + script_path
+                        ),
+                        "expected": "The function exists.",
+                    },
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn(
+                "interactive JavaScript validation",
+                problem,
+            )
+            self.assertIn(
+                "HTML control identifier",
+                problem,
+            )
+            self.assertIn(
+                "event-binding mechanism",
+                problem,
+            )
+            self.assertIn(
+                "CSS state class",
+                problem,
+            )
+
+    def test_standalone_javascript_creation_needs_no_integration_evidence(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            script_path = os.path.join(directory, "script.js")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = set()
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [script_path],
+                "steps": [
+                    "Create script.js as a new file for a theme toggle.",
+                ],
+                "validation": [],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_interactive_javascript_uses_undeclared_inspected_css_evidence(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            style_path = os.path.join(directory, "style.css")
+            script_path = os.path.join(directory, "script.js")
+
+            with open(index_path, "w") as handle:
+                handle.write(
+                    '<button id="theme-toggle">Toggle</button>'
+                    '<script src="script.js"></script>\n'
+                )
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                index_path,
+                style_path,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [
+                    index_path,
+                    script_path,
+                ],
+                "steps": [
+                    "Update index.html while preserving its existing button.",
+                    (
+                        "Create script.js and implement the theme toggle "
+                        "when the button is clicked."
+                    ),
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -Fq 'toggleDarkMode()' "
+                            + script_path
+                        ),
+                        "expected": "The theme function exists.",
+                    },
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn("'theme-toggle'", problem)
+            self.assertIn("addEventListener", problem)
+            self.assertIn("'dark-mode'", problem)
+
+    def test_interactive_javascript_reports_only_relevant_evidence(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            style_path = os.path.join(directory, "style.css")
+            script_path = os.path.join(directory, "script.js")
+
+            with open(index_path, "w") as handle:
+                handle.write(
+                    '<button id="theme-toggle">Toggle</button>'
+                    '<section id="movies"></section>'
+                    '<section id="music"></section>'
+                    '<section id="tv-shows"></section>'
+                    '<script src="script.js"></script>\n'
+                )
+            with open(style_path, "w") as handle:
+                handle.write(
+                    ".dark-mode { color: white; }\n"
+                    ".light-mode { color: black; }\n"
+                )
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                index_path,
+                style_path,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "objective": (
+                    "Implement a light and dark theme toggle."
+                ),
+                "files": [
+                    index_path,
+                    script_path,
+                ],
+                "steps": [
+                    "Update index.html while preserving theme-toggle.",
+                    (
+                        "Create script.js and implement the light and dark "
+                        "theme toggle when the button is clicked."
+                    ),
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -Fq 'toggleDarkMode()' "
+                            + script_path
+                        ),
+                        "expected": "The function exists.",
+                    },
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn("'theme-toggle'", problem)
+            self.assertIn("'dark-mode'", problem)
+            self.assertIn("'light-mode'", problem)
+            self.assertNotIn("'movies'", problem)
+            self.assertNotIn("'music'", problem)
+            self.assertNotIn("'tv-shows'", problem)
+
+    def test_expected_text_cannot_replace_executable_integration_checks(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            style_path = os.path.join(directory, "style.css")
+            script_path = os.path.join(directory, "script.js")
+
+            with open(index_path, "w") as handle:
+                handle.write(
+                    '<button id="theme-toggle">Toggle</button>'
+                    '<script src="script.js"></script>\n'
+                )
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                index_path,
+                style_path,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "objective": "Implement a dark theme toggle.",
+                "files": [
+                    index_path,
+                    script_path,
+                ],
+                "steps": [
+                    "Update index.html while preserving theme-toggle.",
+                    (
+                        "Create script.js and implement the dark theme "
+                        "toggle when the button is clicked."
+                    ),
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -Fq 'toggleDarkMode()' "
+                            + script_path
+                        ),
+                        "expected": (
+                            "theme-toggle uses addEventListener and "
+                            "changes dark-mode."
+                        ),
+                    },
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn(
+                "interactive JavaScript validation",
+                problem,
+            )
+
+    def test_interactive_javascript_integration_validation_is_allowed(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            style_path = os.path.join(directory, "style.css")
+            script_path = os.path.join(directory, "script.js")
+
+            with open(index_path, "w") as handle:
+                handle.write(
+                    '<button id="theme-toggle">Toggle</button>'
+                    '<script src="script.js"></script>\n'
+                )
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {
+                index_path,
+                style_path,
+            }
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [
+                    index_path,
+                    style_path,
+                    script_path,
+                ],
+                "steps": [
+                    "Reference index.html while preserving its existing button.",
+                    "Reference style.css while preserving its theme rules.",
+                    (
+                        "Create script.js and implement JavaScript to toggle "
+                        "the theme when the button is clicked."
+                    ),
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -Fq 'theme-toggle' "
+                            + script_path
+                            + " && grep -Fq 'addEventListener' "
+                            + script_path
+                            + " && grep -Fq 'dark-mode' "
+                            + script_path
+                        ),
+                        "expected": (
+                            "script.js binds theme-toggle with "
+                            "addEventListener and toggles dark-mode."
+                        ),
+                    },
+                    {
+                        "command": (
+                            "grep -Fq '.dark-mode {' "
+                            + style_path
+                        ),
+                        "expected": (
+                            "style.css contains the exact inspected "
+                            "dark-mode selector."
+                        ),
+                    },
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_validation_rejects_false_assertion_on_unchanged_file(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [],
+                "steps": [
+                    "Implement the required JavaScript behavior.",
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -Fq '.dark-mode, .light-mode {' "
+                            + style_path
+                        ),
+                        "expected": "Both theme selectors are defined.",
+                    },
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn(
+                "asserts missing content",
+                problem,
+            )
+            self.assertIn("unchanged local file", problem)
+
+    def test_validation_allows_true_assertion_on_unchanged_file(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [],
+                "steps": [
+                    "Implement the required JavaScript behavior.",
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -Fq '.dark-mode {' "
+                            + style_path
+                        ),
+                        "expected": "The existing dark-mode selector remains.",
+                    },
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_validation_does_not_preflight_declared_change_target(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [style_path],
+                "steps": [
+                    "Modify style.css to add a combined theme selector.",
+                ],
+                "validation": [
+                    {
+                        "command": (
+                            "grep -Fq '.dark-mode, .light-mode {' "
+                            + style_path
+                        ),
+                        "expected": "The new combined selector exists.",
+                    },
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_plan_rejects_adding_existing_css_classes(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(
+                    ".dark-mode { color: white; }\n"
+                    ".light-mode { color: black; }\n"
+                )
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [style_path],
+                "steps": [
+                    (
+                        "Add CSS classes for dark and light modes "
+                        "in style.css."
+                    ),
+                ],
+                "validation": [],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn(
+                "already present in inspected file",
+                problem,
+            )
+            self.assertIn("'dark-mode'", problem)
+            self.assertIn("'light-mode'", problem)
+
+    def test_plan_allows_modifying_existing_css_classes(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(
+                    ".dark-mode { color: white; }\n"
+                    ".light-mode { color: black; }\n"
+                )
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [style_path],
+                "steps": [
+                    (
+                        "Modify the existing dark-mode and light-mode "
+                        "classes in style.css to add a new property."
+                    ),
+                ],
+                "validation": [],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_plan_allows_adding_missing_css_class(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(".dark-mode { color: white; }\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [style_path],
+                "steps": [
+                    "Add the CSS class contrast-mode to style.css.",
+                ],
+                "validation": [],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_unchanged_css_error_includes_exact_transition_candidates(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(
+                    ":root { --transition-speed: 0.3s; }\n"
+                    "body { transition: background-color "
+                    "var(--transition-speed), color "
+                    "var(--transition-speed); }\n"
+                    "header { transition: background-color "
+                    "var(--transition-speed); }\n"
+                )
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [],
+                "steps": ["Use the existing stylesheet behavior."],
+                "validation": [{
+                    "command": (
+                        "grep -Fq 'transition: all 0.5s ease;' "
+                        + style_path
+                    ),
+                    "expected": "Theme transitions exist.",
+                }],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn(
+                "exact inspected candidate literals include",
+                problem,
+            )
+            self.assertIn(
+                "transition: background-color "
+                "var(--transition-speed), color "
+                "var(--transition-speed);",
+                problem,
+            )
+            self.assertNotIn(
+                "'transition: all 0.5s ease;' |",
+                problem,
+            )
+
+    def test_unchanged_css_error_includes_exact_selector_candidates(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = os.path.join(directory, "style.css")
+            with open(style_path, "w") as handle:
+                handle.write(
+                    ".dark-mode { color: white; }\n"
+                    ".light-mode { color: black; }\n"
+                )
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {style_path}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [],
+                "steps": ["Reuse the existing theme selectors."],
+                "validation": [{
+                    "command": (
+                        "grep -Fq '.dark-mode, .light-mode {' "
+                        + style_path
+                    ),
+                    "expected": "Theme selectors exist.",
+                }],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn(
+                "'.dark-mode { color: white; }'",
+                problem,
+            )
+            self.assertIn(
+                "'.light-mode { color: black; }'",
+                problem,
+            )
+
+    def test_plan_rejects_existing_file_not_read_this_turn(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            existing = os.path.join(directory, "index.html")
+            with open(existing, "w") as handle:
+                handle.write("<html></html>\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = set()
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": ["index.html"],
+                "steps": [
+                    "Edit index.html to update the copyright year.",
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn("index.html", problem)
+            self.assertIn("not inspected with read_file", problem)
+
+    def test_plan_allows_existing_file_read_this_turn(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            existing = os.path.join(directory, "index.html")
+            with open(existing, "w") as handle:
+                handle.write("<html></html>\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {existing}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": ["index.html"],
+                "steps": [
+                    "Edit index.html to update the copyright year.",
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_plan_rejects_probable_typo_from_existing_sibling(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            actual = os.path.join(directory, "style.css")
+            with open(actual, "w") as handle:
+                handle.write("body {}\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = set()
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": ["styles.css"],
+                "steps": [
+                    "Add light and dark theme rules to styles.css.",
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn("styles.css", problem)
+            self.assertIn("style.css", problem)
+            self.assertIn("intended target", problem)
+
+    def test_plan_rejects_probable_typo_for_inspected_file(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            actual = os.path.join(directory, "style.css")
+            with open(actual, "w") as handle:
+                handle.write("body {}\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = {actual}
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": ["styles.css"],
+                "steps": [
+                    "Add light and dark theme rules to styles.css.",
+                ],
+            }))
+
+            self.assertIsNotNone(problem)
+            self.assertIn("styles.css", problem)
+            self.assertIn("style.css", problem)
+            self.assertIn("intended target", problem)
+
+    def test_plan_allows_explicit_creation_of_new_local_file(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._read_paths_this_turn = set()
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": ["script.js"],
+                "steps": [
+                    "Create script.js as a new file for the theme toggle.",
+                ],
+            }))
+
+            self.assertIsNone(problem)
+
+    def test_successful_tool_event_is_authoritative(self):
+        self.assertTrue(core.Agent._has_successful_tool_event([
+            {"tool": "read_file", "status": "success"},
+        ]))
+        self.assertFalse(core.Agent._has_successful_tool_event([
+            {"tool": "edit_file", "status": "failure"},
+            {"tool": "read_file", "status": "noop"},
+        ]))
+
+    @mock.patch.object(core.memory, "transition_plan", return_value=True)
+    @mock.patch.object(core.memory, "get_plan")
+    def test_plan_step_without_tool_event_fails_after_three_attempts(
+        self,
+        get_plan,
+        _transition_plan,
+    ):
+        get_plan.return_value = {
+            "id": 9,
+            "session_id": 17,
+            "status": "approved",
+        }
+
+        agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = False
+        agent.session_id = 17
+        agent.on_status = mock.Mock()
+        agent._tool_events = []
+        agent._stored_plan_payload = mock.Mock(return_value={
+            "steps": ["Update style.css."],
+            "validation": [],
+        })
+        agent._plan_step_prompt = mock.Mock(return_value="step prompt")
+        agent._fail_running_plan = mock.Mock(
+            return_value="FAIL: no successful tool event"
+        )
+
+        def prose_only(_prompt):
+            agent._tool_events = []
+            return "I updated style.css."
+
+        agent.step = mock.Mock(side_effect=prose_only)
+
+        result = agent.execute_plan(9)
+
+        self.assertEqual(result, "FAIL: no successful tool event")
+        self.assertEqual(agent.step.call_count, 3)
+        agent._fail_running_plan.assert_called_once()
+        self.assertIn(
+            "no qualifying Plan progress event",
+            agent._fail_running_plan.call_args.args[1],
+        )
+
+    def test_reuse_step_with_verified_fetch_needs_no_listening_ports(self):
+        import json
+
+        agent = core.Agent.__new__(core.Agent)
+        agent.workdir = "/var/www/LiamApp01"
+        agent._read_paths_this_turn = set()
+        agent.plan_mode = True
+        agent._tool_events = [
+            {
+                "tool": "fetch_url",
+                "status": "success",
+                "args": {"url": "http://127.0.0.1:8002/"},
+            },
+        ]
+
+        problem = agent._plan_file_evidence_problem(json.dumps({
+            "objective": (
+                "Restyle the local webpage already served at "
+                "http://127.0.0.1:8002."
+            ),
+            "files": [],
+            "steps": [
+                (
+                    "Reuse the already-running server on port 8002; "
+                    "no new server is needed."
+                ),
+            ],
+            "validation": [],
+        }))
+
+        self.assertIsNone(problem)
+
+    def test_reuse_step_without_verified_fetch_still_requires_listening_ports(self):
+        import json
+
+        agent = core.Agent.__new__(core.Agent)
+        agent.workdir = "/var/www/LiamApp01"
+        agent._read_paths_this_turn = set()
+        agent.plan_mode = True
+        agent._tool_events = []
+
+        problem = agent._plan_file_evidence_problem(json.dumps({
+            "objective": (
+                "Restyle the local webpage already served at "
+                "http://127.0.0.1:8002."
+            ),
+            "files": [],
+            "steps": [
+                (
+                    "Reuse the already-running server on port 8002; "
+                    "no new server is needed."
+                ),
+            ],
+            "validation": [],
+        }))
+
+        self.assertIsNotNone(problem)
+        self.assertIn("listening_ports evidence", problem)
+
+    def test_generic_assumption_with_matching_tool_event_is_accepted(self):
+        import json
+
+        # Deliberately not a web/port case — proves the assumptions
+        # mechanism is generic, not special-cased to local web servers.
+        agent = core.Agent.__new__(core.Agent)
+        agent.workdir = "/home/user/finance-cli"
+        agent._read_paths_this_turn = set()
+        agent.plan_mode = True
+        agent._tool_events = [
+            {
+                "tool": "run_shell_command",
+                "status": "success",
+                "args": {"command": "g++ --version"},
+                "result": "g++ (Ubuntu 13.2.0) 13.2.0",
+            },
+        ]
+
+        problem = agent._plan_file_evidence_problem(json.dumps({
+            "objective": "Add a new report command to the finance CLI.",
+            "files": [],
+            "steps": ["Implement the new report command."],
+            "validation": [],
+            "assumptions": [
+                {
+                    "claim": "g++ 13 is already installed on this machine",
+                    "verified_by": "run_shell_command:g++ --version",
+                },
+            ],
+        }))
+
+        self.assertIsNone(problem)
+
+    def test_generic_assumption_without_matching_tool_event_is_rejected(self):
+        import json
+
+        agent = core.Agent.__new__(core.Agent)
+        agent.workdir = "/home/user/finance-cli"
+        agent._read_paths_this_turn = set()
+        agent.plan_mode = True
+        agent._tool_events = []
+
+        problem = agent._plan_file_evidence_problem(json.dumps({
+            "objective": "Add a new report command to the finance CLI.",
+            "files": [],
+            "steps": ["Implement the new report command."],
+            "validation": [],
+            "assumptions": [
+                {
+                    "claim": "g++ 13 is already installed on this machine",
+                    "verified_by": "run_shell_command:g++ --version",
+                },
+            ],
+        }))
+
+        self.assertIsNotNone(problem)
+        self.assertIn("g++ 13 is already installed", problem)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -20,6 +20,16 @@ DEFAULTS = {
     "custom_instructions": "",
     "show_external_sessions": True,
     "dialog_geometry": {},
+    # Paned divider positions and panel visibility, restored on launch so
+    # the window looks the way it did when it was last closed. None means
+    # "never dragged/toggled yet" — the widget's own hardcoded construction
+    # default applies instead of a guessed number here.
+    "sidebar_paned_position": None,
+    "content_paned_position": None,
+    "right_stack_position": None,
+    "artifacts_split_position": None,
+    "artifacts_visible": False,
+    "plan_panel_visible": True,
 }
 
 

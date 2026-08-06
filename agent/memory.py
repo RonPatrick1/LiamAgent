@@ -89,6 +89,7 @@ def _ensure_schema(conn):
                 title VARCHAR(255) NOT NULL,
                 folder_path VARCHAR(1024) NOT NULL,
                 plan_mode TINYINT(1) NOT NULL DEFAULT 0,
+                sudo_enabled TINYINT(1) NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
@@ -326,6 +327,12 @@ def _ensure_schema(conn):
                 "ALTER TABLE sessions ADD COLUMN plan_mode "
                 "TINYINT(1) NOT NULL DEFAULT 0"
             )
+        cur.execute("SHOW COLUMNS FROM sessions LIKE 'sudo_enabled'")
+        if not cur.fetchone():
+            cur.execute(
+                "ALTER TABLE sessions ADD COLUMN sudo_enabled "
+                "TINYINT(1) NOT NULL DEFAULT 0"
+            )
         # Forking needs more than one thread able to share a folder_path —
         # drop the uniqueness this table was originally created with.
         cur.execute("SHOW INDEX FROM sessions WHERE Key_name = 'folder_path_unique'")
@@ -540,7 +547,8 @@ def get_session(session_id):
             _ensure_schema(conn)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, title, folder_path, pinned, unread, archived, plan_mode "
+                    "SELECT id, title, folder_path, pinned, unread, archived, "
+                    "plan_mode, sudo_enabled "
                     "FROM sessions WHERE id = %s",
                     (session_id,),
                 )
@@ -549,11 +557,12 @@ def get_session(session_id):
             conn.close()
         if not row:
             return None
-        id_, title, folder_path, pinned, unread, archived, plan_mode = row
+        id_, title, folder_path, pinned, unread, archived, plan_mode, sudo_enabled = row
         return {
             "id": id_, "title": title, "folder_path": folder_path,
             "pinned": bool(pinned), "unread": bool(unread),
             "archived": bool(archived), "plan_mode": bool(plan_mode),
+            "sudo_enabled": bool(sudo_enabled),
         }
     except Exception as exc:
         print(f"[memory] failed to get session: {exc}")
@@ -660,6 +669,23 @@ def set_plan_mode(session_id, enabled):
             conn.close()
     except Exception as exc:
         print(f"[memory] failed to set Plan mode: {exc}")
+
+
+def set_sudo_enabled(session_id, enabled):
+    """Set whether one thread may use local sudo in run_shell_command."""
+    try:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sessions SET sudo_enabled = %s WHERE id = %s",
+                    (1 if enabled else 0, session_id),
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[memory] failed to set sudo_enabled: {exc}")
 
 
 def fork_session(session_id):

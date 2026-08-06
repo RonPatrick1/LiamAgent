@@ -61,6 +61,7 @@ class GuiPlanExecutionTests(unittest.TestCase):
         window._plan_cancel_event = None
         window.execute_plan_button = FakeButton()
         window.cancel_plan_button = FakeButton()
+        window._refresh_plan_panel = mock.Mock()
 
         window._refresh_plan_actions()
 

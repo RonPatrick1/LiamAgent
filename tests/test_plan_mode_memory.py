@@ -49,6 +49,7 @@ class PlanModeMemoryTests(unittest.TestCase):
             0,
             0,
             1,
+            0,
         )
 
         result = memory.get_session(7)
@@ -63,10 +64,12 @@ class PlanModeMemoryTests(unittest.TestCase):
                 "unread": False,
                 "archived": False,
                 "plan_mode": True,
+                "sudo_enabled": False,
             },
         )
         self.cursor.execute.assert_called_once_with(
-            "SELECT id, title, folder_path, pinned, unread, archived, plan_mode "
+            "SELECT id, title, folder_path, pinned, unread, archived, "
+            "plan_mode, sudo_enabled "
             "FROM sessions WHERE id = %s",
             (7,),
         )

@@ -280,9 +280,43 @@ class DesktopOnlySshTests(unittest.TestCase):
         ):
             for command in commands:
                 result = agent._run_tool("run_shell_command", {"command": command})
-                self.assertIn("cannot invoke SSH clients or pipe a password", result)
+                self.assertIn("cannot invoke SSH clients", result)
 
         implementation.assert_not_called()
+
+    def test_local_sudo_blocked_when_thread_toggle_is_off(self):
+        agent = self._agent("gui")
+        agent.sudo_enabled = False
+        implementation = mock.Mock(return_value="must not run")
+
+        with mock.patch.dict(
+            core.TOOL_IMPL, {"run_shell_command": implementation}, clear=False,
+        ):
+            result = agent._run_tool(
+                "run_shell_command",
+                {"command": "mkdir /var/www/AMusic", "sudo": True},
+            )
+
+        self.assertIn("sudo is not enabled for this thread", result)
+        implementation.assert_not_called()
+
+    def test_local_sudo_reaches_tool_when_thread_toggle_is_on(self):
+        agent = self._agent("gui")
+        agent.sudo_enabled = True
+        agent.auto_confirm = True
+        implementation = mock.Mock(return_value="Created directory /var/www/AMusic")
+
+        with mock.patch.dict(
+            core.TOOL_IMPL, {"run_shell_command": implementation}, clear=False,
+        ):
+            result = agent._run_tool(
+                "run_shell_command",
+                {"command": "mkdir /var/www/AMusic", "sudo": True},
+            )
+
+        self.assertEqual(result, "Created directory /var/www/AMusic")
+        implementation.assert_called_once()
+        self.assertEqual(implementation.call_args.kwargs.get("sudo"), True)
 
     def test_credential_failure_discards_unsafe_model_workaround(self):
         agent = self._agent("gui")

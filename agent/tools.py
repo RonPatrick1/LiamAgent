@@ -1,6 +1,7 @@
 """Basic tool implementations and their JSON schemas."""
 
 import difflib
+import getpass
 import hashlib
 import os
 import re
@@ -445,14 +446,91 @@ def git_add(path, base_dir=None):
     return _run_git(["add", path], base_dir)
 
 
-def run_shell_command(command, base_dir=None, timeout=60):
-    result = subprocess.run(
-        command, shell=True, capture_output=True, text=True, timeout=timeout,
-        cwd=base_dir or None,
-    )
+def run_shell_command(command, base_dir=None, timeout=60, sudo=False):
+    """sudo=True runs the command elevated on THIS machine, using the local
+    sudo password stored in GNOME Keyring (agent/ssh_secrets.py) — same
+    mechanism ssh_run_command already uses for remote hosts, just local.
+    Whether sudo is even honored is gated per-thread by the caller
+    (Agent._run_tool checks self.sudo_enabled before this ever runs);
+    that gate, not this function, is what stops an arbitrary request from
+    silently getting root.
+    """
+    if not isinstance(sudo, bool):
+        raise ValueError("sudo must be true or false")
+
+    password = None
+    actual_command = command
+    user = None
+    if sudo:
+        user = getpass.getuser()
+        try:
+            password = ssh_secrets.lookup_local_sudo_password(user)
+        except ssh_secrets.SudoSecretError:
+            return (
+                "Error: Local sudo credential lookup failed: GNOME Keyring "
+                "is unavailable or locked."
+            )
+        if not password:
+            return (
+                "Error: Local sudo is unavailable: no local sudo password is "
+                "stored in GNOME Keyring. Save one in Liam's desktop settings."
+            )
+        if any(character in password for character in ("\n", "\r", "\x00")):
+            return (
+                "Error: The stored local sudo credential is invalid. "
+                "Replace it in Liam's desktop settings."
+            )
+        actual_command = _sudo_wrapped_command(command)
+
+    try:
+        result = subprocess.run(
+            actual_command, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=base_dir or None,
+            input=f"{password}\n" if sudo else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        if stderr:
+            output += f"\n[stderr]\n{stderr}"
+        output = _redact_secret(output, password)
+        output = output.replace(SUDO_VALIDATED_MARKER, "").lstrip("\r\n")
+        output = _strip_terminal_noise(output)
+        return (
+            f"{output}\n[stderr]\nCommand timed out after {timeout} seconds."
+            "\n[exit code: 124]"
+        )[:20_000]
+
     output = result.stdout
     if result.stderr:
         output += f"\n[stderr]\n{result.stderr}"
+    output = _redact_secret(output, password)
+
+    if sudo:
+        validated = SUDO_VALIDATED_MARKER in output
+        output = output.replace(SUDO_VALIDATED_MARKER, "", 1).lstrip("\r\n")
+        if not validated:
+            lowered = output.lower()
+            if any(marker in lowered for marker in (
+                "sorry, try again", "incorrect password", "authentication failure",
+                "no password was provided",
+            )):
+                return (
+                    f"Error: Local sudo authentication failed for {user}. "
+                    "Replace the stored password in Liam's desktop settings."
+                    f"\n[exit code: {result.returncode}]"
+                )
+            detail = output.strip()
+            prefix = f"Error: Local sudo validation failed for {user}."
+            return (
+                f"{prefix}\n{detail}\n[exit code: {result.returncode}]"
+                if detail else f"{prefix}\n[exit code: {result.returncode}]"
+            )[:20_000]
+
     output = _strip_terminal_noise(output)
     output += f"\n[exit code: {result.returncode}]"
     return output[:20_000]
@@ -540,7 +618,11 @@ def _redact_secret(text, secret):
     return text.replace(secret, "[REDACTED]") if secret else text
 
 
-def _sudo_remote_command(command):
+def _sudo_wrapped_command(command):
+    """Shared by ssh_run_command and run_shell_command — nothing here is
+    SSH-specific, it's a plain shell pipeline: validate credentials via
+    stdin, mark that validation actually happened, detach from stdin, then
+    run the real command elevated with a sanitized environment."""
     quoted_command = shlex.quote(command)
     return (
         "sudo -S -p '' -v && "
@@ -587,7 +669,7 @@ def ssh_run_command(host, command, timeout=60, sudo=False):
                 f"Error: Sudo credential for {identity['user']}@{host} is invalid. "
                 "Replace it in Liam's desktop settings."
             )
-        remote_command = _sudo_remote_command(command)
+        remote_command = _sudo_wrapped_command(command)
 
     try:
         result = subprocess.run(
@@ -1649,14 +1731,24 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "run_shell_command",
             "description": (
-                "Run a shell command on this local machine and return its output. "
-                "Never invoke ssh/scp/sftp or pipe passwords into sudo here; remote "
-                "commands from the Ubuntu desktop must use ssh_run_command."
+                "Run a shell command on THIS local machine and return its output. "
+                "Never invoke ssh/scp/sftp here; a remote computer must use "
+                "ssh_run_command instead — this tool is for the local machine only, "
+                "sudo included. Set sudo=true to run the command elevated on this "
+                "machine using the local sudo password already stored in Liam's "
+                "desktop settings; never pass a password in the command text itself. "
+                "If sudo is not enabled for this thread or no local sudo password is "
+                "stored, this returns a clear error explaining that — relay it as-is, "
+                "do not guess a workaround."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The shell command to execute."},
+                    "sudo": {
+                        "type": "boolean",
+                        "description": "Run the command elevated on this local machine. Defaults to false.",
+                    },
                 },
                 "required": ["command"],
             },

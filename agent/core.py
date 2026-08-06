@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+import shlex
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 
@@ -34,12 +35,14 @@ by calling remember again, since that only adds a new note and can't
 remove anything.
 
 Third, corrections to your behavior are handled by Liam's learning
-system. When a user says you were wrong, acknowledge the correction and
-apply it to the current answer. Do not claim that a lesson was saved or
-activated yourself: the host verifies explicit feedback separately and
-will append the real learning status. This is different from
-remember/notes: notes are facts about the user, while lessons are
-corrections to your own behavior.
+system. When a user says you were wrong, acknowledge the correction
+briefly and apply it to the current answer — do not write out a "Lesson
+to Learn" summary, a titled writeup, or anything resembling one; that
+performance is not real and nothing you write there gets saved. Do not
+claim that a lesson was saved or activated yourself: the host verifies
+explicit feedback separately and will append the real learning status.
+This is different from remember/notes: notes are facts about the user,
+while lessons are corrections to your own behavior.
 
 You can also schedule real one-time or recurring tasks with schedule_routine — a
 genuine systemd timer that runs a prompt again later, whether or not this
@@ -174,9 +177,26 @@ include exactly one fenced liam-plan JSON block using this shape:
     }
   ],
   "non_goals": ["What execution must not change"],
-  "risks": ["Concrete risk or blocker"]
+  "risks": ["Concrete risk or blocker"],
+  "assumptions": [
+    {
+      "claim": "A fact about existing state this plan relies on instead of redoing",
+      "verified_by": "tool_name:distinguishing substring from that tool's args or result this turn"
+    }
+  ]
 }
 ```
+
+assumptions is optional and omitted entirely when a plan has nothing to reuse.
+Use it whenever the plan relies on some existing state instead of
+(re)creating it — a server already running, a package or compiler already
+installed, a service already active, disk space already confirmed,
+anything already true on this machine — so the plan doesn't have to
+rediscover or redo something already established. Each entry's verified_by
+must name a real tool from this same turn and a literal substring that
+actually appears in that tool call's own arguments or result — never invent
+one. An assumption without a real matching tool event this turn is rejected
+exactly like any other unverified claim.
 
 Validation must be a non-empty JSON list of objects containing command and
 expected strings. Every validation command must return exit code 0 only when
@@ -190,10 +210,26 @@ listening_ports and use one concrete currently-unused unprivileged port in the
 steps and validation. When steps create or modify files, list those concrete
 paths in files. non_goals may limit scope, but must not contradict any listed
 implementation step. A local webpage plan must give the concrete server command, including
-its address and port, and explain how the process remains running during
-validation. A nohup command must redirect both stdout and stderr before `&`
+its address and port. The literal command itself must keep the process running
+during validation; surrounding prose that merely says "background" is not
+enough. A nohup or shell-background command must redirect both stdout and
+stderr before `&`
 so Liam's command capture can finish, for example `>/dev/null 2>&1 &`.
 It must not prohibit starting or running that server.
+
+For example: if a local webpage's server may already be running from earlier
+work, check first — call fetch_url against the concrete http://127.0.0.1:<port>
+(or http://localhost:<port>) address before drafting the server step. If that
+fetch succeeds, do NOT pick a new port or write a new start command: write the
+step as reusing it, e.g. "Reuse the already-running server on port 8002; no
+new server is needed," naming that same concrete port, and add a matching
+assumptions entry (e.g. "verified_by": "fetch_url:127.0.0.1:8002"). This skips
+the listening_ports call and the start-command/backgrounding requirements
+entirely, since nothing new is being started. Only fall back to
+listening_ports and a fresh start command when no such fetch succeeds. The
+same pattern applies to any other kind of already-established fact, in any
+kind of project — a compiler or library already confirmed installed, a
+background service already running, and so on.
 
 Inspect enough real repository content to make actionable plans ready for
 approval. Informational questions and read-only explanations may finish with
@@ -210,10 +246,82 @@ MAX_CALLS_PER_RESPONSE = 5
 MAX_TOTAL_CALLS = 15
 
 PLAN_EXECUTION_NO_PROGRESS_LIMIT = 3
+
+PLAN_PROGRESS_ACTION_TOOLS = (
+    (
+        set(DANGEROUS_TOOLS)
+        - {"run_shell_command", "ssh_run_command"}
+    )
+    | {"generate_image", "remember"}
+)
+
+PLAN_STEP_ACTION_RE = re.compile(
+    r"\b(?:add|build|cancel|change|configure|copy|create|delete|deploy|"
+    r"design|draw|edit|execute|fix|forget|generate|implement|install|"
+    r"make|modify|move|paint|publish|remember|remove|rename|render|"
+    r"replace|restart|run|schedule|set\s+up|start|stop|update|write)\b",
+    re.IGNORECASE,
+)
+
+PLAN_STEP_FILE_MUTATION_RE = re.compile(
+    r"\b(?:add|change|configure|copy|create|delete|edit|fix|implement|"
+    r"modify|move|remove|rename|replace|update|write)\b",
+    re.IGNORECASE,
+)
+
+PLAN_MUTATING_SHELL_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:"
+    r"(?:sudo\s+)?(?:cp|mv|rm|mkdir|rmdir|touch|install|chmod|chown|"
+    r"ln|kill|pkill)\b|"
+    r"(?:sudo\s+)?sed\s+"
+    r"(?:-[A-Za-z]*i[A-Za-z]*|--in-place(?:=\S+)?)\b|"
+    r"(?:sudo\s+)?perl\s+-[A-Za-z]*i[A-Za-z]*\b|"
+    r"(?:sudo\s+)?tee(?:\s+-a)?\b|"
+    r"(?:sudo\s+)?systemctl(?:\s+--user)?\s+"
+    r"(?:start|stop|restart|reload|enable|disable)\b|"
+    r"(?:sudo\s+)?service\s+\S+\s+"
+    r"(?:start|stop|restart|reload)\b|"
+    r"(?:sudo\s+)?(?:apt(?:-get)?|dnf|yum|pacman|snap)\s+"
+    r"(?:install|remove|upgrade|update)\b|"
+    r"(?:npm|pnpm|yarn)\s+(?:install|add|remove)\b|"
+    r"git\s+(?:add|apply|checkout|restore|commit|merge|rebase|"
+    r"cherry-pick|reset)\b|"
+    r"(?:cargo\s+build|(?:npm|pnpm|yarn)\s+(?:run\s+)?build|"
+    r"cmake\s+--build|make(?:\s|$))|"
+    r"nohup\b"
+    r")",
+    re.IGNORECASE,
+)
+
 PLAN_EXECUTION_STOP_MARKERS = (
     "stopped: reached the reasoning step limit",
     "stopped: hit the",
     "tool-call limit",
+)
+ACTION_TOOL_RECOVERY = (
+    "The user requested an action, or this is an approved Plan step. "
+    "Do not describe code or write tool-call syntax in prose. Call the "
+    "appropriate available tool now. If the action cannot be performed, "
+    "state the concrete tool blocker without claiming success."
+)
+APPROVED_PLAN_STEP_PREFIXES = (
+    "[APPROVED PLAN EXECUTION]",
+    "[APPROVED PLAN VALIDATION REPAIR]",
+)
+EXPLICIT_PLAN_REQUEST_RE = re.compile(
+    r"^\s*(?:please\s+)?"
+    r"(?:make|create|draft|write|prepare|build|put\s+together)\s+"
+    r"(?:me\s+)?(?:an?\s+)?(?:new\s+)?"
+    r"(?:implementation\s+)?plan\b",
+    re.IGNORECASE,
+)
+INERT_ACTION_CODE_RE = re.compile(
+    r"(?:```(?:python|py)?\s|"
+    r"\bwith\s+open\s*\(|"
+    r"\b(?:read_file|write_file|edit_file|run_shell_command|"
+    r"ssh_run_command|make_directory|copy_path|move_path|delete_path|"
+    r"git_add)\s*\()",
+    re.IGNORECASE,
 )
 HISTORY_LIMIT = 20
 CHUNK_THRESHOLD = 8000
@@ -228,6 +336,8 @@ RECOVERY_TOOL_LIMIT = 1
 RECOVERY_USER_CONTEXT_LIMIT = 4
 RECOVERY_USER_MESSAGE_CHARS = 2000
 PLAN_RECOVERY_RESPONSE_CHARS = 8000
+PLAN_RECOVERY_EVIDENCE_CHARS = 12000
+PLAN_RECOVERY_EVIDENCE_FILE_CHARS = 4000
 GENERIC_FEEDBACK_KEYWORDS = {
     "always", "assistant", "behavior", "better", "change", "correction",
     "feedback", "instead", "liam", "never", "next", "next time", "should",
@@ -319,6 +429,18 @@ PLAN_DRAFT_JSON_SCHEMA = {
                 "type": "string",
             },
         },
+        "assumptions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim", "verified_by"],
+                "properties": {
+                    "claim": {"type": "string", "minLength": 1},
+                    "verified_by": {"type": "string", "minLength": 1},
+                },
+            },
+        },
     },
 }
 
@@ -348,7 +470,7 @@ PLAN_UNRESOLVED_PLACEHOLDER_RE = re.compile(
 )
 PLAN_STEP_FILE_REFERENCE_RE = re.compile(
     r"\b(?:create|write|edit|modify|replace|add)\b.{0,160}"
-    r"(?:/(?:[A-Za-z0-9_.-]+/?)+|"
+    r"(?:/(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|"
     r"(?:\.{0,2}/)?[A-Za-z0-9_.-]+\."
     r"(?:html|css|js|mjs|cjs|json|py|php|cpp|c|h|hpp|"
     r"sh|service|conf|yaml|yml|toml|md|txt))",
@@ -371,6 +493,18 @@ PLAN_FILE_CHANGE_BLOCKING_NON_GOAL_RE = re.compile(
 )
 PLAN_SCOPED_FILE_NON_GOAL_RE = re.compile(
     r"\b(?:outside(?:\s+of)?|except(?:\s+for)?|other\s+than)\b",
+    re.IGNORECASE,
+)
+PLAN_CONCRETE_FILE_RE = re.compile(
+    r"(?:/(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|"
+    r"(?:\.{0,2}/)?[A-Za-z0-9_.-]+\."
+    r"(?:html|css|js|mjs|cjs|json|py|php|cpp|c|h|hpp|"
+    r"sh|service|conf|yaml|yml|toml|md|txt))",
+    re.IGNORECASE,
+)
+PLAN_FILE_CHANGE_VERB_RE = re.compile(
+    r"\b(?:creat(?:e|ing)|writ(?:e|ing)|edit(?:ing)?|"
+    r"modif(?:y|ying)|replac(?:e|ing)|add(?:ing)?)\b",
     re.IGNORECASE,
 )
 PLAN_SERVER_BLOCKING_NON_GOAL_RE = re.compile(
@@ -407,6 +541,230 @@ PLAN_SAFE_NOHUP_REDIRECTION_RE = re.compile(
     r".*&",
     re.IGNORECASE,
 )
+PLAN_PYTHON_HTTP_SERVER_RE = re.compile(
+    r"\bpython(?:3)?\s+-m\s+http\.server\b",
+    re.IGNORECASE,
+)
+PLAN_PYTHON_HTTP_SERVER_BIND_RE = re.compile(
+    r"\bpython(?:3)?\s+-m\s+http\.server\s+\d{2,5}\b"
+    r"[^`\n]*\s--bind\s+"
+    r"(?:localhost|(?:\d{1,3}\.){3}\d{1,3})\b",
+    re.IGNORECASE,
+)
+PLAN_QUIET_GREP_PIPE_RE = re.compile(
+    r"\bgrep\b"
+    r"(?=[^|;\n]*\s(?:-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)\b)"
+    r"[^|;\n]*\|\s*grep\b",
+    re.IGNORECASE,
+)
+PLAN_TRANSITION_QUIET_GREP_PIPE_RE = re.compile(
+    r"^\s*grep\s+"
+    r"(?:-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)\s+"
+    r"(?:'transition:'|\"transition:\"|transition:)\s+"
+    r"(?P<target>'[^']+'|\"[^\"]+\"|\S+)\s*"
+    r"\|\s*grep\s+"
+    r"(?:-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)\s+"
+    r"(?:'smooth'|\"smooth\"|smooth)\s*$",
+    re.IGNORECASE,
+)
+PLAN_SERVER_PORT_RE = re.compile(
+    r"(?:"
+    r"python(?:3)?\s+-m\s+http\.server\s+|"
+    r"\b(?:--port|-p)\s*=?\s*|"
+    r"\b(?:127\.0\.0\.1|0\.0\.0\.0|localhost):"
+    r")"
+    r"(?P<port>\d{2,5})\b",
+    re.IGNORECASE,
+)
+PLAN_UNUSED_PORTS_RESULT_RE = re.compile(
+    r"Suggested currently-unused unprivileged TCP ports "
+    r"from \d+-\d+:\s*(?P<ports>[^\n]+)",
+    re.IGNORECASE,
+)
+# A plan that reuses a server already running for this exact project (no
+# new process to start) is a different, equally valid shape from one that
+# starts a fresh server — proven live: a prior plan already stood up and
+# verified a server on a given port, and a later plan for the same site
+# was forced to rediscover a "new" port via listening_ports and invent a
+# redundant start command, even though nothing needed to be (re)started.
+PLAN_SERVER_REUSE_STEP_RE = re.compile(
+    r"\b(?:reus(?:e|ing)|already[\s-]+(?:running|serving|started|up)|"
+    r"no\s+new\s+server\s+(?:is\s+)?(?:needed|required)|"
+    r"existing\s+(?:local\s+)?(?:web\s+)?server)\b",
+    re.IGNORECASE,
+)
+PLAN_PLAIN_PORT_RE = re.compile(r"\bport\s+(?P<port>\d{2,5})\b", re.IGNORECASE)
+PLAN_LOOPBACK_URL_PORT_RE = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost):(?P<port>\d{2,5})\b",
+    re.IGNORECASE,
+)
+
+
+PLAN_SERVER_SERVICE_COMMAND_RE = re.compile(
+    r"\b(?:"
+    r"systemctl(?:\s+--user)?\s+(?:start|restart)\s+\S+|"
+    r"service\s+\S+\s+(?:start|restart)"
+    r")\b",
+    re.IGNORECASE,
+)
+PLAN_QUOTED_LEADING_HYPHEN_RE = re.compile(
+    r"(?P<quote>[\"'])(?P<value>-[^\"']+)(?P=quote)"
+)
+
+
+def _plan_normalize_transition_quiet_grep_pipeline(command):
+    """Replace only the proven invalid transition/smooth quiet pipeline."""
+    if not isinstance(command, str):
+        return command
+
+    match = PLAN_TRANSITION_QUIET_GREP_PIPE_RE.fullmatch(command)
+    if match is None:
+        return command
+
+    try:
+        target_tokens = shlex.split(match.group("target"))
+    except ValueError:
+        return command
+
+    if len(target_tokens) != 1:
+        return command
+
+    target = target_tokens[0]
+    if os.path.splitext(target)[1].lower() != ".css":
+        return command
+
+    return (
+        "grep -Fq 'transition:' "
+        + shlex.quote(target)
+    )
+
+
+def _plan_server_step_has_persistent_command(step):
+    """Require a service manager or safely redirected nohup command."""
+    if not isinstance(step, str):
+        return False
+
+    command_fragments = re.findall(r"`([^`]*)`", step)
+    if not command_fragments:
+        command_fragments = [step]
+
+    for command in command_fragments:
+        if not PLAN_SERVER_MECHANISM_STEP_RE.search(command):
+            continue
+
+        if PLAN_SERVER_SERVICE_COMMAND_RE.search(command):
+            return True
+
+        if (
+            PLAN_NOHUP_STEP_RE.search(command)
+            and PLAN_SAFE_NOHUP_REDIRECTION_RE.search(command)
+        ):
+            return True
+
+    return False
+
+
+def _plan_invalid_grep_leading_hyphen_pattern(command):
+    """Find a grep pattern that needs -- or -e before it."""
+    if not isinstance(command, str):
+        return None
+
+    quoted_leading_values = {
+        match.group("value")
+        for match in PLAN_QUOTED_LEADING_HYPHEN_RE.finditer(command)
+    }
+    if not quoted_leading_values:
+        return None
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+
+    clauses = []
+    clause = []
+
+    for token in tokens:
+        if token in {"&&", "||", ";", "|"}:
+            if clause:
+                clauses.append(clause)
+            clause = []
+        else:
+            clause.append(token)
+
+    if clause:
+        clauses.append(clause)
+
+    for clause in clauses:
+        if (
+            not clause
+            or os.path.basename(clause[0]) != "grep"
+        ):
+            continue
+
+        for index, token in enumerate(clause[1:], 1):
+            if token not in quoted_leading_values:
+                continue
+
+            preceding = clause[1:index]
+
+            if "--" in preceding:
+                continue
+
+            if (
+                index > 1
+                and clause[index - 1] in {"-e", "--regexp"}
+            ):
+                continue
+
+            if len(clause) - index >= 2:
+                return token
+
+    return None
+
+
+def _plan_normalize_grep_leading_hyphen_patterns(command):
+    """Insert grep's option terminator without rewriting other shell text."""
+    if not isinstance(command, str):
+        return command
+
+    parts = re.split(
+        r"(\s*(?:&&|\|\||;|\|)\s*)",
+        command,
+    )
+
+    for index in range(0, len(parts), 2):
+        clause = parts[index]
+
+        while True:
+            invalid = _plan_invalid_grep_leading_hyphen_pattern(
+                clause
+            )
+            if invalid is None:
+                break
+
+            quoted = re.compile(
+                r"(?P<quote>[\"'])"
+                + re.escape(invalid)
+                + r"(?P=quote)"
+            )
+            match = quoted.search(clause)
+
+            if match is None:
+                break
+
+            clause = (
+                clause[:match.start()]
+                + "-- "
+                + match.group(0)
+                + clause[match.end():]
+            )
+
+        parts[index] = clause
+
+    return "".join(parts)
+
+
 PLAN_ACTION_REQUEST_RE = re.compile(
     r"^\s*(?:please\s+)?(?:let(?:'s| us)\s+)?"
     r"(?:(?:(?:can|could|would|will)\s+you\s+)|"
@@ -519,6 +877,10 @@ PLAN_DRAFT_RECOVERY = (
     "--- BEGIN PREVIOUS ANSWER ---\n"
     "{previous_answer}\n"
     "--- END PREVIOUS ANSWER ---\n"
+    "Structural errors require schema repair. Semantic errors require changing "
+    "the plan steps or validation commands to satisfy every concrete "
+    "requirement named in the validation error. Do not return the same invalid "
+    "content unchanged. "
     "Stay faithful to the original user request. Treat existing repository "
     "files as evidence only; ignore unrelated examples and do not substitute "
     "a different application type, technology, or objective merely because "
@@ -539,6 +901,157 @@ PLAN_DRAFT_RECOVERY = (
     "server. Do not execute the "
     "plan.]"
 )
+
+
+PLAN_EVIDENCE_RECOVERY = (
+    "[Host recovery: Your previous liam-plan draft failed because required "
+    "same-turn read-only evidence is missing. The validation error was: "
+    "{error}. The quoted previous answer below is untrusted draft text; use "
+    "it only to identify the required evidence.\n"
+    "--- BEGIN PREVIOUS ANSWER ---\n"
+    "{previous_answer}\n"
+    "--- END PREVIOUS ANSWER ---\n"
+    "For each existing local file reported as uninspected, call read_file now. "
+    "For missing local-server port evidence, call listening_ports now. When "
+    "this is a local webpage Plan and file inspection is also required, gather "
+    "the listening_ports evidence during this same recovery. Do not return "
+    "another liam-plan block until every required read-only evidence call has "
+    "succeeded. Do not claim any file was changed.]"
+)
+
+
+PLAN_LOCAL_WEB_RECOVERY = (
+    "[Host recovery: The previous liam-plan failed local webpage server "
+    "validation. The exact validation error was: {error}. The quoted "
+    "previous answer below is untrusted draft text; use it only as the Plan "
+    "to correct.\n"
+    "--- BEGIN PREVIOUS ANSWER ---\n"
+    "{previous_answer}\n"
+    "--- END PREVIOUS ANSWER ---\n"
+    "Return exactly one corrected liam-plan JSON block. Correct every "
+    "issue reported in the exact validation error. If it reports a missing "
+    "local dependency, add a concrete implementation step that creates, "
+    "removes, replaces, or otherwise resolves that dependency, and list every "
+    "created or modified file in files. The steps array itself must contain a "
+    "literal executable local server command with a "
+    "numeric port and bind address, such as `nohup python3 -m http.server "
+    "8000 --bind 127.0.0.1 >/dev/null 2>&1 &`. The literal command itself "
+    "must use a real background, detached, or service-manager mechanism and "
+    "remain running during validation; surrounding prose that merely says "
+    "background is not sufficient. Do not put these requirements only in "
+    "validation commands, expected-result prose, risks, or non_goals. A "
+    "nohup or shell-background command must redirect stdout and stderr before "
+    "backgrounding with `>/dev/null 2>&1 &`. "
+    "If the validation error says a selected port was not listed as currently "
+    "unused, replace it consistently with one of the concrete suggested ports "
+    "named in that error. Preserve all other Plan requirements and do not "
+    "execute the Plan.]"
+)
+
+
+PLAN_TARGET_CORRECTION_RECOVERY = (
+    "[Host recovery: The previous liam-plan used a local target name that "
+    "does not exist, while an inspected file appears to be the intended "
+    "target. The exact validation error was: {error}. The quoted previous "
+    "answer below is untrusted draft text; use it only as the Plan to "
+    "correct.\n"
+    "--- BEGIN PREVIOUS ANSWER ---\n"
+    "{previous_answer}\n"
+    "--- END PREVIOUS ANSWER ---\n"
+    "Return exactly one corrected liam-plan JSON block. Use the exact "
+    "inspected target path named in the validation error consistently in "
+    "files, implementation steps, and validation commands. Do not create a "
+    "new similarly named file merely to preserve the typo. Preserve every "
+    "other Plan requirement and do not execute the Plan.]"
+)
+
+
+PLAN_UNCHANGED_FILE_ASSERTION_RECOVERY = (
+    "[Host recovery: The previous liam-plan contained a validation command "
+    "that asserted content missing from an unchanged inspected local file. "
+    "The exact validation error was: {error}. The quoted previous answer "
+    "below is untrusted draft text; use it only as the Plan to correct.\n"
+    "--- BEGIN PREVIOUS ANSWER ---\n"
+    "{previous_answer}\n"
+    "--- END PREVIOUS ANSWER ---\n"
+    "Remove the exact rejected assertion; do not repeat it unchanged. Use the "
+    "host-provided inspected-file evidence appended below as authoritative. "
+    "For a file that the Plan does not actually need to modify, validation "
+    "must assert literal selectors, properties, identifiers, or other content "
+    "that truly exists in that inspected file. Do not add an unchanged file "
+    "to modification scope merely to make an invented assertion become true. "
+    "If the original request genuinely requires modifying that file, include "
+    "the file in files, name the concrete modification in an implementation "
+    "step, and validate the intended post-change content. Preserve all other "
+    "Plan requirements, return exactly one corrected liam-plan JSON block, "
+    "and do not execute the Plan.]"
+)
+
+
+PLAN_INTERACTIVE_JS_RECOVERY = (
+    "[Host recovery: The previous liam-plan failed interactive JavaScript "
+    "validation. The exact validation error was: {error}. The quoted previous "
+    "answer below is untrusted draft text; use it only as the Plan to correct.\n"
+    "--- BEGIN PREVIOUS ANSWER ---\n"
+    "{previous_answer}\n"
+    "--- END PREVIOUS ANSWER ---\n"
+    "Return exactly one corrected liam-plan JSON block. Correct every issue "
+    "reported in the exact validation error. If it says CSS classes already "
+    "exist, revise implementation steps to reuse or modify those definitions "
+    "instead of adding duplicates. Add or repair executable validation commands "
+    "so validation commands targeting the same declared JavaScript file "
+    "assert every relevant control identifier and CSS state class named in the "
+    "error, plus at least one literal event-binding mechanism named there. "
+    "Use a concrete same-file command such as `grep -Fq 'theme-toggle' script.js "
+    "&& grep -Fq 'addEventListener' script.js && grep -Fq 'dark-mode' script.js "
+    "&& grep -Fq 'light-mode' script.js`. Do not validate `theme-toggle` only "
+    "against index.html or the state classes only against style.css; those "
+    "separate checks do not prove that JavaScript connects the control to the "
+    "state change. For inspected CSS classes, also validate each "
+    "class in the inspected CSS file with "
+    "its own exact selector literal from the host-provided evidence, such as "
+    "`grep -Fq '.dark-mode {{' style.css && grep -Fq '.light-mode {{' style.css`. "
+    "Do not synthesize a combined selector such as `.dark-mode, .light-mode` "
+    "unless that exact combined selector appears in the inspected file. If the "
+    "error reports missing smooth-transition CSS evidence, validate every exact "
+    "transition literal named in the error against the inspected CSS file, such "
+    "as `grep -Fq -- '--transition-speed:' style.css && grep -Fq 'transition:' "
+    "style.css`. Do not satisfy a requirement only by mentioning it in an "
+    "expected-result "
+    "description. Compound grep -Fq checks joined with && are acceptable when "
+    "they use concrete paths already in the Plan. Every command must exit "
+    "nonzero when its assertion fails. Do not return the same invalid "
+    "validation unchanged and do not execute the Plan.]"
+)
+
+
+def _plan_recovery_template(error, *, evidence_needed=False):
+    if evidence_needed:
+        return PLAN_EVIDENCE_RECOVERY
+    if (
+        isinstance(error, str)
+        and "looks like the intended target" in error
+    ):
+        return PLAN_TARGET_CORRECTION_RECOVERY
+    if (
+        isinstance(error, str)
+        and "local webpage plans must" in error
+    ):
+        return PLAN_LOCAL_WEB_RECOVERY
+    if (
+        isinstance(error, str)
+        and error.startswith(
+            "validation command asserts missing content"
+        )
+    ):
+        return PLAN_UNCHANGED_FILE_ASSERTION_RECOVERY
+    if (
+        isinstance(error, str)
+        and "interactive JavaScript validation" in error
+    ):
+        return PLAN_INTERACTIVE_JS_RECOVERY
+    return PLAN_DRAFT_RECOVERY
+
 
 RECOVERY_SYSTEM_PROMPT = (
     "You are Liam retrying one failed turn. The listed tools are real and "
@@ -613,6 +1126,17 @@ REMEMBER_CLAIM_RE = re.compile(
 MODEL_LEARNING_NOTICE_RE = re.compile(
     r"\s*\[\s*(?:i\s+)?(?:queued|learned|reinforced|quarantined)\b"
     r"[^\]]{0,400}\blesson\b[^\]]*\]\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+# Same problem as MODEL_LEARNING_NOTICE_RE — the model narrating its own
+# lesson activity instead of leaving that to the host — but in a longer,
+# unbracketed essay shape ("Lesson to Learn:\n\n...\n\nExample:\n\n...")
+# that notice regex was never written to catch. Proven live: this exact
+# shape sailed straight through with nothing behind it in the lessons
+# table at all. Anchored on the distinctive header phrase, not "lesson"
+# alone, to stay narrow.
+FAKE_LESSON_ESSAY_RE = re.compile(
+    r"lesson\s+to\s+learn\s*:.*",
     re.IGNORECASE | re.DOTALL,
 )
 PLAN_HOST_NOTICE_RE = re.compile(
@@ -742,6 +1266,21 @@ SUCCESS_CLAIM_RE = re.compile(
     r"\b(successfully|completed|fixed|created|saved|deleted|moved|copied|"
     r"generated|finished|done|worked|succeeded)\b",
     re.IGNORECASE,
+)
+ACTION_PROMISE_RE = re.compile(
+    r"\b(?:i\s+(?:will|'ll|am\s+going\s+to)|let\s+me)\s+"
+    r"(?:now\s+)?(?:call|copy|delete|execute|install|move|play|run|"
+    r"start|stop|use|write)\b",
+    re.IGNORECASE,
+)
+ACTION_FOLLOWUP_REQUEST_RE = re.compile(
+    r"^\s*(?:(?:well|then|now|just|please|actually|finally|"
+    r"fucking|fuckin'?)\s+)*"
+    r"(?:(?:go\s+ahead(?:\s+and)?)|"
+    r"(?:do|run|execute|start|stop|try)\s+"
+    r"(?:it|that|this\b.*|again\b.*|the\b.*))"
+    r"[.!?\s]*$",
+    re.IGNORECASE | re.DOTALL,
 )
 # Only data-lookup tools get routed through isolated synthesis — their
 # result is meant to answer a factual question. Action tools (remember,
@@ -1030,6 +1569,47 @@ def _extract_plan_draft(content):
     if not payload["steps"]:
         return None, "steps must contain at least one implementation step"
 
+    # Optional and domain-neutral on purpose: a plan for any kind of project
+    # (a web server, a compiled binary, an installed package, a running
+    # service — anything) can declare a fact it's relying on and exactly
+    # which tool call this turn backs it up, instead of every new domain
+    # needing its own hand-written detection/evidence code the next time a
+    # plan wrongly re-derives something already established.
+    assumptions = payload.get("assumptions", [])
+    if not isinstance(assumptions, list):
+        return None, "assumptions must be a list of objects"
+    cleaned_assumptions = []
+    for item in assumptions:
+        if not isinstance(item, dict):
+            return None, "each assumption must be an object with claim and verified_by"
+        claim = item.get("claim")
+        verified_by = item.get("verified_by")
+        if not isinstance(claim, str) or not claim.strip():
+            return None, "each assumption's claim must be a non-empty string"
+        if (
+            not isinstance(verified_by, str)
+            or ":" not in verified_by
+            or not verified_by.split(":", 1)[0].strip()
+            or not verified_by.split(":", 1)[1].strip()
+        ):
+            return (
+                None,
+                "each assumption's verified_by must be "
+                "'tool_name:distinguishing evidence substring', naming a "
+                "real tool call from this same turn",
+            )
+        tool_name = verified_by.split(":", 1)[0].strip()
+        if tool_name not in TOOL_IMPL:
+            return None, f"assumption verified_by names unknown tool {tool_name!r}"
+        cleaned_assumptions.append({
+            "claim": claim.strip(),
+            "verified_by": verified_by.strip(),
+        })
+    # Only set the key when actually used — plans that never mention
+    # assumptions at all stay byte-identical to before this field existed.
+    if "assumptions" in payload or cleaned_assumptions:
+        payload["assumptions"] = cleaned_assumptions
+
     if (
         not payload["files"]
         and any(
@@ -1047,6 +1627,35 @@ def _extract_plan_draft(content):
         for step in payload["steps"]
     )
 
+    declared_file_paths = [
+        os.path.normpath(path)
+        for path in payload["files"]
+    ]
+    undeclared_step_files = []
+
+    for step in payload["steps"]:
+        if not PLAN_FILE_CHANGE_VERB_RE.search(step):
+            continue
+
+        for matched_file in PLAN_CONCRETE_FILE_RE.findall(step):
+            named_file = matched_file.rstrip(".,;:!?")
+            if not named_file:
+                continue
+
+            normalized = os.path.normpath(named_file)
+            declared = any(
+                normalized == declared_path
+                or os.path.basename(normalized)
+                == os.path.basename(declared_path)
+                for declared_path in declared_file_paths
+            )
+
+            if (
+                not declared
+                and named_file not in undeclared_step_files
+            ):
+                undeclared_step_files.append(named_file)
+
     for item in payload["non_goals"]:
         if PLAN_EXECUTION_BLOCKING_NON_GOAL_RE.search(item):
             return (
@@ -1054,57 +1663,141 @@ def _extract_plan_draft(content):
                 "non_goals must not prohibit executing or implementing "
                 "the approved plan",
             )
+        named_files = [
+            matched.rstrip(".,;:!?")
+            for matched in PLAN_CONCRETE_FILE_RE.findall(item)
+            if matched.rstrip(".,;:!?")
+        ]
+        file_change_prohibition = bool(
+            PLAN_FILE_CHANGE_BLOCKING_NON_GOAL_RE.search(item)
+            or (
+                named_files
+                and PLAN_FILE_CHANGE_VERB_RE.search(item)
+            )
+        )
+
         if (
             file_changes_required
-            and PLAN_FILE_CHANGE_BLOCKING_NON_GOAL_RE.search(item)
+            and file_change_prohibition
             and not PLAN_SCOPED_FILE_NON_GOAL_RE.search(item)
         ):
-            return (
-                None,
-                "non_goals conflict with file-changing implementation steps",
+            declared_files = [
+                os.path.normpath(path)
+                for path in payload["files"]
+            ]
+            named_files_are_out_of_scope = bool(named_files) and all(
+                not any(
+                    os.path.normpath(named) == declared
+                    or os.path.basename(named) == os.path.basename(declared)
+                    for declared in declared_files
+                )
+                for named in named_files
             )
 
-    local_web_required = PLAN_LOCAL_WEB_RE.search(
-        "\n".join([payload["objective"]] + payload["steps"])
+            if not named_files_are_out_of_scope:
+                return (
+                    None,
+                    "non_goals conflict with file-changing implementation "
+                    f"steps: {item!r}",
+                )
+
+    local_web_required = bool(
+        PLAN_LOCAL_WEB_RE.search(
+            "\n".join([payload["objective"]] + payload["steps"])
+        )
+        or any(
+            os.path.splitext(path)[1].lower() in {".html", ".htm"}
+            for path in payload["files"]
+        )
     )
 
+    execution_shape_problems = []
+
+    if undeclared_step_files:
+        execution_shape_problems.append(
+            "file-changing implementation step references undeclared "
+            "path(s): "
+            + ", ".join(
+                repr(path)
+                for path in undeclared_step_files
+            )
+            + "; every created or modified file must be listed in files"
+        )
+
     if local_web_required:
-        for item in payload["non_goals"]:
-            if PLAN_SERVER_BLOCKING_NON_GOAL_RE.search(item):
-                return (
-                    None,
-                    "non_goals conflict with the required local web server",
-                )
-
-        if not any(
-            PLAN_SERVER_MECHANISM_STEP_RE.search(step)
-            for step in payload["steps"]
+        if any(
+            PLAN_SERVER_BLOCKING_NON_GOAL_RE.search(item)
+            for item in payload["non_goals"]
         ):
-            return (
-                None,
-                "local webpage plans must include a concrete server command",
+            execution_shape_problems.append(
+                "non_goals conflict with the required local web server"
             )
 
-        if not any(
-            PLAN_SERVER_LIFECYCLE_STEP_RE.search(step)
-            for step in payload["steps"]
-        ):
-            return (
-                None,
-                "local webpage plans must explain how the server remains "
-                "running during validation",
+        # A step that explicitly reuses an already-running server (naming
+        # a concrete port) has nothing to start, so it can't and shouldn't
+        # be held to the start-command/backgrounding requirements below —
+        # those exist to keep a *new* server process alive, which is moot
+        # when no new process is being created.
+        reuses_existing_server = any(
+            PLAN_SERVER_REUSE_STEP_RE.search(step)
+            and (
+                PLAN_SERVER_PORT_RE.search(step)
+                or PLAN_PLAIN_PORT_RE.search(step)
             )
+            for step in payload["steps"]
+        ) or any(
+            PLAN_SERVER_REUSE_STEP_RE.search(item["claim"])
+            and (
+                PLAN_SERVER_PORT_RE.search(item["claim"])
+                or PLAN_PLAIN_PORT_RE.search(item["claim"])
+            )
+            for item in payload.get("assumptions", [])
+        )
 
-        for step in payload["steps"]:
-            if (
-                PLAN_NOHUP_STEP_RE.search(step)
-                and not PLAN_SAFE_NOHUP_REDIRECTION_RE.search(step)
+        if not reuses_existing_server:
+            if not any(
+                PLAN_SERVER_MECHANISM_STEP_RE.search(step)
+                for step in payload["steps"]
             ):
-                return (
-                    None,
-                    "nohup server commands must redirect stdout and stderr "
-                    "before backgrounding the process",
+                execution_shape_problems.append(
+                    "local webpage plans must include a concrete server command"
                 )
+
+            if not any(
+                _plan_server_step_has_persistent_command(step)
+                for step in payload["steps"]
+            ):
+                execution_shape_problems.append(
+                    "local webpage plans must explain how the server remains "
+                    "running during validation using a literal safely redirected "
+                    "background command or a concrete service-manager command"
+                )
+
+        if any(
+            PLAN_NOHUP_STEP_RE.search(step)
+            and not PLAN_SAFE_NOHUP_REDIRECTION_RE.search(step)
+            for step in payload["steps"]
+        ):
+            execution_shape_problems.append(
+                "nohup server commands must redirect stdout and stderr "
+                "before backgrounding the process"
+            )
+
+        if any(
+            PLAN_PYTHON_HTTP_SERVER_RE.search(step)
+            and not PLAN_PYTHON_HTTP_SERVER_BIND_RE.search(step)
+            for step in payload["steps"]
+        ):
+            execution_shape_problems.append(
+                "python http.server commands must include a concrete "
+                "--bind address"
+            )
+
+    execution_shape_error = (
+        "; ".join(execution_shape_problems)
+        if execution_shape_problems
+        else None
+    )
 
     validation = payload.get("validation")
     if not isinstance(validation, list) or not validation:
@@ -1121,12 +1814,37 @@ def _extract_plan_draft(content):
         if not isinstance(expected, str) or not expected.strip():
             return None, "each validation expected result must be a non-empty string"
 
-        command = command.strip()
+        command = _plan_normalize_grep_leading_hyphen_patterns(
+            command.strip()
+        )
+        command = _plan_normalize_transition_quiet_grep_pipeline(
+            command
+        )
         if PLAN_VALIDATION_FAILURE_MASK_RE.search(command):
             return (
                 None,
                 "validation command masks failure; it must return nonzero "
                 "when its check fails",
+            )
+
+        if PLAN_QUIET_GREP_PIPE_RE.search(command):
+            return (
+                None,
+                "validation command pipes output from quiet grep into "
+                "another grep; quiet grep suppresses the output required "
+                "by the downstream command",
+            )
+
+        invalid_grep_pattern = (
+            _plan_invalid_grep_leading_hyphen_pattern(command)
+        )
+        if invalid_grep_pattern is not None:
+            return (
+                None,
+                "validation grep pattern "
+                f"{invalid_grep_pattern!r} begins with '-' and must be "
+                "preceded by grep's -- option terminator or supplied "
+                "with -e/--regexp",
             )
 
         http_expectation = PLAN_HTTP_EXACT_EXPECTATION_RE.search(
@@ -1201,7 +1919,7 @@ def _extract_plan_draft(content):
         ensure_ascii=False,
         indent=2,
     )
-    return canonical, None
+    return canonical, execution_shape_error
 
 
 class Agent:
@@ -1210,7 +1928,8 @@ class Agent:
                  workdir=None, session_id=None, extra_folders=None,
                  custom_instructions=None, notes_session_id=None,
                  allowed_tools=None, channel="cli", actor_id="local-owner",
-                 is_owner=True, learning_enabled=True, plan_mode=False):
+                 is_owner=True, learning_enabled=True, plan_mode=False,
+                 sudo_enabled=False):
         """on_tool_call(name, args), on_confirm(name, args) -> bool, and
         on_status(message) are pluggable so any frontend (CLI, GUI, ...)
         can hook into the agent's progress and confirmation prompts
@@ -1304,6 +2023,11 @@ class Agent:
         self.actor_id = actor_id
         self.is_owner = bool(is_owner)
         self.plan_mode = bool(plan_mode)
+        self._turn_plan_mode = False
+        # Owner-only, never advisory: gated for real in _run_tool, which
+        # forces run_shell_command's sudo argument off whenever this is
+        # False, regardless of what the model itself requests.
+        self.sudo_enabled = bool(sudo_enabled) and self.is_owner
         self.learning_enabled = bool(learning_enabled) and not self.plan_mode
         self._current_user_input = ""
         self._tool_events = []
@@ -1517,13 +2241,18 @@ class Agent:
             lines.append(f"{label}:\n{content}")
         return "\n\n".join(lines)
 
-    def _select_recovery_tool_schemas(self, user_message_index):
+    def _select_recovery_tool_schemas(
+        self,
+        user_message_index,
+        tool_schemas=None,
+    ):
         """Use the preprocessing model as a generic, allowlist-safe router."""
-        if not self.tool_schemas:
+        tool_schemas = self.tool_schemas if tool_schemas is None else tool_schemas
+        if not tool_schemas:
             return []
         catalog = []
         by_name = {}
-        for schema in self.tool_schemas:
+        for schema in tool_schemas:
             function = schema["function"]
             name = function["name"]
             by_name[name] = schema
@@ -1602,6 +2331,257 @@ class Agent:
             retry,
         ]
 
+    def _plan_recovery_evidence_context(self):
+        """Return bounded inspected-file and listening-port evidence."""
+        workdir = os.path.normpath(self.workdir)
+        remaining = PLAN_RECOVERY_EVIDENCE_CHARS
+        sections = []
+
+        successful_port_events = [
+            event
+            for event in getattr(self, "_tool_events", [])
+            if (
+                isinstance(event, dict)
+                and event.get("tool") == "listening_ports"
+                and event.get("status") == "success"
+                and isinstance(event.get("result"), str)
+            )
+        ]
+
+        if successful_port_events and remaining > 0:
+            result = successful_port_events[-1]["result"]
+            limit = remaining
+            truncated = len(result) > limit
+            content = result[:limit]
+            remaining -= len(content)
+
+            section = (
+                "--- BEGIN LISTENING PORTS EVIDENCE ---\n"
+                + content
+            )
+            if truncated:
+                section += "\n[content truncated by host]"
+            section += (
+                "\n--- END LISTENING PORTS EVIDENCE ---"
+            )
+            sections.append(section)
+
+        for path in sorted(
+            getattr(self, "_read_paths_this_turn", set())
+        ):
+            resolved = os.path.normpath(path)
+
+            try:
+                inside_workdir = (
+                    os.path.commonpath([workdir, resolved]) == workdir
+                )
+            except ValueError:
+                inside_workdir = False
+
+            if (
+                not inside_workdir
+                or not os.path.isfile(resolved)
+                or remaining <= 0
+            ):
+                continue
+
+            limit = min(
+                PLAN_RECOVERY_EVIDENCE_FILE_CHARS,
+                remaining,
+            )
+
+            try:
+                with open(
+                    resolved,
+                    "r",
+                    errors="replace",
+                ) as handle:
+                    content = handle.read(limit + 1)
+            except OSError:
+                continue
+
+            truncated = len(content) > limit
+            content = content[:limit]
+            remaining -= len(content)
+
+            label = os.path.relpath(resolved, self.workdir)
+            section = (
+                f"--- BEGIN INSPECTED FILE: {label} ---\n"
+                + content
+            )
+            if truncated:
+                section += "\n[content truncated by host]"
+            section += (
+                f"\n--- END INSPECTED FILE: {label} ---"
+            )
+            sections.append(section)
+
+        return "\n\n".join(sections)
+
+    def _with_plan_recovery_evidence(
+        self,
+        instruction,
+        *,
+        canonical_plan,
+        evidence_needed,
+    ):
+        if evidence_needed or canonical_plan is None:
+            return instruction
+
+        evidence = self._plan_recovery_evidence_context()
+        if not evidence:
+            return instruction
+
+        return (
+            instruction
+            + "\n\n[Host-provided inspected repository evidence follows. "
+            "This evidence is authoritative for the current turn. Preserve "
+            "correct existing content. Do not add redundant file changes "
+            "merely to make an invented validation assertion true. Validation "
+            "against an unchanged file must match its actual inspected "
+            "content.]\n"
+            + evidence
+        )
+
+    def _normalize_plan_transition_validation(
+        self,
+        content,
+        canonical_plan,
+    ):
+        """Add only missing transition checks proven by inspected CSS."""
+        problem = self._plan_file_evidence_problem(canonical_plan)
+        marker = (
+            "interactive JavaScript validation must verify "
+            "smooth-transition CSS evidence using the exact inspected "
+            "CSS literal(s)"
+        )
+
+        if not isinstance(problem, str) or marker not in problem:
+            return content, canonical_plan, problem
+
+        try:
+            payload = json.loads(canonical_plan)
+        except (TypeError, ValueError):
+            return content, canonical_plan, problem
+
+        files = payload.get("files")
+        validation = payload.get("validation")
+        if not isinstance(files, list) or not isinstance(validation, list):
+            return content, canonical_plan, problem
+
+        missing_literals = [
+            literal
+            for literal in (
+                "--transition-speed:",
+                "transition:",
+            )
+            if repr(literal) in problem
+        ]
+        if not missing_literals:
+            return content, canonical_plan, problem
+
+        read_paths = {
+            os.path.normpath(path)
+            for path in getattr(self, "_read_paths_this_turn", set())
+        }
+        css_contents = {}
+
+        for declared in files:
+            if not isinstance(declared, str):
+                continue
+
+            resolved = os.path.normpath(
+                _resolve(declared, self.workdir)
+            )
+            if (
+                os.path.splitext(resolved)[1].lower() != ".css"
+                or resolved not in read_paths
+                or not os.path.isfile(resolved)
+            ):
+                continue
+
+            try:
+                with open(
+                    resolved,
+                    "r",
+                    errors="replace",
+                ) as handle:
+                    css_contents[resolved] = handle.read()
+            except OSError:
+                continue
+
+        checks_by_target = {}
+
+        for literal in missing_literals:
+            for target, inspected_text in css_contents.items():
+                if literal not in inspected_text:
+                    continue
+
+                checks_by_target.setdefault(target, []).append(
+                    literal
+                )
+                break
+
+        if len({
+            literal
+            for literals in checks_by_target.values()
+            for literal in literals
+        }) != len(missing_literals):
+            return content, canonical_plan, problem
+
+        for target, literals in checks_by_target.items():
+            commands = []
+
+            for literal in literals:
+                terminator = "-- " if literal.startswith("-") else ""
+                commands.append(
+                    "grep -Fq "
+                    + terminator
+                    + shlex.quote(literal)
+                    + " "
+                    + shlex.quote(target)
+                )
+
+            validation.append({
+                "command": " && ".join(commands),
+                "expected": (
+                    "The exact inspected smooth-transition CSS "
+                    f"literal(s) remain present in {target}."
+                ),
+            })
+
+        candidate_text = (
+            "```liam-plan\n"
+            + json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n```"
+        )
+        normalized_plan, extraction_problem = _extract_plan_draft(
+            candidate_text
+        )
+
+        if extraction_problem is not None or normalized_plan is None:
+            return content, canonical_plan, problem
+
+        updated_problem = self._plan_file_evidence_problem(
+            normalized_plan
+        )
+        replacement = (
+            "```liam-plan\n"
+            + normalized_plan
+            + "\n```"
+        )
+        updated_content = PLAN_BLOCK_RE.sub(
+            lambda _match: replacement,
+            content,
+            count=1,
+        )
+
+        return updated_content, normalized_plan, updated_problem
+
     def _helper_chat(self, messages, *, structured=True):
         """Run a small structured or plain-text preprocessing job.
 
@@ -1654,7 +2634,7 @@ class Agent:
     def _run_tool(self, name, args):
         if name not in TOOL_IMPL:
             return f"Error: unknown tool '{name}'. There is no such tool — the only tools that exist are: {', '.join(sorted(TOOL_IMPL))}."
-        if getattr(self, "plan_mode", False) and name not in PLAN_MODE_ALLOWED_TOOLS:
+        if self._plan_mode_active() and name not in PLAN_MODE_ALLOWED_TOOLS:
             return (
                 f"Error: '{name}' is unavailable in Plan mode. Plan mode permits "
                 "read-only analysis only; no action was performed."
@@ -1672,10 +2652,20 @@ class Agent:
             args.get("command", "")
         ):
             return (
-                "Error: run_shell_command cannot invoke SSH clients or pipe a "
-                "password into sudo. From Liam's Ubuntu desktop app, use "
-                "ssh_run_command with an allowlisted host and sudo=true; the "
-                "credential must come only from GNOME Keyring."
+                "Error: run_shell_command cannot invoke SSH clients, or embed "
+                "'sudo -S'/a piped password in the command text itself. For a "
+                "remote host use ssh_run_command with sudo=true; for this local "
+                "machine, call run_shell_command with sudo=true instead — never "
+                "put sudo or a credential directly in the command string. Either "
+                "way, the credential comes only from GNOME Keyring, never from "
+                "text you write."
+            )
+        if name == "run_shell_command" and args.get("sudo") and not self.sudo_enabled:
+            return (
+                "Error: local sudo is not enabled for this thread. Tell the "
+                "user to turn it on (the sudo toggle in the desktop app's "
+                "header) if they want this run elevated — do not retry "
+                "without sudo and claim that satisfies an explicit sudo request."
             )
         # base_dir/session_id are never part of a tool's JSON schema — the
         # model can't supply them itself — but this agent's own workdir/
@@ -1879,6 +2869,35 @@ class Agent:
         result = self._run_tool(name, args)
         event = self._classify_tool_outcome(name, args, result)
         self._tool_events.append(event)
+
+        if (
+            name == "read_file"
+            and event.get("reason") == "tool_error"
+            and "is a directory" in (result or "").lower()
+        ):
+            follow_args = {"path": args.get("path", "")}
+            self.on_tool_call("list_directory", follow_args)
+            listing = self._run_tool("list_directory", follow_args)
+            listing_event = self._classify_tool_outcome(
+                "list_directory",
+                follow_args,
+                listing,
+            )
+            self._tool_events.append(listing_event)
+
+            if listing_event.get("status") == "success":
+                return (
+                    "read_file target was a directory; Liam automatically "
+                    "used list_directory instead:\n"
+                    + listing
+                )
+
+            return (
+                result
+                + "\n\nAutomatic list_directory attempt also failed:\n"
+                + listing
+            )
+
         return self._force_compile_retry(name, args, result)
 
     def _record_intervention(self, reason, tool, detail):
@@ -1907,6 +2926,1011 @@ class Agent:
     def _is_direct_note_recall_request(user_input):
         return bool(NOTE_RECALL_REQUEST_RE.search(user_input or ""))
 
+    @staticmethod
+    def _is_explicit_plan_request(user_input):
+        return bool(EXPLICIT_PLAN_REQUEST_RE.search(user_input or ""))
+
+    def _plan_mode_active(self):
+        return bool(
+            getattr(self, "plan_mode", False)
+            or getattr(self, "_turn_plan_mode", False)
+        )
+
+    def _plan_reuse_evidence_ports(self):
+        """Ports proven, this turn, to already be correctly answering a
+        real HTTP request — via fetch_url or a run_shell_command curl —
+        against loopback. This is real evidence a server for this exact
+        project is already up, unlike listening_ports (which only proves
+        a port is unused, the opposite fact a reuse step actually needs)."""
+        ports = set()
+        for event in getattr(self, "_tool_events", []):
+            if event.get("tool") not in ("fetch_url", "run_shell_command"):
+                continue
+            if event.get("status") != "success":
+                continue
+            args = event.get("args") or {}
+            for haystack in (str(args.get("url", "")), str(args.get("command", ""))):
+                for match in PLAN_LOOPBACK_URL_PORT_RE.finditer(haystack):
+                    port = int(match.group("port"))
+                    if 1024 <= port <= 65535:
+                        ports.add(port)
+        return ports
+
+    def _plan_unverified_assumptions(self, payload):
+        """Generic evidence check for the plan's declared assumptions field:
+        each one must name a real tool ("verified_by": "tool_name:evidence
+        substring") that actually succeeded this turn with that evidence in
+        its own args or result. Domain-neutral on purpose — this is the same
+        underlying check as _plan_reuse_evidence_ports (don't trust a claim
+        about already-established state without a real tool event backing
+        it up this turn), just generalized so a future project type (a
+        compiler already installed, a package already present, a service
+        already running — anything) doesn't need its own hand-written
+        detector the next time it comes up, the way the web-server case
+        originally did."""
+        problems = []
+        for item in payload.get("assumptions") or []:
+            if not isinstance(item, dict):
+                continue
+            claim = item.get("claim", "")
+            verified_by = item.get("verified_by", "")
+            tool_name, _, needle = verified_by.partition(":")
+            tool_name = tool_name.strip()
+            needle = needle.strip()
+            matched = any(
+                event.get("tool") == tool_name
+                and event.get("status") == "success"
+                and needle
+                and needle in (
+                    json.dumps(event.get("args") or {}, default=str)
+                    + str(event.get("result", ""))
+                )
+                for event in getattr(self, "_tool_events", [])
+            )
+            if not matched:
+                problems.append(
+                    f"assumption {claim!r} claims verification via "
+                    f"{verified_by!r}, but no successful {tool_name!r} tool "
+                    "event containing that evidence exists this turn"
+                )
+        return problems
+
+    def _plan_file_evidence_problem(self, canonical_plan):
+        """Reject uninspected nonexistent local targets unless creation is explicit."""
+        try:
+            payload = json.loads(canonical_plan)
+        except (TypeError, ValueError):
+            return None
+
+        files = payload.get("files")
+        steps = payload.get("steps")
+        if not isinstance(files, list) or not isinstance(steps, list):
+            return None
+
+        workdir = os.path.normpath(self.workdir)
+        read_paths = {
+            os.path.normpath(path)
+            for path in getattr(self, "_read_paths_this_turn", set())
+        }
+
+        declared_local = []
+
+        for declared in files:
+            if not isinstance(declared, str) or not declared.strip():
+                continue
+
+            resolved = os.path.normpath(_resolve(declared, self.workdir))
+            try:
+                inside_workdir = (
+                    os.path.commonpath([workdir, resolved]) == workdir
+                )
+            except ValueError:
+                inside_workdir = False
+
+            if not inside_workdir:
+                continue
+
+            declared_local.append((declared, resolved))
+
+            if resolved in read_paths:
+                continue
+
+            if os.path.exists(resolved):
+                return (
+                    f"files contains existing local path {declared!r} "
+                    "that was not inspected with read_file this turn"
+                )
+
+            basename = os.path.basename(resolved)
+            basename_pattern = re.escape(basename)
+            explicit_creation = any(
+                isinstance(step, str)
+                and (
+                    re.search(
+                        r"\b(?:create|generate|introduce)\b.{0,160}"
+                        + basename_pattern,
+                        step,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    or re.search(
+                        basename_pattern
+                        + r".{0,100}\b(?:new\s+file|from\s+scratch)\b",
+                        step,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                )
+                for step in steps
+            )
+            if explicit_creation:
+                continue
+
+            same_directory_candidates = {
+                path
+                for path in read_paths
+                if os.path.dirname(path) == os.path.dirname(resolved)
+            }
+            try:
+                same_directory_candidates.update(
+                    os.path.normpath(
+                        os.path.join(os.path.dirname(resolved), name)
+                    )
+                    for name in os.listdir(os.path.dirname(resolved))
+                )
+            except OSError:
+                pass
+
+            likely_target = None
+            likely_ratio = 0.0
+            for path in same_directory_candidates:
+                ratio = SequenceMatcher(
+                    None,
+                    basename.lower(),
+                    os.path.basename(path).lower(),
+                ).ratio()
+                if ratio > likely_ratio:
+                    likely_target = path
+                    likely_ratio = ratio
+
+            if likely_target is not None and likely_ratio >= 0.80:
+                return (
+                    f"files contains nonexistent local path {declared!r}; "
+                    f"the inspected file "
+                    f"{os.path.relpath(likely_target, self.workdir)!r} "
+                    "looks like the intended target"
+                )
+
+            # Absence alone is not evidence of a bad Plan target. It may be
+            # a legitimate new file, and mocked or incomplete discovery may
+            # provide no inspected comparison. Reject only when a similarly
+            # named file was actually read this turn.
+            continue
+
+        semantic_problems = self._plan_unverified_assumptions(payload)
+
+        local_web_required = bool(
+            PLAN_LOCAL_WEB_RE.search(
+                "\n".join(
+                    [
+                        str(payload.get("objective", "")),
+                        *[
+                            step
+                            for step in steps
+                            if isinstance(step, str)
+                        ],
+                    ]
+                )
+            )
+            or any(
+                isinstance(path, str)
+                and os.path.splitext(path)[1].lower()
+                in {".html", ".htm"}
+                for path in files
+            )
+        )
+
+        if local_web_required and self._plan_mode_active():
+            mechanism_ports = {
+                int(match.group("port"))
+                for step in steps
+                if isinstance(step, str)
+                and PLAN_SERVER_MECHANISM_STEP_RE.search(step)
+                for match in PLAN_SERVER_PORT_RE.finditer(step)
+                if 1024 <= int(match.group("port")) <= 65535
+            }
+            reuse_ports = {
+                int(match.group("port"))
+                for step in steps
+                if isinstance(step, str)
+                and PLAN_SERVER_REUSE_STEP_RE.search(step)
+                for match in (
+                    list(PLAN_SERVER_PORT_RE.finditer(step))
+                    + list(PLAN_PLAIN_PORT_RE.finditer(step))
+                )
+                if 1024 <= int(match.group("port")) <= 65535
+            }
+            server_ports = sorted(mechanism_ports | reuse_ports)
+
+            if not server_ports:
+                semantic_problems.append(
+                    "local webpage plans must include a concrete numeric "
+                    "unprivileged server port that can be verified against "
+                    "listening_ports evidence"
+                )
+            else:
+                # A port a reuse step names, and that a real HTTP fetch
+                # this turn already hit successfully, doesn't need fresh
+                # listening_ports evidence — a live, working response is
+                # stronger proof the port is correct than a generic
+                # "currently unused" listing, and "unused" would in fact
+                # be the wrong thing to prove: the whole point of reuse
+                # is that the port is already in use, by this project.
+                verified_reuse_ports = reuse_ports & self._plan_reuse_evidence_ports()
+                ports_needing_listening_evidence = [
+                    port for port in server_ports
+                    if port not in verified_reuse_ports
+                ]
+
+                if ports_needing_listening_evidence:
+                    successful_port_events = [
+                        event
+                        for event in getattr(self, "_tool_events", [])
+                        if (
+                            event.get("tool") == "listening_ports"
+                            and event.get("status") == "success"
+                            and isinstance(event.get("result"), str)
+                        )
+                    ]
+
+                    if not successful_port_events:
+                        semantic_problems.append(
+                            "local webpage plan requires listening_ports evidence "
+                            "this turn before selecting server port(s): "
+                            + ", ".join(
+                                str(port)
+                                for port in ports_needing_listening_evidence
+                            )
+                        )
+                    else:
+                        suggested_ports = set()
+
+                        for event in successful_port_events:
+                            match = PLAN_UNUSED_PORTS_RESULT_RE.search(
+                                event["result"]
+                            )
+
+                            if match is None:
+                                continue
+
+                            if match.group("ports").strip().lower() == "none":
+                                continue
+
+                            suggested_ports.update(
+                                int(value)
+                                for value in re.findall(
+                                    r"\b\d{2,5}\b",
+                                    match.group("ports"),
+                                )
+                                if 1024 <= int(value) <= 65535
+                            )
+
+                        unsupported_ports = [
+                            port
+                            for port in ports_needing_listening_evidence
+                            if port not in suggested_ports
+                        ]
+
+                        if unsupported_ports:
+                            suggested_text = (
+                                ", ".join(
+                                    str(port)
+                                    for port in sorted(suggested_ports)
+                                )
+                                if suggested_ports
+                                else "none"
+                            )
+                            semantic_problems.append(
+                                "local webpage plans must use a server port "
+                                "listed as currently unused by listening_ports "
+                                "this turn; selected port(s): "
+                                + ", ".join(
+                                    str(port)
+                                    for port in unsupported_ports
+                                )
+                                + "; suggested currently-unused port(s): "
+                                + suggested_text
+                            )
+
+        step_text = "\n".join(
+            step for step in steps
+            if isinstance(step, str)
+        )
+
+        referenced_declared = set()
+        for declared, resolved in declared_local:
+            basename = os.path.basename(resolved)
+            token_pattern = (
+                r"(?<![A-Za-z0-9_.-])"
+                + re.escape(basename)
+                + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])"
+            )
+            if (
+                re.search(token_pattern, step_text, re.IGNORECASE)
+                or declared in step_text
+                or resolved in step_text
+            ):
+                referenced_declared.add(resolved)
+
+        if referenced_declared:
+            unreferenced = [
+                declared
+                for declared, resolved in declared_local
+                if resolved not in referenced_declared
+            ]
+            if unreferenced:
+                semantic_problems.append(
+                    "files contains declared path(s) with no implementation "
+                    "step reference: "
+                    + ", ".join(repr(path) for path in unreferenced)
+                )
+
+        dependency_action_re = re.compile(
+            r"\b(?:add|create|delete|fix|generate|implement|remove|"
+            r"replace|restore|update|write)\b",
+            re.IGNORECASE,
+        )
+        dependency_ref_re = re.compile(
+            r"\b(?:src|href)\s*=\s*[\"']([^\"']+)[\"']",
+            re.IGNORECASE,
+        )
+
+        for declared, resolved in declared_local:
+            if (
+                resolved not in read_paths
+                or not os.path.isfile(resolved)
+                or os.path.splitext(resolved)[1].lower() not in {
+                    ".html",
+                    ".htm",
+                }
+            ):
+                continue
+
+            try:
+                with open(resolved, "r", errors="replace") as handle:
+                    html = handle.read()
+            except OSError:
+                continue
+
+            for raw_reference in dependency_ref_re.findall(html):
+                reference = raw_reference.split("#", 1)[0]
+                reference = reference.split("?", 1)[0].strip()
+
+                if (
+                    not reference
+                    or reference.startswith("//")
+                    or re.match(
+                        r"^[A-Za-z][A-Za-z0-9+.-]*:",
+                        reference,
+                    )
+                ):
+                    continue
+
+                if reference.startswith("/"):
+                    dependency = os.path.normpath(
+                        os.path.join(
+                            workdir,
+                            reference.lstrip("/"),
+                        )
+                    )
+                else:
+                    dependency = os.path.normpath(
+                        os.path.join(
+                            os.path.dirname(resolved),
+                            reference,
+                        )
+                    )
+
+                if os.path.splitext(dependency)[1].lower() not in {
+                    ".css",
+                    ".js",
+                    ".mjs",
+                    ".cjs",
+                }:
+                    continue
+
+                if os.path.exists(dependency):
+                    continue
+
+                dependency_name = os.path.basename(dependency)
+                dependency_pattern = re.compile(
+                    r"(?<![A-Za-z0-9_.-])"
+                    + re.escape(dependency_name)
+                    + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+                    re.IGNORECASE,
+                )
+                dependency_addressed = any(
+                    isinstance(step, str)
+                    and dependency_pattern.search(step)
+                    and dependency_action_re.search(step)
+                    for step in steps
+                )
+
+                if dependency_addressed:
+                    continue
+
+                problem = (
+                    f"inspected HTML file {declared!r} references missing "
+                    f"local dependency {reference!r}, but no implementation "
+                    "step creates, removes, replaces, or otherwise resolves it"
+                )
+                if problem not in semantic_problems:
+                    semantic_problems.append(problem)
+
+        for declared, resolved in declared_local:
+            if (
+                resolved not in read_paths
+                or not os.path.isfile(resolved)
+                or os.path.splitext(resolved)[1].lower() != ".css"
+            ):
+                continue
+
+            try:
+                with open(
+                    resolved,
+                    "r",
+                    errors="replace",
+                ) as handle:
+                    css_text = handle.read()
+            except OSError:
+                continue
+
+            existing_classes = set(
+                re.findall(
+                    r"(?<![A-Za-z0-9_-])"
+                    r"\.([A-Za-z_][A-Za-z0-9_-]*)",
+                    css_text,
+                )
+            )
+            if not existing_classes:
+                continue
+
+            basename = os.path.basename(resolved)
+            file_pattern = re.compile(
+                r"(?<![A-Za-z0-9_.-])"
+                + re.escape(basename)
+                + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+                re.IGNORECASE,
+            )
+
+            for step in steps:
+                if not isinstance(step, str):
+                    continue
+                if not (
+                    file_pattern.search(step)
+                    or declared in step
+                    or resolved in step
+                ):
+                    continue
+                if not re.search(
+                    r"\b(?:add|create|define|introduce)\b"
+                    r".{0,100}\b(?:css\s+)?class(?:es)?\b",
+                    step,
+                    re.IGNORECASE | re.DOTALL,
+                ):
+                    continue
+
+                step_tokens = {
+                    token[:-1] if token.endswith("s") else token
+                    for token in re.findall(
+                        r"[A-Za-z0-9]+",
+                        step.lower(),
+                    )
+                }
+                claimed_existing = []
+                for class_name in sorted(existing_classes):
+                    class_tokens = {
+                        token[:-1] if token.endswith("s") else token
+                        for token in re.findall(
+                            r"[A-Za-z0-9]+",
+                            class_name.lower(),
+                        )
+                    }
+                    if class_tokens and class_tokens.issubset(step_tokens):
+                        claimed_existing.append(class_name)
+
+                if claimed_existing:
+                    semantic_problems.append(
+                        f"implementation step claims to add CSS class(es) "
+                        f"already present in inspected file {declared!r}: "
+                        + ", ".join(
+                            repr(class_name)
+                            for class_name in claimed_existing
+                        )
+                        + "; reuse or modify the existing definitions "
+                        "instead of duplicating them"
+                    )
+
+        validation = payload.get("validation")
+        validation_text = ""
+        if isinstance(validation, list):
+            validation_text = "\n".join(
+                str(check.get("command", ""))
+                for check in validation
+                if isinstance(check, dict)
+            )
+
+        declared_resolved = {
+            resolved
+            for _declared, resolved in declared_local
+        }
+
+        if isinstance(validation, list):
+            import shlex
+
+            for check in validation:
+                if not isinstance(check, dict):
+                    continue
+
+                command = check.get("command")
+                if not isinstance(command, str):
+                    continue
+
+                try:
+                    tokens = shlex.split(command)
+                except ValueError:
+                    continue
+
+                clauses = []
+                clause = []
+                for token in tokens:
+                    if token in {"&&", "||", ";"}:
+                        if clause:
+                            clauses.append(clause)
+                        clause = []
+                    else:
+                        clause.append(token)
+                if clause:
+                    clauses.append(clause)
+
+                for clause in clauses:
+                    if (
+                        not clause
+                        or os.path.basename(clause[0]) != "grep"
+                    ):
+                        continue
+
+                    index = 1
+                    options = []
+                    while (
+                        index < len(clause)
+                        and clause[index].startswith("-")
+                    ):
+                        options.append(clause[index])
+                        index += 1
+
+                    if len(clause) - index < 2:
+                        continue
+
+                    pattern = clause[index]
+                    targets = clause[index + 1:]
+                    fixed = any(
+                        "F" in option[1:]
+                        for option in options
+                    )
+                    exact_line = any(
+                        "x" in option[1:]
+                        for option in options
+                    )
+
+                    for target in targets:
+                        resolved_target = os.path.normpath(
+                            _resolve(target, self.workdir)
+                        )
+
+                        try:
+                            inside_workdir = (
+                                os.path.commonpath(
+                                    [workdir, resolved_target]
+                                )
+                                == workdir
+                            )
+                        except ValueError:
+                            inside_workdir = False
+
+                        if (
+                            not inside_workdir
+                            or resolved_target in declared_resolved
+                            or not os.path.isfile(resolved_target)
+                        ):
+                            continue
+
+                        try:
+                            with open(
+                                resolved_target,
+                                "r",
+                                errors="replace",
+                            ) as handle:
+                                current_text = handle.read()
+                        except OSError:
+                            continue
+
+                        if fixed:
+                            if exact_line:
+                                matched = pattern in current_text.splitlines()
+                            else:
+                                matched = pattern in current_text
+                        else:
+                            try:
+                                expression = re.compile(pattern)
+                            except re.error:
+                                continue
+
+                            if exact_line:
+                                matched = any(
+                                    expression.fullmatch(line)
+                                    for line in current_text.splitlines()
+                                )
+                            else:
+                                matched = any(
+                                    expression.search(line)
+                                    for line in current_text.splitlines()
+                                )
+
+                        if not matched:
+                            candidate_tokens = {
+                                token.lower()
+                                for token in re.findall(
+                                    r"[A-Za-z][A-Za-z0-9_-]{3,}",
+                                    pattern,
+                                )
+                            }
+                            candidate_lines = []
+                            for current_line in current_text.splitlines():
+                                literal = current_line.strip()
+                                if not literal:
+                                    continue
+                                lowered = literal.lower()
+                                if candidate_tokens and any(
+                                    token in lowered
+                                    for token in candidate_tokens
+                                ):
+                                    if literal not in candidate_lines:
+                                        candidate_lines.append(literal)
+                                if len(candidate_lines) >= 5:
+                                    break
+
+                            candidate_hint = ""
+                            if candidate_lines:
+                                candidate_hint = (
+                                    "; exact inspected candidate literals "
+                                    "include: "
+                                    + " | ".join(
+                                        repr(line)
+                                        for line in candidate_lines
+                                    )
+                                )
+
+                            return (
+                                "validation command asserts missing content "
+                                f"{pattern!r} in unchanged local file "
+                                f"{target!r}; either validate its actual "
+                                "inspected content or declare and implement "
+                                "an in-scope change to that file"
+                                + candidate_hint
+                            )
+
+        javascript_targets = [
+            resolved
+            for _declared, resolved in declared_local
+            if os.path.splitext(resolved)[1].lower()
+            in {".js", ".mjs", ".cjs"}
+        ]
+        interactive_javascript = bool(
+            javascript_targets
+            and re.search(
+                r"\b(?:button|click|event|theme|toggle)\b",
+                step_text,
+                re.IGNORECASE,
+            )
+        )
+
+        if interactive_javascript:
+            inspected_html_ids = set()
+            inspected_state_classes = set()
+            inspected_transition_literals = set()
+
+            declared_directories = {
+                os.path.dirname(resolved)
+                for _declared, resolved in declared_local
+            }
+            evidence_paths = sorted(
+                path
+                for path in read_paths
+                if os.path.dirname(path) in declared_directories
+                and os.path.isfile(path)
+            )
+
+            for resolved in evidence_paths:
+                extension = os.path.splitext(resolved)[1].lower()
+                if extension not in {".html", ".htm", ".css"}:
+                    continue
+
+                try:
+                    with open(
+                        resolved,
+                        "r",
+                        errors="replace",
+                    ) as handle:
+                        inspected_text = handle.read()
+                except OSError:
+                    continue
+
+                if extension in {".html", ".htm"}:
+                    for control_match in re.finditer(
+                        r"<(?:button|input|select|textarea|summary)\b"
+                        r"(?P<attributes>[^>]*)>",
+                        inspected_text,
+                        re.IGNORECASE | re.DOTALL,
+                    ):
+                        identifier_match = re.search(
+                            r"\bid\s*=\s*[\"']([^\"']+)[\"']",
+                            control_match.group("attributes"),
+                            re.IGNORECASE,
+                        )
+                        if identifier_match is not None:
+                            inspected_html_ids.add(
+                                identifier_match.group(1)
+                            )
+                else:
+                    inspected_state_classes.update(
+                        name
+                        for name in re.findall(
+                            r"(?<![A-Za-z0-9_-])"
+                            r"\.([A-Za-z_][A-Za-z0-9_-]*)",
+                            inspected_text,
+                        )
+                        if re.search(
+                            r"(?:mode|theme|active|open|selected|hidden)",
+                            name,
+                            re.IGNORECASE,
+                        )
+                    )
+
+                    if re.search(
+                        r"--transition-speed\s*:",
+                        inspected_text,
+                        re.IGNORECASE,
+                    ):
+                        inspected_transition_literals.add(
+                            "--transition-speed:"
+                        )
+
+                    if re.search(
+                        r"(?<![A-Za-z0-9_-])transition\s*:",
+                        inspected_text,
+                        re.IGNORECASE,
+                    ):
+                        inspected_transition_literals.add(
+                            "transition:"
+                        )
+
+            semantic_context = "\n".join(
+                [str(payload.get("objective", "")), step_text]
+            ).lower()
+            smooth_transition_required = bool(
+                re.search(
+                    r"\bsmooth(?:ly)?\b.{0,40}"
+                    r"\btransition(?:s|ing)?\b|"
+                    r"\btransition(?:s|ing)?\b.{0,40}"
+                    r"\bsmooth(?:ly)?\b",
+                    semantic_context,
+                    re.IGNORECASE | re.DOTALL,
+                )
+            )
+
+            def relevant_integration_name(name):
+                normalized = re.sub(
+                    r"[-_]+",
+                    " ",
+                    str(name).lower(),
+                )
+                tokens = re.findall(r"[a-z0-9]+", normalized)
+                return bool(tokens) and all(
+                    token in semantic_context
+                    for token in tokens
+                )
+
+            relevant_html_ids = {
+                identifier
+                for identifier in inspected_html_ids
+                if relevant_integration_name(identifier)
+            }
+            relevant_state_classes = {
+                class_name
+                for class_name in inspected_state_classes
+                if relevant_integration_name(class_name)
+            }
+
+            if relevant_html_ids:
+                inspected_html_ids = relevant_html_ids
+            if relevant_state_classes:
+                inspected_state_classes = relevant_state_classes
+
+            if inspected_html_ids or inspected_state_classes:
+                def validation_commands_for_target(target):
+                    basename = os.path.basename(target)
+                    target_pattern = re.compile(
+                        r"(?<![A-Za-z0-9_.-])"
+                        + re.escape(basename)
+                        + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+                        re.IGNORECASE,
+                    )
+                    return [
+                        command
+                        for check in validation
+                        if isinstance(check, dict)
+                        for command in [check.get("command")]
+                        if (
+                            isinstance(command, str)
+                            and (
+                                target in command
+                                or target_pattern.search(command)
+                            )
+                        )
+                    ]
+
+                event_binding_re = re.compile(
+                    r"\b(?:addEventListener|onclick|onchange|oninput)\b",
+                    re.IGNORECASE,
+                )
+
+                integration_validated = False
+                for javascript_target in javascript_targets:
+                    target_validation_text = "\n".join(
+                        validation_commands_for_target(
+                            javascript_target
+                        )
+                    )
+                    if not target_validation_text:
+                        continue
+
+                    controls_validated = (
+                        not inspected_html_ids
+                        or all(
+                            identifier in target_validation_text
+                            for identifier in inspected_html_ids
+                        )
+                    )
+                    event_validated = bool(
+                        event_binding_re.search(
+                            target_validation_text
+                        )
+                    )
+                    states_validated = (
+                        not inspected_state_classes
+                        or all(
+                            class_name in target_validation_text
+                            for class_name in inspected_state_classes
+                        )
+                    )
+
+                    if (
+                        controls_validated
+                        and event_validated
+                        and states_validated
+                    ):
+                        integration_validated = True
+                        break
+
+                if not integration_validated:
+                    required_checks = []
+                    if inspected_html_ids:
+                        required_checks.append(
+                            "the inspected HTML control identifier(s) "
+                            + ", ".join(
+                                repr(identifier)
+                                for identifier in sorted(
+                                    inspected_html_ids
+                                )
+                            )
+                        )
+                    required_checks.append(
+                        "an event-binding mechanism "
+                        "(addEventListener, onclick, onchange, or oninput)"
+                    )
+                    if inspected_state_classes:
+                        required_checks.append(
+                            "the inspected CSS state class(es) "
+                            + ", ".join(
+                                repr(class_name)
+                                for class_name in sorted(
+                                    inspected_state_classes
+                                )
+                            )
+                        )
+
+                    semantic_problems.append(
+                        "interactive JavaScript validation must verify "
+                        + ", ".join(required_checks)
+                        + " in validation command(s) targeting the same "
+                        "declared JavaScript file; checking HTML, CSS, a "
+                        "function, or a file separately does not prove the "
+                        "control is connected"
+                    )
+
+                inspected_css_targets = [
+                    resolved
+                    for _declared, resolved in declared_local
+                    if (
+                        os.path.splitext(resolved)[1].lower() == ".css"
+                        and resolved in read_paths
+                        and os.path.isfile(resolved)
+                    )
+                ]
+                missing_exact_selectors = []
+
+                for class_name in sorted(inspected_state_classes):
+                    selector = f".{class_name} {{"
+                    selector_validated = any(
+                        selector
+                        in "\n".join(
+                            validation_commands_for_target(css_target)
+                        )
+                        for css_target in inspected_css_targets
+                    )
+                    if not selector_validated:
+                        missing_exact_selectors.append(selector)
+
+                if missing_exact_selectors:
+                    semantic_problems.append(
+                        "interactive JavaScript validation must verify the "
+                        "exact inspected CSS selector literal(s) "
+                        + ", ".join(
+                            repr(selector)
+                            for selector in missing_exact_selectors
+                        )
+                        + " in validation command(s) targeting the "
+                        "inspected CSS file"
+                    )
+
+                if (
+                    smooth_transition_required
+                    and inspected_transition_literals
+                ):
+                    transition_validation_text = "\n".join(
+                        command
+                        for css_target in inspected_css_targets
+                        for command in validation_commands_for_target(
+                            css_target
+                        )
+                    )
+
+                    missing_transition_literals = [
+                        literal
+                        for literal in sorted(
+                            inspected_transition_literals
+                        )
+                        if literal not in transition_validation_text
+                    ]
+
+                    if missing_transition_literals:
+                        semantic_problems.append(
+                            "interactive JavaScript validation must verify "
+                            "smooth-transition CSS evidence using the exact "
+                            "inspected CSS literal(s) "
+                            + ", ".join(
+                                repr(literal)
+                                for literal
+                                in missing_transition_literals
+                            )
+                            + " in validation command(s) targeting the "
+                            "inspected CSS file"
+                        )
+
+        if semantic_problems:
+            return "; ".join(semantic_problems)
+
+        return None
+
     def _plan_required_for_request(self, user_input):
         """Return True only for a concrete request to change something."""
         if self._is_direct_note_recall_request(user_input):
@@ -1914,12 +3938,102 @@ class Agent:
 
         return bool(
             PLAN_ACTION_REQUEST_RE.search(user_input or "")
+            or ACTION_FOLLOWUP_REQUEST_RE.search(user_input or "")
             or _parse_explicit_ssh_command(user_input) is not None
             or self._parse_schedule_request(user_input) is not None
             or _parse_cancel_routine_target(user_input) is not None
             or _parse_remember_content(user_input) is not None
             or _parse_forget_target(user_input) is not None
             or self._is_direct_image_request(user_input)
+        )
+
+    @staticmethod
+    def _has_successful_tool_event(events):
+        return any(
+            isinstance(event, dict) and event.get("status") == "success"
+            for event in events or []
+        )
+
+    @staticmethod
+    def _successful_plan_action_event(
+        event,
+        *,
+        require_mutating_shell=False,
+    ):
+        if (
+            not isinstance(event, dict)
+            or event.get("status") != "success"
+        ):
+            return False
+
+        tool = event.get("tool")
+
+        if tool in PLAN_MODE_ALLOWED_TOOLS:
+            return False
+
+        if tool in {"run_shell_command", "ssh_run_command"}:
+            if not require_mutating_shell:
+                return True
+
+            args = event.get("args")
+            command = (
+                args.get("command", "")
+                if isinstance(args, dict)
+                else ""
+            )
+            return bool(PLAN_MUTATING_SHELL_RE.search(command))
+
+        return tool in PLAN_PROGRESS_ACTION_TOOLS
+
+    @classmethod
+    def _has_successful_plan_step_progress(
+        cls,
+        step,
+        events,
+    ):
+        if not PLAN_STEP_ACTION_RE.search(step or ""):
+            return cls._has_successful_tool_event(events)
+
+        require_mutating_shell = bool(
+            PLAN_STEP_FILE_MUTATION_RE.search(step or "")
+            and PLAN_CONCRETE_FILE_RE.search(step or "")
+        )
+
+        return any(
+            cls._successful_plan_action_event(
+                event,
+                require_mutating_shell=require_mutating_shell,
+            )
+            for event in events or []
+        )
+
+    @classmethod
+    def _has_successful_plan_repair_progress(cls, events):
+        return any(
+            cls._successful_plan_action_event(
+                event,
+                require_mutating_shell=True,
+            )
+            for event in events or []
+        )
+
+    def _response_requires_real_tool(self, user_input, content):
+        user_input = user_input or ""
+        content = content or ""
+
+        if self._plan_mode_active():
+            return False
+
+        if user_input.lstrip().startswith(APPROVED_PLAN_STEP_PREFIXES):
+            return True
+
+        if not self._plan_required_for_request(user_input):
+            return False
+
+        return bool(
+            SUCCESS_CLAIM_RE.search(content)
+            or ACTION_PROMISE_RE.search(content)
+            or INERT_ACTION_CODE_RE.search(content)
         )
 
     @staticmethod
@@ -3063,6 +5177,35 @@ class Agent:
                         )
                     )
 
+                    if not self._has_successful_plan_step_progress(
+                        payload["steps"][step_number],
+                        self._tool_events,
+                    ):
+                        signature = "no_qualifying_plan_progress_event"
+                        if signature == repeated_signature:
+                            repeated_count += 1
+                        else:
+                            repeated_signature = signature
+                            repeated_count = 1
+
+                        if (
+                            repeated_count
+                            >= PLAN_EXECUTION_NO_PROGRESS_LIMIT
+                        ):
+                            return self._fail_running_plan(
+                                plan_id,
+                                "the implementation step produced no "
+                                "qualifying Plan progress event in three "
+                                "consecutive attempts. Model prose is not "
+                                "execution.",
+                            )
+
+                        self.on_status(
+                            "  [approved plan step produced no qualifying "
+                            "Plan progress event; retrying the same step...]"
+                        )
+                        continue
+
                     if not self._plan_reply_hit_cycle_limit(reply):
                         completed_steps.append(step)
                         break
@@ -3150,12 +5293,43 @@ class Agent:
                 if self._plan_cancel_requested(cancel_event):
                     return self._cancel_running_plan(plan_id)
 
-                self.step(
-                    self._plan_repair_prompt(
-                        payload,
-                        validation_results,
+                repair_no_progress_count = 0
+
+                while True:
+                    if self._plan_cancel_requested(cancel_event):
+                        return self._cancel_running_plan(plan_id)
+
+                    self.step(
+                        self._plan_repair_prompt(
+                            payload,
+                            validation_results,
+                        )
                     )
-                )
+
+                    if self._has_successful_plan_repair_progress(
+                        self._tool_events
+                    ):
+                        break
+
+                    repair_no_progress_count += 1
+
+                    if (
+                        repair_no_progress_count
+                        >= PLAN_EXECUTION_NO_PROGRESS_LIMIT
+                    ):
+                        return self._fail_running_plan(
+                            plan_id,
+                            "the validation repair produced no "
+                            "successful corrective action event in three "
+                            "consecutive attempts. Model prose is not "
+                            "execution.",
+                        )
+
+                    self.on_status(
+                        "  [approved plan validation repair produced no "
+                        "successful corrective action event; retrying the "
+                        "same repair...]"
+                    )
 
                 self.on_status(
                     "  [approved plan validation still fails; "
@@ -3171,7 +5345,7 @@ class Agent:
 
     def _capture_plan_draft(self, content):
         """Validate and store a complete Plan-mode proposal as a draft."""
-        if not getattr(self, "plan_mode", False) or getattr(self, "session_id", None) is None:
+        if not self._plan_mode_active() or getattr(self, "session_id", None) is None:
             return content
 
         if isinstance(content, str):
@@ -3181,6 +5355,30 @@ class Agent:
             content = PLAN_HOST_NOTICE_RE.sub("", content).rstrip()
 
         canonical, error = _extract_plan_draft(content)
+        if (
+            error is None
+            and canonical is not None
+            and hasattr(self, "workdir")
+        ):
+            content, canonical, error = (
+                self._normalize_plan_transition_validation(
+                    content,
+                    canonical,
+                )
+            )
+
+        if error is None and canonical is not None:
+            replacement = (
+                "```liam-plan\n"
+                + canonical
+                + "\n```"
+            )
+            content = PLAN_BLOCK_RE.sub(
+                lambda _match: replacement,
+                content,
+                count=1,
+            )
+
         if error:
             updated = f"{content}\n\n[Plan draft not saved: {error}.]"
         elif canonical is None:
@@ -3415,6 +5613,7 @@ class Agent:
         # database rows existed.
         if isinstance(content, str):
             content = MODEL_LEARNING_NOTICE_RE.sub("", content).rstrip()
+            content = FAKE_LESSON_ESSAY_RE.sub("", content).rstrip()
         content = ensure_visible_reply(
             content, stage="finalizing the answer", tool_events=self._tool_events,
         )
@@ -3439,6 +5638,11 @@ class Agent:
         self._tool_events = []
         self._lesson_uses = []
         self._current_user_input = user_input
+        self._turn_plan_mode = bool(
+            not getattr(self, "plan_mode", False)
+            and self._is_explicit_plan_request(user_input)
+        )
+        turn_plan_mode = self._plan_mode_active()
         previous_answer = next(
             (
                 message.get("content", "") for message in reversed(self.messages)
@@ -3465,7 +5669,17 @@ class Agent:
         # plain text instead of a real structured tool call). self.messages
         # itself is never mutated, so this never bloats persisted history
         # or leaks into the next turn's fresh call.
-        available_tools = {schema["function"]["name"] for schema in self.tool_schemas}
+        turn_tool_schemas = self.tool_schemas
+        if getattr(self, "_turn_plan_mode", False):
+            turn_tool_schemas = [
+                schema
+                for schema in self.tool_schemas
+                if schema["function"]["name"] in PLAN_MODE_ALLOWED_TOOLS
+            ]
+        available_tools = {
+            schema["function"]["name"]
+            for schema in turn_tool_schemas
+        }
         lesson_hits = memory.match_lesson_records(
             user_input, workspace=self.workdir, channel=self.channel,
             available_tools=available_tools, limit=3,
@@ -3480,7 +5694,7 @@ class Agent:
 
         tool_results = []
         plan_required = (
-            getattr(self, "plan_mode", False)
+            turn_plan_mode
             and self._plan_required_for_request(user_input)
         )
 
@@ -3643,6 +5857,14 @@ class Agent:
         recovery_attempted = False
         plan_recovery_attempts = 0
         plan_recovery_limit = 2
+        plan_evidence_recovery_attempts = 0
+        plan_evidence_recovery_limit = 1
+        plan_post_evidence_recovery_attempts = 0
+        plan_post_evidence_recovery_limit = 1
+        plan_target_recovery_attempts = 0
+        plan_target_recovery_limit = 1
+        plan_post_target_recovery_attempts = 0
+        plan_post_target_recovery_limit = 1
         recovery_instruction = None
         recovery_tool_schemas = None
         recovery_response_format = None
@@ -3655,11 +5877,29 @@ class Agent:
                 chat_tools = recovery_tool_schemas
             else:
                 chat_messages = self.messages
-                chat_tools = self.tool_schemas
-            if hint_text and not recovery_instruction:
+                chat_tools = turn_tool_schemas
+            if not recovery_instruction and (
+                hint_text or getattr(self, "_turn_plan_mode", False)
+            ):
                 chat_messages = list(self.messages)
                 hinted = dict(chat_messages[user_message_index])
-                hinted["content"] = f"{hinted['content']}\n\n[Relevant lessons from past mistakes:\n{hint_text}]"
+                additions = []
+                if hint_text:
+                    additions.append(
+                        "[Relevant lessons from past mistakes:\n"
+                        f"{hint_text}]"
+                    )
+                if getattr(self, "_turn_plan_mode", False):
+                    additions.append(
+                        "[For this request only, Plan mode is active. "
+                        "Follow these instructions without changing the "
+                        "thread's saved mode:\n"
+                        f"{PLAN_MODE_SYSTEM_PROMPT.strip()}]"
+                    )
+                hinted["content"] = (
+                    f"{hinted['content']}\n\n"
+                    + "\n\n".join(additions)
+                )
                 chat_messages[user_message_index] = hinted
             message = self._chat(
                 chat_messages,
@@ -3704,14 +5944,100 @@ class Agent:
             protocol_problem = self._tool_call_protocol_problem(message)
             content = message.get("content", "")
             plan_draft_problem = None
+            plan_evidence_recovery_needed = False
+            plan_target_recovery_needed = False
+            plan_post_evidence_recovery_needed = False
+            plan_post_target_recovery_needed = False
 
             if (
-                getattr(self, "plan_mode", False)
+                self._plan_mode_active()
                 and not tool_calls
                 and isinstance(content, str)
             ):
                 canonical_plan, plan_draft_problem = (
                     _extract_plan_draft(content)
+                )
+                file_evidence_problem = None
+                if canonical_plan is not None:
+                    original_content = content
+                    (
+                        content,
+                        canonical_plan,
+                        file_evidence_problem,
+                    ) = self._normalize_plan_transition_validation(
+                        content,
+                        canonical_plan,
+                    )
+                    if content != original_content:
+                        message = dict(message)
+                        message["content"] = content
+                        self.messages[-1] = message
+
+                    if (
+                        file_evidence_problem
+                        and (
+                            "requires listening_ports evidence this turn"
+                            in file_evidence_problem
+                        )
+                        and any(
+                            schema["function"]["name"]
+                            == "listening_ports"
+                            for schema in turn_tool_schemas
+                        )
+                    ):
+                        port_args = {}
+                        self.on_tool_call(
+                            "listening_ports",
+                            port_args,
+                        )
+                        self._execute_tool(
+                            "listening_ports",
+                            port_args,
+                        )
+                        file_evidence_problem = (
+                            self._plan_file_evidence_problem(
+                                canonical_plan
+                            )
+                        )
+
+                    if plan_draft_problem is None:
+                        plan_draft_problem = file_evidence_problem
+                    elif (
+                        file_evidence_problem
+                        and "not inspected with read_file this turn"
+                        in file_evidence_problem
+                    ):
+                        # Gather required repository evidence before spending
+                        # another formatting correction. Preserve the original
+                        # semantic validator; it will run again after the reads.
+                        plan_draft_problem = file_evidence_problem
+                    elif (
+                        file_evidence_problem
+                        and file_evidence_problem not in plan_draft_problem
+                    ):
+                        # Once required evidence exists, report extraction and
+                        # repository-semantic defects together so one bounded
+                        # correction can address every detectable problem.
+                        plan_draft_problem = (
+                            f"{plan_draft_problem}; "
+                            f"{file_evidence_problem}"
+                        )
+
+                plan_evidence_recovery_needed = bool(
+                    plan_draft_problem
+                    and (
+                        "not inspected with read_file this turn"
+                        in plan_draft_problem
+                        or (
+                            "requires listening_ports evidence this turn"
+                            in plan_draft_problem
+                        )
+                    )
+                )
+                plan_target_recovery_needed = bool(
+                    plan_draft_problem
+                    and "looks like the intended target"
+                    in plan_draft_problem
                 )
                 if (
                     canonical_plan is None
@@ -3722,6 +6048,22 @@ class Agent:
                         "missing required liam-plan block"
                     )
 
+                plan_post_evidence_recovery_needed = bool(
+                    plan_draft_problem
+                    and not plan_evidence_recovery_needed
+                    and not plan_target_recovery_needed
+                    and plan_evidence_recovery_attempts > 0
+                    and plan_recovery_attempts >= plan_recovery_limit
+                    and plan_target_recovery_attempts == 0
+                )
+                plan_post_target_recovery_needed = bool(
+                    canonical_plan is not None
+                    and plan_draft_problem
+                    and not plan_evidence_recovery_needed
+                    and not plan_target_recovery_needed
+                    and plan_target_recovery_attempts > 0
+                )
+
             response_problem = None
             next_recovery_instruction = None
             if protocol_problem:
@@ -3731,12 +6073,23 @@ class Agent:
                 response_problem = (
                     f"invalid plan draft: {plan_draft_problem}"
                 )
-                next_recovery_instruction = PLAN_DRAFT_RECOVERY.format(
+                recovery_template = _plan_recovery_template(
+                    plan_draft_problem,
+                    evidence_needed=plan_evidence_recovery_needed,
+                )
+                next_recovery_instruction = recovery_template.format(
                     error=plan_draft_problem,
                     previous_answer=self._truncate_context_text(
                         content,
                         PLAN_RECOVERY_RESPONSE_CHARS,
                     ),
+                )
+                next_recovery_instruction = (
+                    self._with_plan_recovery_evidence(
+                        next_recovery_instruction,
+                        canonical_plan=canonical_plan,
+                        evidence_needed=plan_evidence_recovery_needed,
+                    )
                 )
             elif not tool_calls and not isinstance(content, str):
                 response_problem = (
@@ -3756,37 +6109,184 @@ class Agent:
             ):
                 response_problem = "a capability deflection despite available tools"
                 next_recovery_instruction = TOOL_DEFLECTION_RECOVERY
+            elif (
+                not tool_calls
+                and not tool_results
+                and available_tools
+                and self._response_requires_real_tool(user_input, content)
+            ):
+                response_problem = (
+                    "an action claim or approved Plan response without "
+                    "a real tool call"
+                )
+                next_recovery_instruction = ACTION_TOOL_RECOVERY
 
-            recovery_available = (
-                plan_draft_problem is not None
-                and plan_recovery_attempts < plan_recovery_limit
-            ) or (
-                plan_draft_problem is None
-                and not recovery_attempted
-            )
+            if plan_draft_problem is not None:
+                if plan_evidence_recovery_needed:
+                    recovery_available = (
+                        plan_evidence_recovery_attempts
+                        < plan_evidence_recovery_limit
+                    )
+                elif plan_target_recovery_needed:
+                    recovery_available = (
+                        plan_target_recovery_attempts
+                        < plan_target_recovery_limit
+                    )
+                elif plan_post_evidence_recovery_needed:
+                    recovery_available = (
+                        plan_post_evidence_recovery_attempts
+                        < plan_post_evidence_recovery_limit
+                    )
+                elif plan_post_target_recovery_needed:
+                    recovery_available = (
+                        plan_post_target_recovery_attempts
+                        < plan_post_target_recovery_limit
+                    )
+                else:
+                    recovery_available = (
+                        plan_recovery_attempts < plan_recovery_limit
+                    )
+                plan_recovery_exhausted = not recovery_available
+            else:
+                recovery_available = not recovery_attempted
+                plan_recovery_exhausted = False
 
             if response_problem and recovery_available:
                 self.messages.pop()
                 recovery_instruction = next_recovery_instruction
                 if plan_draft_problem:
-                    # Plan-format correction has its own retry budget so an
-                    # earlier protocol/empty/deflection recovery cannot
-                    # prevent a complete plan from being corrected.
-                    plan_recovery_attempts += 1
-                    recovery_tool_schemas = []
-                    recovery_response_format = PLAN_DRAFT_JSON_SCHEMA
+                    # Formatting correction and required file inspection are
+                    # separate bounded activities. A read-only evidence call
+                    # must not consume a formatting-correction attempt.
+                    if plan_evidence_recovery_needed:
+                        plan_evidence_recovery_attempts += 1
+                        evidence_tool_names = set()
+
+                        if (
+                            "not inspected with read_file this turn"
+                            in plan_draft_problem
+                        ):
+                            evidence_tool_names.add("read_file")
+
+                        if (
+                            "requires listening_ports evidence this turn"
+                            in plan_draft_problem
+                        ):
+                            evidence_tool_names.add("listening_ports")
+
+                        if canonical_plan is not None:
+                            try:
+                                evidence_payload = json.loads(
+                                    canonical_plan
+                                )
+                            except (TypeError, ValueError):
+                                evidence_payload = {}
+
+                            evidence_files = (
+                                evidence_payload.get("files") or []
+                            )
+                            evidence_steps = (
+                                evidence_payload.get("steps") or []
+                            )
+                            evidence_local_web = bool(
+                                PLAN_LOCAL_WEB_RE.search(
+                                    "\n".join(
+                                        [
+                                            str(
+                                                evidence_payload.get(
+                                                    "objective",
+                                                    "",
+                                                )
+                                            ),
+                                            *[
+                                                step
+                                                for step in evidence_steps
+                                                if isinstance(step, str)
+                                            ],
+                                        ]
+                                    )
+                                )
+                                or any(
+                                    isinstance(path, str)
+                                    and os.path.splitext(path)[1].lower()
+                                    in {".html", ".htm"}
+                                    for path in evidence_files
+                                )
+                            )
+
+                            if evidence_local_web:
+                                evidence_tool_names.add(
+                                    "listening_ports"
+                                )
+
+                        recovery_tool_schemas = [
+                            schema
+                            for schema in turn_tool_schemas
+                            if schema["function"]["name"]
+                            in evidence_tool_names
+                        ]
+                        recovery_response_format = None
+                    elif plan_target_recovery_needed:
+                        plan_target_recovery_attempts += 1
+                        recovery_tool_schemas = []
+                        recovery_response_format = PLAN_DRAFT_JSON_SCHEMA
+                    elif plan_post_evidence_recovery_needed:
+                        plan_post_evidence_recovery_attempts += 1
+                        recovery_tool_schemas = []
+                        recovery_response_format = PLAN_DRAFT_JSON_SCHEMA
+                    elif plan_post_target_recovery_needed:
+                        plan_post_target_recovery_attempts += 1
+                        recovery_tool_schemas = []
+                        recovery_response_format = PLAN_DRAFT_JSON_SCHEMA
+                    else:
+                        plan_recovery_attempts += 1
+                        recovery_tool_schemas = []
+                        recovery_response_format = PLAN_DRAFT_JSON_SCHEMA
                 else:
                     recovery_attempted = True
                     recovery_tool_schemas = self._select_recovery_tool_schemas(
                         user_message_index,
+                        tool_schemas=turn_tool_schemas,
                     )
                     recovery_response_format = None
                 if plan_draft_problem:
-                    retry_status = (
-                        "  [model returned invalid plan draft: "
-                        f"{plan_draft_problem}; retrying plan formatting "
-                        f"({plan_recovery_attempts}/{plan_recovery_limit})...]"
-                    )
+                    if plan_evidence_recovery_needed:
+                        retry_status = (
+                            "  [model returned invalid plan draft: "
+                            f"{plan_draft_problem}; retrying plan evidence "
+                            f"({plan_evidence_recovery_attempts}/"
+                            f"{plan_evidence_recovery_limit})...]"
+                        )
+                    elif plan_target_recovery_needed:
+                        retry_status = (
+                            "  [model returned invalid plan draft: "
+                            f"{plan_draft_problem}; retrying plan target "
+                            f"({plan_target_recovery_attempts}/"
+                            f"{plan_target_recovery_limit})...]"
+                        )
+                    elif plan_post_evidence_recovery_needed:
+                        retry_status = (
+                            "  [model returned invalid plan draft: "
+                            f"{plan_draft_problem}; retrying post-evidence "
+                            "plan correction "
+                            f"({plan_post_evidence_recovery_attempts}/"
+                            f"{plan_post_evidence_recovery_limit})...]"
+                        )
+                    elif plan_post_target_recovery_needed:
+                        retry_status = (
+                            "  [model returned invalid plan draft: "
+                            f"{plan_draft_problem}; retrying post-target "
+                            "plan correction "
+                            f"({plan_post_target_recovery_attempts}/"
+                            f"{plan_post_target_recovery_limit})...]"
+                        )
+                    else:
+                        retry_status = (
+                            "  [model returned invalid plan draft: "
+                            f"{plan_draft_problem}; retrying plan formatting "
+                            f"({plan_recovery_attempts}/"
+                            f"{plan_recovery_limit})...]"
+                        )
                 else:
                     retry_status = (
                         f"  [model returned {response_problem}; "
@@ -3811,14 +6311,51 @@ class Agent:
             elif response_problem and (
                 (
                     plan_draft_problem is not None
-                    and plan_recovery_attempts >= plan_recovery_limit
+                    and plan_recovery_exhausted
                 )
                 or (
                     plan_draft_problem is None
                     and recovery_attempted
                 )
             ):
-                if next_recovery_instruction == TOOL_DEFLECTION_RECOVERY:
+                if (
+                    plan_draft_problem is not None
+                    and (
+                        canonical_plan is not None
+                        or getattr(self, "_turn_plan_mode", False)
+                    )
+                ):
+                    if plan_evidence_recovery_needed:
+                        content = (
+                            "[Plan draft not saved after evidence recovery: "
+                            f"{plan_draft_problem}.]"
+                        )
+                    elif plan_target_recovery_needed:
+                        content = (
+                            "[Plan draft not saved after target recovery: "
+                            f"{plan_draft_problem}.]"
+                        )
+                    elif plan_post_evidence_recovery_needed:
+                        content = (
+                            "[Plan draft not saved after post-evidence "
+                            f"recovery: {plan_draft_problem}.]"
+                        )
+                    elif plan_post_target_recovery_needed:
+                        content = (
+                            "[Plan draft not saved after post-target "
+                            f"recovery: {plan_draft_problem}.]"
+                        )
+                    else:
+                        content = (
+                            "[Plan draft not saved after "
+                            f"{plan_recovery_attempts} formatting retries: "
+                            f"{plan_draft_problem}.]"
+                        )
+                    message["content"] = content
+                elif next_recovery_instruction in {
+                    TOOL_DEFLECTION_RECOVERY,
+                    ACTION_TOOL_RECOVERY,
+                }:
                     content = self._append_terminal_model_failure(
                         content,
                         "Liam retried tool selection but still did not call a "
@@ -3846,7 +6383,7 @@ class Agent:
                     if auto_proposed is not None:
                         content = auto_proposed
                 if (
-                    not getattr(self, "plan_mode", False)
+                    not self._plan_mode_active()
                     and any(name in GROUNDING_TOOLS for name, _ in tool_results)
                 ):
                     content = self._synthesize(user_input, tool_results)
@@ -3866,7 +6403,7 @@ class Agent:
                 content = self._capture_plan_draft(content)
                 memory.save_message("assistant", content, session_id=self.session_id)
                 if (
-                    not getattr(self, "plan_mode", False)
+                    not self._plan_mode_active()
                     and not any(name == "write_file" for name, _ in tool_results)
                 ):
                     self._capture_code_artifacts(content)
@@ -3936,7 +6473,7 @@ class Agent:
         if auto_proposed is not None:
             content = auto_proposed
         elif (
-            not getattr(self, "plan_mode", False)
+            not self._plan_mode_active()
             and any(name in GROUNDING_TOOLS for name, _ in tool_results)
         ):
             content = self._synthesize(user_input, tool_results)
@@ -3957,7 +6494,7 @@ class Agent:
         content = self._capture_plan_draft(content)
         memory.save_message("assistant", content, session_id=self.session_id)
         if (
-            not getattr(self, "plan_mode", False)
+            not self._plan_mode_active()
             and not any(name == "write_file" for name, _ in tool_results)
         ):
             self._capture_code_artifacts(content)

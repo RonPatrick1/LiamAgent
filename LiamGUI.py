@@ -13,6 +13,7 @@ that approach directly instead of working around GTK4's removed APIs.
 """
 
 import base64
+import getpass
 import hashlib
 import json
 import os
@@ -365,6 +366,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.sessions = []
         self.busy = False
         self._setting_plan_toggle = False
+        self._setting_sudo_toggle = False
         self._current_plan = None
         self._executing_plan_id = None
         self._plan_cancel_event = None
@@ -393,6 +395,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self._restore_timeout_id = 0
         self._restoring_placement = self._placement["valid"]
         self._post_map_restore_done = False
+        self._layout_restored_done = False
 
         headerbar = Gtk.HeaderBar()
         headerbar.set_show_close_button(True)
@@ -429,11 +432,31 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.artifacts_toggle.connect("toggled", self._on_artifacts_toggled)
         headerbar.pack_end(self.artifacts_toggle)
 
+        self.plan_panel_toggle = Gtk.ToggleButton()
+        self.plan_panel_toggle.get_style_context().add_class("liam-toggle")
+        self.plan_panel_toggle.set_image(
+            Gtk.Image.new_from_icon_name("view-sidebar-symbolic", Gtk.IconSize.BUTTON)
+        )
+        self.plan_panel_toggle.set_tooltip_text("Current Plan")
+        self.plan_panel_toggle.connect("toggled", self._on_plan_panel_toggled)
+        headerbar.pack_end(self.plan_panel_toggle)
+
         self.plan_toggle = Gtk.ToggleButton(label="Plan")
         self.plan_toggle.get_style_context().add_class("liam-toggle")
         self.plan_toggle.set_tooltip_text("Plan without making changes")
         self.plan_toggle.connect("toggled", self._on_plan_toggled)
         headerbar.pack_end(self.plan_toggle)
+
+        self.sudo_toggle = Gtk.ToggleButton()
+        self.sudo_toggle.get_style_context().add_class("liam-toggle")
+        self.sudo_toggle.set_image(
+            Gtk.Image.new_from_icon_name("security-high-symbolic", Gtk.IconSize.BUTTON)
+        )
+        self.sudo_toggle.set_tooltip_text(
+            "Allow local sudo in this thread (password stored in GNOME Keyring)"
+        )
+        self.sudo_toggle.connect("toggled", self._on_sudo_toggled)
+        headerbar.pack_end(self.sudo_toggle)
 
         self.execute_plan_button = Gtk.Button(label="Run Plan")
         self.execute_plan_button.get_style_context().add_class(
@@ -464,10 +487,10 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.spinner.set_visible(False)
         headerbar.pack_end(self.spinner)
 
-        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_position(220)
-        paned.set_wide_handle(True)
-        self.add(paned)
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.paned.set_position(220)
+        self.paned.set_wide_handle(True)
+        self.add(self.paned)
 
         # --- sidebar: one thread per folder, like Recents ---
         self.session_list = Gtk.ListBox()
@@ -494,7 +517,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.external_sessions_toggle.connect("toggled", self._on_external_sessions_toggled)
         sidebar_box.pack_start(self.external_sessions_toggle, False, False, 0)
         sidebar_box.pack_start(session_scroller, True, True, 0)
-        paned.pack1(sidebar_box, resize=False, shrink=False)
+        self.paned.pack1(sidebar_box, resize=False, shrink=False)
 
         # --- content: the chat view ---
         content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -595,9 +618,7 @@ class LiamWindow(Gtk.ApplicationWindow):
         self.artifacts_list.connect("row-selected", self._on_artifact_selected)
         artifacts_list_scroller = Gtk.ScrolledWindow()
         artifacts_list_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        artifacts_list_scroller.set_size_request(-1, 160)
         artifacts_list_scroller.add(self.artifacts_list)
-        self.artifacts_box.pack_start(artifacts_list_scroller, False, False, 0)
 
         self.artifact_buffer = Gtk.TextBuffer()
         artifact_view = Gtk.TextView(buffer=self.artifact_buffer)
@@ -606,9 +627,17 @@ class LiamWindow(Gtk.ApplicationWindow):
         artifact_view.set_left_margin(8)
         artifact_view.set_right_margin(8)
         artifact_scroller = Gtk.ScrolledWindow()
-        artifact_scroller.set_vexpand(True)
         artifact_scroller.add(artifact_view)
-        self.artifacts_box.pack_start(artifact_scroller, True, True, 0)
+
+        # A Paned (not a fixed-height list + expanding preview) so the
+        # list/preview split can actually be dragged to a different size —
+        # a plain Box locked the list at a fixed height no matter how much
+        # room the surrounding panel had.
+        self.artifacts_split = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.artifacts_split.pack1(artifacts_list_scroller, resize=True, shrink=True)
+        self.artifacts_split.pack2(artifact_scroller, resize=True, shrink=True)
+        self.artifacts_split.set_position(160)
+        self.artifacts_box.pack_start(self.artifacts_split, True, True, 0)
 
         artifact_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         artifact_actions.set_margin_top(6)
@@ -621,10 +650,73 @@ class LiamWindow(Gtk.ApplicationWindow):
         artifact_actions.pack_start(self.artifact_save_button, True, True, 0)
         self.artifacts_box.pack_start(artifact_actions, False, False, 0)
 
-        inner_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        inner_paned.pack1(content_box, resize=True, shrink=False)
-        inner_paned.pack2(self.artifacts_box, resize=False, shrink=True)
-        paned.pack2(inner_paned, resize=True, shrink=False)
+        # --- current plan: summary for the active thread, shown only when
+        # one actually exists. Refreshed by _refresh_plan_actions() at every
+        # point that already re-checks plan status (thread switch, draft/
+        # approve/cancel, and after every assistant reply) rather than a
+        # separate poll loop.
+        self.plan_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.plan_box.set_size_request(260, -1)
+        self.plan_box.set_visible(False)
+
+        plan_header = Gtk.Label(label="Current Plan", xalign=0)
+        plan_header.set_margin_top(8)
+        plan_header.set_margin_bottom(4)
+        plan_header.set_margin_start(10)
+        plan_header.get_style_context().add_class("dim-label")
+        self.plan_box.pack_start(plan_header, False, False, 0)
+
+        self.plan_title_label = Gtk.Label(xalign=0)
+        self.plan_title_label.set_line_wrap(True)
+        self.plan_title_label.set_margin_start(10)
+        self.plan_title_label.set_margin_end(10)
+        self.plan_box.pack_start(self.plan_title_label, False, False, 0)
+
+        self.plan_status_label = Gtk.Label(xalign=0)
+        self.plan_status_label.set_margin_start(10)
+        self.plan_status_label.set_margin_end(10)
+        self.plan_status_label.set_margin_top(2)
+        self.plan_status_label.set_margin_bottom(6)
+        self.plan_box.pack_start(self.plan_status_label, False, False, 0)
+
+        self.plan_steps_buffer = Gtk.TextBuffer()
+        self.plan_steps_tag_done = self.plan_steps_buffer.create_tag("done", foreground="#2ec27e")
+        self.plan_steps_tag_fail = self.plan_steps_buffer.create_tag("fail", foreground="#e01b24")
+        plan_steps_view = Gtk.TextView(buffer=self.plan_steps_buffer)
+        plan_steps_view.set_editable(False)
+        plan_steps_view.set_cursor_visible(False)
+        plan_steps_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        plan_steps_view.set_left_margin(10)
+        plan_steps_view.set_right_margin(8)
+        plan_steps_scroller = Gtk.ScrolledWindow()
+        plan_steps_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        plan_steps_scroller.set_size_request(-1, 120)
+        plan_steps_scroller.set_vexpand(True)
+        plan_steps_scroller.add(plan_steps_view)
+        self.plan_box.pack_start(plan_steps_scroller, True, True, 0)
+
+        # A Paned so Plan/Artifacts can be dragged to share the column
+        # (GTK also collapses the handle and gives 100% to whichever one
+        # child is visible when only one is shown); the whole thing is
+        # hidden via _refresh_right_sidebar_visibility() when neither
+        # panel is currently toggled on.
+        self.right_stack = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.right_stack.pack1(self.plan_box, resize=True, shrink=True)
+        self.right_stack.pack2(self.artifacts_box, resize=True, shrink=True)
+        self.right_stack.set_position(320)
+        self.right_stack.set_visible(False)
+
+        self.inner_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.inner_paned.pack1(content_box, resize=True, shrink=False)
+        self.inner_paned.pack2(self.right_stack, resize=False, shrink=True)
+        self.paned.pack2(self.inner_paned, resize=True, shrink=False)
+
+        # Toggle states are restored here, after every panel widget they
+        # touch already exists — doing this any earlier (e.g. right where
+        # the header buttons are constructed) would fire their "toggled"
+        # handlers before self.artifacts_box/self.right_stack exist.
+        self.artifacts_toggle.set_active(self.settings.get("artifacts_visible", False))
+        self.plan_panel_toggle.set_active(self.settings.get("plan_panel_visible", True))
 
         self.connect("configure-event", self._on_configure_event)
         self.connect("window-state-event", self._on_window_state_event)
@@ -664,6 +756,40 @@ class LiamWindow(Gtk.ApplicationWindow):
                 json.dump(self._placement, f)
         except Exception:
             pass
+
+    _MIN_PANE_POSITION = 60
+
+    def _sane_pane_position(self, value, horizontal):
+        # Defense in depth against a corrupted/stale saved value (proven
+        # live: a position captured — or applied — against the window's
+        # wrong transient size produced a number that silently collapsed
+        # a whole panel to zero width on the next launch). Anything too
+        # small to be a real usable split, or larger than the window
+        # itself currently allows, is rejected rather than trusted.
+        if not isinstance(value, (int, float)) or value < self._MIN_PANE_POSITION:
+            return None
+        width, height = self.get_size()
+        limit = width if horizontal else height
+        if limit and value > limit - self._MIN_PANE_POSITION:
+            return None
+        return int(value)
+
+    def _write_layout_settings(self):
+        sidebar_position = self._sane_pane_position(self.paned.get_position(), True)
+        if sidebar_position is not None:
+            self.settings["sidebar_paned_position"] = sidebar_position
+        content_position = self._sane_pane_position(self.inner_paned.get_position(), True)
+        if content_position is not None:
+            self.settings["content_paned_position"] = content_position
+        right_stack_position = self._sane_pane_position(self.right_stack.get_position(), False)
+        if right_stack_position is not None:
+            self.settings["right_stack_position"] = right_stack_position
+        artifacts_split_position = self._sane_pane_position(self.artifacts_split.get_position(), False)
+        if artifacts_split_position is not None:
+            self.settings["artifacts_split_position"] = artifacts_split_position
+        self.settings["artifacts_visible"] = self.artifacts_toggle.get_active()
+        self.settings["plan_panel_visible"] = self.plan_panel_toggle.get_active()
+        liam_settings.save(self.settings)
 
     def _save_window_timeout(self):
         self._save_timeout_id = 0
@@ -729,12 +855,39 @@ class LiamWindow(Gtk.ApplicationWindow):
             GLib.source_remove(self._save_timeout_id)
             self._save_timeout_id = 0
         self._write_window_placement()
+        self._write_layout_settings()
         return False  # allow the close to proceed
 
     def _finish_window_restore(self):
         self._restore_timeout_id = 0
         self._restoring_placement = False
+        # Belt-and-suspenders: reapply once more after things settle, in
+        # case the window's first allocation at map-event was still
+        # transitional (same reasoning restore_saved_placement() itself
+        # gets a second pass here).
+        self._restore_layout_positions()
         return False
+
+    def _restore_layout_positions(self):
+        # Paned.set_position() called during __init__ (before the window
+        # has ever been given a real size) gets silently clamped against
+        # whatever tiny default allocation exists at that instant — proven
+        # live: a previously-widened panel collapsed back to ~0 on the next
+        # launch. Deferring to map-event, after the window's real size is
+        # in place, is the same fix already used for window placement
+        # itself just above.
+        sidebar_position = self._sane_pane_position(self.settings.get("sidebar_paned_position"), True)
+        if sidebar_position is not None:
+            self.paned.set_position(sidebar_position)
+        content_position = self._sane_pane_position(self.settings.get("content_paned_position"), True)
+        if content_position is not None:
+            self.inner_paned.set_position(content_position)
+        right_stack_position = self._sane_pane_position(self.settings.get("right_stack_position"), False)
+        if right_stack_position is not None:
+            self.right_stack.set_position(right_stack_position)
+        artifacts_split_position = self._sane_pane_position(self.settings.get("artifacts_split_position"), False)
+        if artifacts_split_position is not None:
+            self.artifacts_split.set_position(artifacts_split_position)
 
     def _on_map_event(self, _widget, _event):
         if self._placement["valid"] and not self._post_map_restore_done:
@@ -746,6 +899,13 @@ class LiamWindow(Gtk.ApplicationWindow):
             self._restore_timeout_id = GLib.timeout_add(
                 RESTORE_SETTLE_MS, self._finish_window_restore,
             )
+        if not self._layout_restored_done:
+            # Must run after restore_saved_placement() above, not before —
+            # the window still has its transient pre-restore size at the
+            # top of this handler, and applying a Paned position against
+            # that wrong width is exactly what corrupted it last time.
+            self._layout_restored_done = True
+            self._restore_layout_positions()
         return False
 
     def restore_saved_placement(self):
@@ -785,6 +945,7 @@ class LiamWindow(Gtk.ApplicationWindow):
             GLib.source_remove(self._restore_timeout_id)
             self._restore_timeout_id = 0
         self._write_window_placement()
+        self._write_layout_settings()
 
     # --- session/thread management ---
 
@@ -971,6 +1132,7 @@ class LiamWindow(Gtk.ApplicationWindow):
     def _build_agent_and_history(self, session_id, folder_path):
         session = memory.get_session(session_id)
         plan_mode = bool(session and session.get("plan_mode"))
+        sudo_enabled = bool(session and session.get("sudo_enabled"))
         extra_folders = [f["folder_path"] for f in memory.list_session_folders(session_id)]
         agent = Agent(
             model=self.model, auto_confirm=self.auto_confirm,
@@ -978,6 +1140,7 @@ class LiamWindow(Gtk.ApplicationWindow):
             custom_instructions=self.settings["custom_instructions"],
             channel="gui", actor_id="local-owner", is_owner=True,
             learning_enabled=True, plan_mode=plan_mode,
+            sudo_enabled=sudo_enabled,
         )
         history = memory.load_recent_messages(limit=REPLAY_LIMIT, session_id=session_id)
         return agent, history
@@ -994,6 +1157,12 @@ class LiamWindow(Gtk.ApplicationWindow):
             self.plan_toggle.set_active(agent.plan_mode)
         finally:
             self._setting_plan_toggle = False
+
+        self._setting_sudo_toggle = True
+        try:
+            self.sudo_toggle.set_active(agent.sudo_enabled)
+        finally:
+            self._setting_sudo_toggle = False
 
         self._refresh_plan_actions()
         memory.set_unread(session_id, False)
@@ -1128,8 +1297,10 @@ class LiamWindow(Gtk.ApplicationWindow):
         window = LiamWindow(self.get_application(), self.model, self.auto_confirm)
         window.show_all()
         # Same show_all()-overrides-set_visible(False) issue as
-        # LiamApp.do_activate — re-hide the artifacts panel here too.
+        # LiamApp.do_activate — re-hide the artifacts and plan panels here too.
         window.artifacts_box.set_visible(window.artifacts_toggle.get_active())
+        window.plan_box.set_visible(window.plan_panel_toggle.get_active())
+        window._refresh_right_sidebar_visibility()
         window.restore_saved_placement()
         window.present()
         window._switch_to(session["folder_path"], session["title"])
@@ -1504,6 +1675,72 @@ class LiamWindow(Gtk.ApplicationWindow):
         sudo_expander.add(sudo_box)
         content.pack_start(sudo_expander, False, False, 0)
 
+        local_sudo_expander = Gtk.Expander(label="Local sudo password (GNOME Keyring)")
+        local_sudo_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        local_sudo_box.set_margin_top(8)
+        local_sudo_box.set_margin_start(8)
+        local_sudo_box.set_margin_end(8)
+        local_sudo_box.pack_start(
+            Gtk.Label(
+                label=(
+                    "Used by run_shell_command's sudo=true on this machine, only "
+                    "in threads where the sudo toggle in the header is on. "
+                    "Password is never shown to Liam."
+                ),
+                xalign=0, wrap=True,
+            ),
+            False, False, 0,
+        )
+        local_sudo_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        local_sudo_entry = Gtk.Entry()
+        local_sudo_entry.set_visibility(False)
+        local_sudo_entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        local_sudo_entry.set_placeholder_text("Sudo password")
+        local_sudo_controls.pack_start(local_sudo_entry, True, True, 0)
+        local_sudo_save = Gtk.Button(label="Save")
+        local_sudo_remove = Gtk.Button(label="Remove")
+        local_sudo_controls.pack_start(local_sudo_save, False, False, 0)
+        local_sudo_controls.pack_start(local_sudo_remove, False, False, 0)
+        local_sudo_box.pack_start(local_sudo_controls, False, False, 0)
+        local_sudo_status = Gtk.Label(xalign=0)
+        local_sudo_status.get_style_context().add_class("dim-label")
+        local_sudo_box.pack_start(local_sudo_status, False, False, 0)
+
+        try:
+            local_sudo_stored = ssh_secrets.has_local_sudo_password(getpass.getuser())
+            local_sudo_status.set_text(
+                "Password stored" if local_sudo_stored else "No password stored"
+            )
+        except ssh_secrets.SudoSecretError as exc:
+            local_sudo_status.set_text(str(exc))
+
+        def on_local_sudo_save(_button):
+            try:
+                ssh_secrets.store_local_sudo_password(
+                    getpass.getuser(), local_sudo_entry.get_text(),
+                )
+            except ssh_secrets.SudoSecretError as exc:
+                local_sudo_status.set_text(str(exc))
+                return
+            local_sudo_entry.set_text("")
+            local_sudo_status.set_text("Password saved in GNOME Keyring")
+
+        def on_local_sudo_remove(_button):
+            try:
+                removed = ssh_secrets.clear_local_sudo_password(getpass.getuser())
+            except ssh_secrets.SudoSecretError as exc:
+                local_sudo_status.set_text(str(exc))
+                return
+            local_sudo_entry.set_text("")
+            local_sudo_status.set_text(
+                "Password removed" if removed else "No password was stored"
+            )
+
+        local_sudo_save.connect("clicked", on_local_sudo_save)
+        local_sudo_remove.connect("clicked", on_local_sudo_remove)
+        local_sudo_expander.add(local_sudo_box)
+        content.pack_start(local_sudo_expander, False, False, 0)
+
         content.pack_start(
             Gtk.Label(label="Custom instructions (added to every thread's system prompt)", xalign=0),
             False, False, 0,
@@ -1574,6 +1811,12 @@ class LiamWindow(Gtk.ApplicationWindow):
             self.plan_toggle.set_active(agent.plan_mode)
         finally:
             self._setting_plan_toggle = False
+
+        self._setting_sudo_toggle = True
+        try:
+            self.sudo_toggle.set_active(agent.sudo_enabled)
+        finally:
+            self._setting_sudo_toggle = False
 
         self._refresh_plan_actions()
 
@@ -2261,6 +2504,77 @@ class LiamWindow(Gtk.ApplicationWindow):
 
     # --- artifacts ---
 
+    def _refresh_right_sidebar_visibility(self):
+        self.right_stack.set_visible(
+            self.plan_box.get_visible() or self.artifacts_box.get_visible()
+        )
+
+    def _on_plan_panel_toggled(self, button):
+        self.plan_box.set_visible(button.get_active())
+        self._refresh_right_sidebar_visibility()
+
+    def _refresh_plan_panel(self, plan):
+        self.plan_steps_buffer.set_text("")
+        self.plan_box.set_visible(self.plan_panel_toggle.get_active())
+        self._refresh_right_sidebar_visibility()
+        if not plan:
+            self.plan_title_label.set_markup("<i>No plan for this thread yet.</i>")
+            self.plan_status_label.set_text("")
+            return
+
+        try:
+            payload = json.loads(plan.get("content") or "") or {}
+        except (TypeError, ValueError):
+            payload = {}
+
+        title = payload.get("title") or f"Plan #{plan['id']}"
+        self.plan_title_label.set_markup(f"<b>{GLib.markup_escape_text(str(title))}</b>")
+
+        status = plan.get("status", "unknown")
+        status_colors = {
+            "draft": "#888888", "approved": "#3584e4", "running": "#e5a50a",
+            "completed": "#2ec27e", "failed": "#e01b24", "cancelled": "#888888",
+        }
+        color = status_colors.get(status, "#888888")
+        self.plan_status_label.set_markup(
+            f"<span foreground='{color}'>{GLib.markup_escape_text(status.upper())}</span>"
+            f"  ·  plan #{plan['id']}"
+        )
+
+        # Map each validation command to PASS/FAIL from the plan's own
+        # stored result text (same "PASS: <command>" / "FAIL: <command>"
+        # lines _validation_summary in core.py writes), so a completed or
+        # failed plan shows exactly which checks it actually passed —
+        # not just a single overall status.
+        outcomes = {}
+        for block in re.split(r"\n\n+", plan.get("result") or ""):
+            match = re.match(r"(PASS|FAIL): (.+)", block, re.DOTALL)
+            if match:
+                outcomes[match.group(2).splitlines()[0].strip()] = match.group(1)
+
+        end_iter = self.plan_steps_buffer.get_end_iter()
+        for index, step_text in enumerate(payload.get("steps") or [], start=1):
+            self.plan_steps_buffer.insert(end_iter, f"{index}. {step_text}\n")
+            end_iter = self.plan_steps_buffer.get_end_iter()
+
+        validation = payload.get("validation") or []
+        if validation:
+            self.plan_steps_buffer.insert(end_iter, "\nValidation:\n")
+            for item in validation:
+                command = item.get("command", "")
+                outcome = outcomes.get(command)
+                if outcome == "PASS":
+                    prefix, tag = "✓ ", self.plan_steps_tag_done
+                elif outcome == "FAIL":
+                    prefix, tag = "✗ ", self.plan_steps_tag_fail
+                else:
+                    prefix, tag = "• ", None
+                end_iter = self.plan_steps_buffer.get_end_iter()
+                if tag:
+                    self.plan_steps_buffer.insert_with_tags(end_iter, f"{prefix}{command}\n", tag)
+                else:
+                    self.plan_steps_buffer.insert(end_iter, f"{prefix}{command}\n")
+
     def _refresh_plan_actions(self):
         plan = (
             memory.get_latest_plan(self.session_id)
@@ -2268,6 +2582,7 @@ class LiamWindow(Gtk.ApplicationWindow):
             else None
         )
         self._current_plan = plan
+        self._refresh_plan_panel(plan)
 
         ready_statuses = {"draft", "failed", "approved"}
         ready = bool(
@@ -2557,6 +2872,7 @@ class LiamWindow(Gtk.ApplicationWindow):
 
     def _on_artifacts_toggled(self, button):
         self.artifacts_box.set_visible(button.get_active())
+        self._refresh_right_sidebar_visibility()
         if button.get_active():
             self._refresh_artifacts_list()
 
@@ -2565,6 +2881,94 @@ class LiamWindow(Gtk.ApplicationWindow):
             return
         memory.set_plan_mode(self.session_id, button.get_active())
         self._reload_current_agent()
+
+    def _on_sudo_toggled(self, button):
+        if self._setting_sudo_toggle or self.session_id is None:
+            return
+
+        if not button.get_active():
+            memory.set_sudo_enabled(self.session_id, False)
+            self._reload_current_agent()
+            return
+
+        try:
+            has_password = ssh_secrets.has_local_sudo_password(getpass.getuser())
+        except ssh_secrets.SudoSecretError:
+            has_password = False
+
+        if has_password:
+            memory.set_sudo_enabled(self.session_id, True)
+            self._reload_current_agent()
+            return
+
+        # No password stored yet — collect one before actually turning this
+        # on. The toggle already shows "on" (GTK flips it before this
+        # handler runs); revert it if the user cancels or saving fails.
+        self._open_local_sudo_password_dialog(self.session_id)
+
+    def _revert_sudo_toggle(self):
+        self._setting_sudo_toggle = True
+        try:
+            self.sudo_toggle.set_active(False)
+        finally:
+            self._setting_sudo_toggle = False
+
+    def _open_local_sudo_password_dialog(self, session_id):
+        dialog = Gtk.Dialog(title="Local Sudo Password", transient_for=self)
+        dialog.set_position(Gtk.WindowPosition.CENTER)
+        dialog.set_default_size(420, -1)
+        dialog.set_resizable(False)
+        dialog.add_buttons(
+            "Cancel", Gtk.ResponseType.CANCEL,
+            "Save", Gtk.ResponseType.OK,
+        )
+        dialog.set_default_response(Gtk.ResponseType.OK)
+
+        content = dialog.get_content_area()
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+        content.set_spacing(8)
+        content.pack_start(
+            Gtk.Label(
+                label=(
+                    f"Enter {getpass.getuser()}'s sudo password once. It's "
+                    "stored in GNOME Keyring, never exposed to Liam directly, "
+                    "and reused for every sudo=true shell command in threads "
+                    "with this toggle on."
+                ),
+                xalign=0, wrap=True,
+            ),
+            False, False, 0,
+        )
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        entry.set_activates_default(True)
+        content.pack_start(entry, False, False, 0)
+        status = Gtk.Label(xalign=0, wrap=True)
+        status.get_style_context().add_class("error")
+        content.pack_start(status, False, False, 0)
+
+        def on_response(current_dialog, response):
+            if response != Gtk.ResponseType.OK:
+                current_dialog.destroy()
+                self._revert_sudo_toggle()
+                return
+            password = entry.get_text()
+            try:
+                ssh_secrets.store_local_sudo_password(getpass.getuser(), password)
+            except ssh_secrets.SudoSecretError as exc:
+                status.set_text(str(exc))
+                return
+            current_dialog.destroy()
+            memory.set_sudo_enabled(session_id, True)
+            if session_id == self.session_id:
+                self._reload_current_agent()
+
+        dialog.connect("response", on_response)
+        dialog.show_all()
 
     def _refresh_artifacts_list(self):
         for child in list(self.artifacts_list.get_children()):
@@ -3289,9 +3693,11 @@ class LiamApp(Gtk.Application):
             # show_all() shows every child widget regardless of any
             # set_visible(False) called earlier in __init__ — it's not
             # "show everything that was already meant to be visible", it
-            # unconditionally overrides that. The artifacts panel starts
-            # closed; re-hide it now that show_all() has stomped on that.
+            # unconditionally overrides that. The artifacts and plan panels
+            # start closed; re-hide them now that show_all() stomped on that.
             window.artifacts_box.set_visible(window.artifacts_toggle.get_active())
+            window.plan_box.set_visible(window.plan_panel_toggle.get_active())
+            window._refresh_right_sidebar_visibility()
         window.present()
 
     def do_shutdown(self):

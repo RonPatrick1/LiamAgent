@@ -120,6 +120,7 @@ class GuiPlanModeTests(unittest.TestCase):
             is_owner=True,
             learning_enabled=True,
             plan_mode=True,
+            sudo_enabled=False,
         )
 
     def test_busy_state_disables_plan_toggle(self):

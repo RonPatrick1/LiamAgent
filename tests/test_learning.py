@@ -558,6 +558,25 @@ class MemoryTruthTests(unittest.TestCase):
         self.assertNotIn("lesson candidate #17", result)
         self.assertIn("no forget tool successfully deleted", result)
 
+    def test_model_cannot_narrate_an_unbracketed_lesson_essay(self):
+        agent = bare_agent()
+        agent.messages = []
+        agent._record_auto_lessons = mock.Mock()
+        agent._evaluate_lesson_uses = mock.Mock()
+
+        result = agent._finalize_learning(
+            "I apologize for the oversight earlier.\n\n"
+            "Lesson to Learn:\n\n"
+            "When executing commands, always verify the result before "
+            "reporting completion.\n\n"
+            "Example:\n\n"
+            "After pkill ogg123, I should have verified it worked.",
+            None,
+        )
+
+        self.assertNotIn("Lesson to Learn", result)
+        self.assertNotIn("pkill ogg123", result)
+
     @mock.patch.object(core.memory, "save_message")
     @mock.patch.object(core.memory, "match_lesson_records", return_value=[])
     def test_direct_note_recall_bypasses_chat_model(self, _match, _save_message):

@@ -7,6 +7,16 @@ from unittest import mock
 from agent import core
 
 
+TEST_LISTENING_PORTS_RESULT = (
+    "Current TCP listeners:\n"
+    "- None found in /proc/net/tcp or /proc/net/tcp6\n"
+    "Suggested currently-unused unprivileged TCP ports "
+    "from 8000-8999: 8000, 8001\n"
+    "These suggestions are absent from the current TCP listener "
+    "table; availability must still be rechecked when the server starts."
+)
+
+
 class PlanGroundingTests(unittest.TestCase):
     def test_grounding_tools_do_not_replace_structured_plan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -19,8 +29,10 @@ class PlanGroundingTests(unittest.TestCase):
                 "steps": [
                     "Create the listed webpage file.",
                     (
-                        "Serve the directory as a background process with "
-                        "python3 -m http.server 8000 --bind 0.0.0.0."
+                        "Serve the directory with `nohup python3 -m "
+                        "http.server 8000 --bind 0.0.0.0 "
+                        ">/dev/null 2>&1 &` so it remains running during "
+                        "validation."
                     ),
                 ],
                 "validation": [
@@ -52,6 +64,12 @@ class PlanGroundingTests(unittest.TestCase):
                                 "arguments": {
                                     "path": directory,
                                 },
+                            },
+                        },
+                        {
+                            "function": {
+                                "name": "listening_ports",
+                                "arguments": {},
                             },
                         },
                     ],
@@ -107,6 +125,10 @@ class PlanGroundingTests(unittest.TestCase):
                         "list_directory": (
                             lambda path, base_dir=None:
                             "index.html"
+                        ),
+                        "listening_ports": (
+                            lambda **_kwargs:
+                            TEST_LISTENING_PORTS_RESULT
                         ),
                     },
                 ),
