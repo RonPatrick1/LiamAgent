@@ -624,12 +624,23 @@ class ActionToolRequirementTests(unittest.TestCase):
                 handle.write("year=2023\n")
 
             payload = {
+                "version": core.PLAN_VERSION,
                 "title": "Update year",
                 "objective": "Update the configured year to 2026.",
                 "files": [path],
                 "steps": [
-                    f"Inspect {path}.",
                     f"Edit {path} so year is 2026.",
+                ],
+                "work_units": [
+                    {
+                        "description": f"Edit {path} so year is 2026.",
+                        "tool": "edit_file",
+                        "arguments": {
+                            "path": path,
+                            "old_string": "year=2023\n",
+                            "new_string": "year=2026\n",
+                        },
+                    }
                 ],
                 "validation": [
                     {
@@ -1894,44 +1905,72 @@ class ActionToolRequirementTests(unittest.TestCase):
 
     @mock.patch.object(core.memory, "transition_plan", return_value=True)
     @mock.patch.object(core.memory, "get_plan")
-    def test_plan_step_without_tool_event_fails_after_three_attempts(
+    def test_plan_work_unit_without_matching_event_fails_without_ai_retry(
         self,
         get_plan,
         _transition_plan,
     ):
+        import json
+
+        payload = {
+            "version": core.PLAN_VERSION,
+            "title": "Run approved command",
+            "objective": "Run the exact approved command.",
+            "files": [],
+            "steps": ["Run the approved command."],
+            "work_units": [
+                {
+                    "description": "Run the approved command.",
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": "printf test",
+                    },
+                    "affected_paths": [],
+                }
+            ],
+            "validation": [
+                {
+                    "command": "true",
+                    "expected": "Exit code 0.",
+                }
+            ],
+            "non_goals": ["Do not perform unrelated work."],
+            "risks": ["The command may fail."],
+        }
         get_plan.return_value = {
             "id": 9,
             "session_id": 17,
             "status": "approved",
+            "content": json.dumps(payload),
         }
 
         agent = core.Agent.__new__(core.Agent)
         agent.plan_mode = False
         agent.session_id = 17
         agent.on_status = mock.Mock()
+        agent.on_tool_call = mock.Mock()
         agent._tool_events = []
-        agent._stored_plan_payload = mock.Mock(return_value={
-            "steps": ["Update style.css."],
-            "validation": [],
-        })
-        agent._plan_step_prompt = mock.Mock(return_value="step prompt")
+        agent.step = mock.Mock()
+        agent._execute_tool = mock.Mock(return_value="command completed")
+        agent._run_plan_validation = mock.Mock()
         agent._fail_running_plan = mock.Mock(
             return_value="FAIL: no successful tool event"
         )
 
-        def prose_only(_prompt):
-            agent._tool_events = []
-            return "I updated style.css."
-
-        agent.step = mock.Mock(side_effect=prose_only)
-
         result = agent.execute_plan(9)
 
         self.assertEqual(result, "FAIL: no successful tool event")
-        self.assertEqual(agent.step.call_count, 3)
+        agent.step.assert_not_called()
+        agent._execute_tool.assert_called_once_with(
+            "run_shell_command",
+            {
+                "command": "printf test",
+            },
+        )
+        agent._run_plan_validation.assert_not_called()
         agent._fail_running_plan.assert_called_once()
         self.assertIn(
-            "no qualifying Plan progress event",
+            "did not produce the exact host-observed completion event",
             agent._fail_running_plan.call_args.args[1],
         )
 

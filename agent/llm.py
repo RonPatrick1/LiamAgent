@@ -42,6 +42,12 @@ class OllamaClient:
             message = body["message"]
             if not isinstance(message, dict):
                 raise TypeError("Ollama response 'message' is not an object")
+            if message.get("content") is None and message.get("tool_calls"):
+                message = dict(message)
+                message["content"] = ""
+            if message.get("content") is None and message.get("tool_calls"):
+                message = dict(message)
+                message["content"] = ""
             return message
         except requests.exceptions.HTTPError as exc:
             response = exc.response if exc.response is not None else resp

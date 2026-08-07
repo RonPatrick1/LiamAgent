@@ -27,6 +27,24 @@ def valid_plan():
     }
 
 
+def valid_v2_plan():
+    payload = valid_plan()
+    payload["version"] = core.PLAN_VERSION
+    payload["steps"] = ["Apply the minimum code change."]
+    payload["work_units"] = [
+        {
+            "description": "Apply the minimum code change.",
+            "tool": "edit_file",
+            "arguments": {
+                "path": "agent/core.py",
+                "old_string": "old text",
+                "new_string": "new text",
+            },
+        }
+    ]
+    return payload
+
+
 def fenced(payload):
     fence = chr(96) * 3
     return (
@@ -54,6 +72,299 @@ class PlanDraftParserTests(unittest.TestCase):
         canonical, error = core._extract_plan_draft(fenced(valid_plan()))
         self.assertIsNone(error)
         self.assertEqual(json.loads(canonical), valid_plan())
+
+    def test_version_2_plan_is_canonicalized(self):
+        payload = valid_v2_plan()
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(error)
+        self.assertEqual(json.loads(canonical), payload)
+
+    def test_version_2_plan_rejects_read_only_work_unit(self):
+        payload = valid_v2_plan()
+        payload["work_units"][0]["tool"] = "read_file"
+        payload["work_units"][0]["arguments"] = {
+            "path": "agent/core.py",
+        }
+
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(canonical)
+        self.assertIn("uses read-only discovery tool", error)
+
+    def test_version_2_plan_rejects_missing_tool_argument(self):
+        payload = valid_v2_plan()
+        del payload["work_units"][0]["arguments"]["new_string"]
+
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(canonical)
+        self.assertIn("missing required argument(s): new_string", error)
+
+    def test_version_2_plan_requires_steps_to_mirror_work_units(self):
+        payload = valid_v2_plan()
+        payload["steps"] = ["Do something different."]
+
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(canonical)
+        self.assertIn("steps must exactly mirror work_units descriptions", error)
+
+    def test_version_2_shell_work_unit_requires_affected_paths(self):
+        payload = valid_v2_plan()
+        payload["steps"] = ["Update the local file with a shell command."]
+        payload["work_units"] = [
+            {
+                "description": "Update the local file with a shell command.",
+                "tool": "run_shell_command",
+                "arguments": {
+                    "command": "sed -i 's/old/new/' agent/core.py",
+                },
+            }
+        ]
+
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(canonical)
+        self.assertIn("affected_paths", error)
+
+    def test_version_2_shell_work_unit_preserves_affected_paths_metadata(self):
+        payload = valid_v2_plan()
+        payload["steps"] = ["Update the local file with a shell command."]
+        payload["work_units"] = [
+            {
+                "description": "Update the local file with a shell command.",
+                "tool": "run_shell_command",
+                "arguments": {
+                    "command": "sed -i 's/old/new/' agent/core.py",
+                },
+                "affected_paths": ["agent/core.py"],
+            }
+        ]
+
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(error)
+        parsed = json.loads(canonical)
+        work_unit = parsed["work_units"][0]
+        self.assertEqual(work_unit["affected_paths"], ["agent/core.py"])
+        self.assertNotIn("affected_paths", work_unit["arguments"])
+
+    def test_version_2_non_shell_work_unit_rejects_affected_paths(self):
+        payload = valid_v2_plan()
+        payload["work_units"][0]["affected_paths"] = ["agent/core.py"]
+
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(canonical)
+        self.assertIn("affected_paths", error)
+
+    def test_version_2_ssh_shell_work_unit_accepts_remote_affected_paths(self):
+        payload = valid_v2_plan()
+        payload["files"] = []
+        payload["steps"] = ["Update the approved remote configuration file."]
+        payload["work_units"] = [
+            {
+                "description": "Update the approved remote configuration file.",
+                "tool": "ssh_run_command",
+                "arguments": {
+                    "host": "example-host",
+                    "command": "sed -i 's/old/new/' /etc/example.conf",
+                },
+                "affected_paths": ["/etc/example.conf"],
+            }
+        ]
+
+        canonical, error = core._extract_plan_draft(fenced(payload))
+
+        self.assertIsNone(error)
+        parsed = json.loads(canonical)
+        self.assertEqual(
+            parsed["work_units"][0]["affected_paths"],
+            ["/etc/example.conf"],
+        )
+        self.assertNotIn(
+            "affected_paths",
+            parsed["work_units"][0]["arguments"],
+        )
+
+    def test_shell_file_mutation_rejects_empty_affected_paths(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "created.txt")
+            payload = valid_v2_plan()
+            payload["files"] = [target]
+            payload["steps"] = ["Create the requested local file."]
+            payload["work_units"] = [
+                {
+                    "description": "Create the requested local file.",
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": f"touch {target}",
+                    },
+                    "affected_paths": [],
+                }
+            ]
+
+            canonical, error = core._extract_plan_draft(fenced(payload))
+            self.assertIsNone(error)
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._current_user_input = f"Create {target}."
+            agent._read_paths_this_turn = set()
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(canonical)
+
+            self.assertIn(
+                "recognized mutating shell command",
+                problem,
+            )
+            self.assertIn(
+                "declares affected_paths as empty",
+                problem,
+            )
+
+    def test_local_shell_affected_path_must_be_listed_in_files(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "created.txt")
+            payload = valid_v2_plan()
+            payload["files"] = []
+            payload["steps"] = ["Create the requested local file."]
+            payload["work_units"] = [
+                {
+                    "description": "Create the requested local file.",
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": f"touch {target}",
+                    },
+                    "affected_paths": [target],
+                }
+            ]
+
+            canonical, error = core._extract_plan_draft(fenced(payload))
+            self.assertIsNone(error)
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._current_user_input = f"Create {target}."
+            agent._read_paths_this_turn = set()
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(canonical)
+
+            self.assertIn(
+                "but that path is not listed in files",
+                problem,
+            )
+
+    def test_local_shell_affected_path_cannot_bypass_file_grounding(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = "/outside/unverified-created.txt"
+            payload = valid_v2_plan()
+            payload["files"] = [target]
+            payload["steps"] = ["Create the requested local file."]
+            payload["work_units"] = [
+                {
+                    "description": "Create the requested local file.",
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": f"touch {target}",
+                    },
+                    "affected_paths": [target],
+                }
+            ]
+
+            canonical, error = core._extract_plan_draft(fenced(payload))
+            self.assertIsNone(error)
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._current_user_input = "Create a local file."
+            agent._read_paths_this_turn = set()
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(canonical)
+
+            self.assertIn(
+                "files contains ungrounded path",
+                problem,
+            )
+
+    def test_ssh_shell_affected_path_must_be_absolute_remote_path(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            payload = valid_v2_plan()
+            payload["files"] = []
+            payload["steps"] = ["Update the approved remote file."]
+            payload["work_units"] = [
+                {
+                    "description": "Update the approved remote file.",
+                    "tool": "ssh_run_command",
+                    "arguments": {
+                        "host": "example-host",
+                        "command": "touch relative/example.conf",
+                    },
+                    "affected_paths": ["relative/example.conf"],
+                }
+            ]
+
+            canonical, error = core._extract_plan_draft(fenced(payload))
+            self.assertIsNone(error)
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._current_user_input = (
+                "Update relative/example.conf on example-host."
+            )
+            agent._read_paths_this_turn = set()
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(canonical)
+
+            self.assertIn(
+                "for ssh_run_command must be an absolute",
+                problem,
+            )
+
+    def test_ssh_absolute_affected_path_is_not_local_grounded(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            payload = valid_v2_plan()
+            payload["files"] = []
+            payload["steps"] = ["Update the approved remote file."]
+            payload["work_units"] = [
+                {
+                    "description": "Update the approved remote file.",
+                    "tool": "ssh_run_command",
+                    "arguments": {
+                        "host": "example-host",
+                        "command": "touch /etc/example.conf",
+                    },
+                    "affected_paths": ["/etc/example.conf"],
+                }
+            ]
+
+            canonical, error = core._extract_plan_draft(fenced(payload))
+            self.assertIsNone(error)
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = directory
+            agent._current_user_input = "Update the approved remote file."
+            agent._read_paths_this_turn = set()
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(canonical)
+
+            self.assertIsNone(problem)
 
     def test_missing_validation_is_not_ready(self):
         payload = valid_plan()
@@ -500,7 +811,7 @@ class PlanDraftParserTests(unittest.TestCase):
         get_latest_plan,
         create_plan,
     ):
-        payload = valid_plan()
+        payload = valid_v2_plan()
         payload["validation"] = [{
             "command": (
                 "grep -Fq 'transition:' style.css "
@@ -555,14 +866,14 @@ class PlanDraftParserTests(unittest.TestCase):
         agent.session_id = 17
         agent.messages = [{"role": "assistant", "content": "original"}]
 
-        reply = agent._capture_plan_draft(fenced(valid_plan()))
+        reply = agent._capture_plan_draft(fenced(valid_v2_plan()))
 
         get_latest_plan.assert_called_once_with(17)
         create_plan.assert_called_once()
         self.assertEqual(create_plan.call_args.args[0], 17)
         self.assertEqual(
             json.loads(create_plan.call_args.args[1]),
-            valid_plan(),
+            valid_v2_plan(),
         )
         self.assertIn(
             "[Plan draft #41 is ready for approval.]",
@@ -578,7 +889,8 @@ class PlanDraftParserTests(unittest.TestCase):
         create_plan,
     ):
         canonical, _error = core._extract_plan_draft(
-            fenced(valid_plan())
+            fenced(valid_v2_plan()),
+            require_v2=True,
         )
         get_latest_plan.return_value = {
             "id": 52,
@@ -591,7 +903,7 @@ class PlanDraftParserTests(unittest.TestCase):
         agent.session_id = 17
         agent.messages = [{"role": "assistant", "content": "original"}]
 
-        reply = agent._capture_plan_draft(fenced(valid_plan()))
+        reply = agent._capture_plan_draft(fenced(valid_v2_plan()))
 
         create_plan.assert_not_called()
         self.assertIn(
@@ -1063,22 +1375,46 @@ class PlanDraftParserTests(unittest.TestCase):
             with open(style_path, "w") as handle:
                 handle.write("body {}\n.dark-mode {}\n")
 
-            invalid_shape = valid_plan()
+            invalid_shape = valid_v2_plan()
+            invalid_shape["files"] = [style_path]
+            invalid_shape["steps"] = [f"Modify {style_path}."]
+            invalid_shape["work_units"] = [
+                {
+                    "description": f"Modify {style_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": "body {}\n.dark-mode {}\n",
+                        "new_string": "body {}\n.dark-mode { color: black; }\n",
+                    },
+                }
+            ]
             invalid_shape["validation"] = []
 
-            typo_plan = valid_plan()
+            typo_plan = valid_v2_plan()
             typo_plan["title"] = "Update stylesheet"
             typo_plan["objective"] = "Update the existing stylesheet."
             typo_plan["files"] = [typo_path]
             typo_plan["steps"] = [
                 f"Modify {typo_path}.",
             ]
+            typo_plan["work_units"] = [
+                {
+                    "description": f"Modify {typo_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": typo_path,
+                        "old_string": "body {}\n",
+                        "new_string": "body { color: black; }\n",
+                    },
+                }
+            ]
             typo_plan["validation"] = [{
                 "command": f"grep -Fq 'body' {typo_path}",
                 "expected": "The stylesheet contains the body rule.",
             }]
 
-            post_target_failure = valid_plan()
+            post_target_failure = valid_v2_plan()
             post_target_failure["title"] = "Update stylesheet"
             post_target_failure["objective"] = (
                 "Update the existing stylesheet."
@@ -1086,6 +1422,17 @@ class PlanDraftParserTests(unittest.TestCase):
             post_target_failure["files"] = [style_path]
             post_target_failure["steps"] = [
                 f"Add the dark-mode class to {style_path}.",
+            ]
+            post_target_failure["work_units"] = [
+                {
+                    "description": f"Add the dark-mode class to {style_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": "body {}\n.dark-mode {}\n",
+                        "new_string": "body {}\n.dark-mode { color: black; }\n",
+                    },
+                }
             ]
             post_target_failure["validation"] = [{
                 "command": (
@@ -1096,7 +1443,7 @@ class PlanDraftParserTests(unittest.TestCase):
                 ),
             }]
 
-            corrected_plan = valid_plan()
+            corrected_plan = valid_v2_plan()
             corrected_plan["title"] = "Update stylesheet"
             corrected_plan["objective"] = (
                 "Update the existing stylesheet."
@@ -1107,6 +1454,20 @@ class PlanDraftParserTests(unittest.TestCase):
                     f"Modify {style_path} to adjust the existing "
                     "dark-mode definition for the requested behavior."
                 ),
+            ]
+            corrected_plan["work_units"] = [
+                {
+                    "description": (
+                        f"Modify {style_path} to adjust the existing "
+                        "dark-mode definition for the requested behavior."
+                    ),
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": ".dark-mode {}",
+                        "new_string": ".dark-mode { color: black; }",
+                    },
+                }
             ]
             corrected_plan["validation"] = [{
                 "command": (
@@ -1881,7 +2242,7 @@ class PlanDraftParserTests(unittest.TestCase):
         )
 
     def test_invalid_plan_response_is_corrected_by_one_model_retry(self):
-        invalid = valid_plan()
+        invalid = valid_v2_plan()
         invalid.pop("non_goals")
         invalid.pop("risks")
         invalid["validation"] = (
@@ -1897,7 +2258,7 @@ class PlanDraftParserTests(unittest.TestCase):
             },
             {
                 "role": "assistant",
-                "content": json.dumps(valid_plan()),
+                "content": json.dumps(valid_v2_plan()),
             },
         ]
 
@@ -1906,6 +2267,15 @@ class PlanDraftParserTests(unittest.TestCase):
                 core,
                 "OllamaClient",
                 return_value=client,
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_normalize_plan_transition_validation",
+                side_effect=lambda content, canonical: (
+                    content,
+                    canonical,
+                    None,
+                ),
             ),
             mock.patch.object(
                 core.memory,
@@ -1958,14 +2328,16 @@ class PlanDraftParserTests(unittest.TestCase):
             client.chat.call_args_list[1].kwargs["response_format"],
             core.PLAN_DRAFT_JSON_SCHEMA,
         )
-        agent.on_status.assert_called_once()
-        self.assertIn(
-            "retrying plan formatting (1/2)",
-            agent.on_status.call_args.args[0],
-        )
+        formatting_statuses = [
+            call.args[0]
+            for call in agent.on_status.call_args_list
+            if call.args
+            and "retrying plan formatting (1/2)" in call.args[0]
+        ]
+        self.assertEqual(len(formatting_statuses), 1)
         self.assertNotIn(
             "tool selection",
-            agent.on_status.call_args.args[0],
+            formatting_statuses[0],
         )
         create_plan.assert_called_once()
         self.assertIn(
@@ -2001,10 +2373,21 @@ class PlanDraftParserTests(unittest.TestCase):
                 {"role": "assistant", "content": "original"},
             ]
 
-            payload = valid_plan()
+            payload = valid_v2_plan()
             payload["files"] = [target]
             payload["steps"] = [
                 "Modify plan-ui-test.txt.",
+            ]
+            payload["work_units"] = [
+                {
+                    "description": "Modify plan-ui-test.txt.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": target,
+                        "old_string": "PLAN TEST\n",
+                        "new_string": "PLAN TEST UPDATED\n",
+                    },
+                }
             ]
 
             reply = agent._capture_plan_draft(
@@ -2315,7 +2698,7 @@ class PlanDraftParserTests(unittest.TestCase):
                 "running during validation."
             )
 
-            inspected_plan = valid_plan()
+            inspected_plan = valid_v2_plan()
             inspected_plan["files"] = [
                 index_path,
                 style_path,
@@ -2326,7 +2709,39 @@ class PlanDraftParserTests(unittest.TestCase):
                 server_step,
             ]
 
-            semantic_failure = valid_plan()
+            inspected_plan["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": "<html></html>\n",
+                        "new_string": "<html>updated</html>\n",
+                    },
+                },
+                {
+                    "description": f"Modify {style_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": "body {}\n",
+                        "new_string": "body { color: black; }\n",
+                    },
+                },
+                {
+                    "description": server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 127.0.0.1 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
+            ]
+
+            semantic_failure = valid_v2_plan()
             semantic_failure["files"] = [
                 index_path,
                 style_path,
@@ -2336,7 +2751,30 @@ class PlanDraftParserTests(unittest.TestCase):
                 server_step,
             ]
 
-            corrected_plan = valid_plan()
+            semantic_failure["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": "<html></html>\n",
+                        "new_string": "<html>updated</html>\n",
+                    },
+                },
+                {
+                    "description": server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 127.0.0.1 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
+            ]
+
+            corrected_plan = valid_v2_plan()
             corrected_plan["files"] = [
                 index_path,
                 style_path,
@@ -2345,6 +2783,38 @@ class PlanDraftParserTests(unittest.TestCase):
                 f"Modify {index_path}.",
                 f"Modify {style_path}.",
                 server_step,
+            ]
+
+            corrected_plan["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": "<html></html>\n",
+                        "new_string": "<html>updated</html>\n",
+                    },
+                },
+                {
+                    "description": f"Modify {style_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": "body {}\n",
+                        "new_string": "body { color: black; }\n",
+                    },
+                },
+                {
+                    "description": server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 127.0.0.1 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
             ]
 
             client = mock.Mock()
@@ -2505,13 +2975,25 @@ class PlanDraftParserTests(unittest.TestCase):
                 "running during validation."
             )
 
-            local_web_failure = valid_plan()
+            local_web_failure = valid_v2_plan()
             local_web_failure["files"] = [index_path]
             local_web_failure["steps"] = [
                 f"Modify {index_path}.",
             ]
 
-            evidence_plan = valid_plan()
+            local_web_failure["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": "<html></html>\n",
+                        "new_string": "<html>updated</html>\n",
+                    },
+                }
+            ]
+
+            evidence_plan = valid_v2_plan()
             evidence_plan["files"] = [
                 index_path,
                 style_path,
@@ -2522,7 +3004,39 @@ class PlanDraftParserTests(unittest.TestCase):
                 server_step,
             ]
 
-            post_evidence_failure = valid_plan()
+            evidence_plan["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": "<html></html>\n",
+                        "new_string": "<html>updated</html>\n",
+                    },
+                },
+                {
+                    "description": f"Modify {style_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": "body {}\n",
+                        "new_string": "body { color: black; }\n",
+                    },
+                },
+                {
+                    "description": server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 127.0.0.1 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
+            ]
+
+            post_evidence_failure = valid_v2_plan()
             post_evidence_failure["files"] = [
                 index_path,
                 style_path,
@@ -2532,7 +3046,28 @@ class PlanDraftParserTests(unittest.TestCase):
                 f"Modify {style_path}.",
             ]
 
-            corrected_plan = valid_plan()
+            post_evidence_failure["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": "<html></html>\n",
+                        "new_string": "<html>updated</html>\n",
+                    },
+                },
+                {
+                    "description": f"Modify {style_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": "body {}\n",
+                        "new_string": "body { color: black; }\n",
+                    },
+                },
+            ]
+
+            corrected_plan = valid_v2_plan()
             corrected_plan["files"] = [
                 index_path,
                 style_path,
@@ -2541,6 +3076,38 @@ class PlanDraftParserTests(unittest.TestCase):
                 f"Modify {index_path}.",
                 f"Modify {style_path}.",
                 server_step,
+            ]
+
+            corrected_plan["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": "<html></html>\n",
+                        "new_string": "<html>updated</html>\n",
+                    },
+                },
+                {
+                    "description": f"Modify {style_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": style_path,
+                        "old_string": "body {}\n",
+                        "new_string": "body { color: black; }\n",
+                    },
+                },
+                {
+                    "description": server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 127.0.0.1 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
             ]
 
             client = mock.Mock()
@@ -2741,19 +3308,35 @@ class PlanDraftParserTests(unittest.TestCase):
                     '<html><script src="script.js"></script></html>\n'
                 )
 
-            invalid_plan = valid_plan()
+            invalid_plan = valid_v2_plan()
             invalid_plan["title"] = "Update page"
             invalid_plan["objective"] = "Update the local webpage."
             invalid_plan["files"] = [index_path]
             invalid_plan["steps"] = [
                 f"Modify {index_path}.",
             ]
+            invalid_plan["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": (
+                            '<html><script src="script.js"></script></html>\n'
+                        ),
+                        "new_string": (
+                            '<html class="updated"><script '
+                            'src="script.js"></script></html>\n'
+                        ),
+                    },
+                }
+            ]
             invalid_plan["validation"] = [{
                 "command": f"grep -Fq 'script.js' {index_path}",
                 "expected": "The page references script.js.",
             }]
 
-            corrected_plan = valid_plan()
+            corrected_plan = valid_v2_plan()
             corrected_plan["title"] = "Update page"
             corrected_plan["objective"] = "Update the local webpage."
             corrected_plan["files"] = [
@@ -2768,6 +3351,45 @@ class PlanDraftParserTests(unittest.TestCase):
                     "--bind 127.0.0.1 >/dev/null 2>&1 &` so it remains "
                     "running during validation."
                 ),
+            ]
+            corrected_plan["work_units"] = [
+                {
+                    "description": f"Modify {index_path}.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": index_path,
+                        "old_string": (
+                            '<html><script src="script.js"></script></html>\n'
+                        ),
+                        "new_string": (
+                            '<html class="updated"><script '
+                            'src="script.js"></script></html>\n'
+                        ),
+                    },
+                },
+                {
+                    "description": f"Create {script_path}.",
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": script_path,
+                        "content": "console.log('ready');\n",
+                    },
+                },
+                {
+                    "description": (
+                        "Run `nohup python3 -m http.server 8000 "
+                        "--bind 127.0.0.1 >/dev/null 2>&1 &` so it remains "
+                        "running during validation."
+                    ),
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 127.0.0.1 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
             ]
             corrected_plan["validation"] = [
                 {
@@ -3056,7 +3678,7 @@ class PlanDraftParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             index_path = os.path.join(directory, "index.html")
 
-            payload = valid_plan()
+            payload = valid_v2_plan()
             payload["objective"] = "Create a local webpage."
             payload["files"] = [index_path]
             payload["steps"] = [
@@ -3066,6 +3688,31 @@ class PlanDraftParserTests(unittest.TestCase):
                     "--bind 127.0.0.1 >/dev/null 2>&1 &` so it remains "
                     "running during validation."
                 ),
+            ]
+            payload["work_units"] = [
+                {
+                    "description": f"Create {index_path}.",
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": index_path,
+                        "content": "<html></html>\n",
+                    },
+                },
+                {
+                    "description": (
+                        "Run `nohup python3 -m http.server 8000 "
+                        "--bind 127.0.0.1 >/dev/null 2>&1 &` so it remains "
+                        "running during validation."
+                    ),
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 127.0.0.1 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
             ]
             payload["validation"] = [{
                 "command": f"test -f {index_path}",
@@ -3175,10 +3822,21 @@ class PlanDraftParserTests(unittest.TestCase):
             with open(target, "w") as handle:
                 handle.write("PLAN TEST\n")
 
-            payload = valid_plan()
+            payload = valid_v2_plan()
             payload["files"] = [target]
             payload["steps"] = [
                 "Modify plan-ui-test.txt.",
+            ]
+            payload["work_units"] = [
+                {
+                    "description": "Modify plan-ui-test.txt.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": target,
+                        "old_string": "PLAN TEST\n",
+                        "new_string": "PLAN TEST UPDATED\n",
+                    },
+                }
             ]
 
             client = mock.Mock()
@@ -3291,10 +3949,21 @@ class PlanDraftParserTests(unittest.TestCase):
             with open(target, "w") as handle:
                 handle.write("PLAN TEST\n")
 
-            payload = valid_plan()
+            payload = valid_v2_plan()
             payload["files"] = [target]
             payload["steps"] = [
                 "Modify plan-ui-test.txt.",
+            ]
+            payload["work_units"] = [
+                {
+                    "description": "Modify plan-ui-test.txt.",
+                    "tool": "edit_file",
+                    "arguments": {
+                        "path": target,
+                        "old_string": "PLAN TEST\n",
+                        "new_string": "PLAN TEST UPDATED\n",
+                    },
+                }
             ]
 
             client = mock.Mock()
@@ -3405,7 +4074,7 @@ class PlanDraftParserTests(unittest.TestCase):
         agent.messages = [{"role": "assistant", "content": "original"}]
 
         reply = agent._capture_plan_draft(
-            fenced(valid_plan())
+            fenced(valid_v2_plan())
             + "\n\n[Plan draft #999 is ready for approval.]"
         )
 
@@ -3428,7 +4097,7 @@ class PlanDraftParserTests(unittest.TestCase):
 
 
     def test_plan_format_retry_has_independent_recovery_budget(self):
-        invalid = valid_plan()
+        invalid = valid_v2_plan()
         invalid.pop("non_goals")
         invalid.pop("risks")
 
@@ -3445,7 +4114,7 @@ class PlanDraftParserTests(unittest.TestCase):
             },
             {
                 "role": "assistant",
-                "content": fenced(valid_plan()),
+                "content": fenced(valid_v2_plan()),
             },
         ]
 
@@ -3454,6 +4123,15 @@ class PlanDraftParserTests(unittest.TestCase):
                 core,
                 "OllamaClient",
                 return_value=client,
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_normalize_plan_transition_validation",
+                side_effect=lambda content, canonical: (
+                    content,
+                    canonical,
+                    None,
+                ),
             ),
             mock.patch.object(
                 core.memory,
@@ -3545,7 +4223,7 @@ class PlanDraftParserTests(unittest.TestCase):
             },
             {
                 "role": "assistant",
-                "content": fenced(valid_plan()),
+                "content": fenced(valid_v2_plan()),
             },
         ]
 
@@ -3554,6 +4232,15 @@ class PlanDraftParserTests(unittest.TestCase):
                 core,
                 "OllamaClient",
                 return_value=client,
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_normalize_plan_transition_validation",
+                side_effect=lambda content, canonical: (
+                    content,
+                    canonical,
+                    None,
+                ),
             ),
             mock.patch.object(
                 core.memory,
@@ -3643,7 +4330,7 @@ class PlanDraftParserTests(unittest.TestCase):
             },
             {
                 "role": "assistant",
-                "content": fenced(valid_plan()),
+                "content": fenced(valid_v2_plan()),
             },
         ]
 
@@ -3652,6 +4339,15 @@ class PlanDraftParserTests(unittest.TestCase):
                 core,
                 "OllamaClient",
                 return_value=client,
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_normalize_plan_transition_validation",
+                side_effect=lambda content, canonical: (
+                    content,
+                    canonical,
+                    None,
+                ),
             ),
             mock.patch.object(
                 core.memory,
@@ -3721,6 +4417,360 @@ class PlanDraftParserTests(unittest.TestCase):
             "[Plan draft #64 is ready for approval.]",
             reply,
         )
+
+    def test_plan_critic_invalid_output_fails_open(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.workdir = "/var/www/LiamAgent"
+        agent._read_paths_this_turn = set()
+        agent._tool_events = []
+        agent.on_status = mock.Mock()
+        agent.client = mock.Mock()
+        agent.helper_client = mock.Mock()
+        agent.helper_client.chat.return_value = {
+            "role": "assistant",
+            "content": "not valid structured critique output",
+        }
+
+        issues = agent._critique_plan_draft(
+            "Update agent/core.py.",
+            json.dumps(valid_v2_plan(), sort_keys=True),
+        )
+
+        self.assertEqual(issues, [])
+        agent.on_status.assert_called_once()
+        self.assertIn(
+            "Plan critic returned invalid structured output",
+            agent.on_status.call_args.args[0],
+        )
+
+    def test_plan_critic_without_distinct_helper_does_not_call_primary(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.workdir = "/var/www/LiamAgent"
+        agent._read_paths_this_turn = set()
+        agent._tool_events = []
+        agent.on_status = mock.Mock()
+        agent.client = mock.Mock()
+        agent.helper_client = agent.client
+
+        issues = agent._critique_plan_draft(
+            "Update agent/core.py.",
+            json.dumps(valid_v2_plan(), sort_keys=True),
+        )
+
+        self.assertEqual(issues, [])
+        agent.client.chat.assert_not_called()
+        agent.on_status.assert_called_once()
+        self.assertIn(
+            "no separate helper is configured",
+            agent.on_status.call_args.args[0],
+        )
+
+    def test_plan_critic_helper_error_does_not_fall_back_to_primary(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.workdir = "/var/www/LiamAgent"
+        agent._read_paths_this_turn = set()
+        agent._tool_events = []
+        agent.on_status = mock.Mock()
+        agent.client = mock.Mock()
+        agent.helper_client = mock.Mock()
+        agent.helper_client.chat.return_value = {
+            "_liam_error": "helper transport failed",
+        }
+
+        issues = agent._critique_plan_draft(
+            "Update agent/core.py.",
+            json.dumps(valid_v2_plan(), sort_keys=True),
+        )
+
+        self.assertEqual(issues, [])
+        agent.helper_client.chat.assert_called_once()
+        agent.client.chat.assert_not_called()
+        agent.on_status.assert_called_once()
+        self.assertIn(
+            "separate helper returned an error",
+            agent.on_status.call_args.args[0],
+        )
+
+    def test_plan_critique_requests_exactly_one_tool_free_reconsideration(self):
+        initial = valid_v2_plan()
+        initial["steps"] = ["Apply the first approved change."]
+        initial["work_units"][0]["description"] = (
+            "Apply the first approved change."
+        )
+
+        revised = valid_v2_plan()
+        revised["steps"] = ["Apply the corrected approved change."]
+        revised["work_units"][0]["description"] = (
+            "Apply the corrected approved change."
+        )
+
+        client = mock.Mock()
+        client.chat.side_effect = [
+            {
+                "role": "assistant",
+                "content": fenced(initial),
+            },
+            {
+                "role": "assistant",
+                "content": fenced(revised),
+            },
+        ]
+
+        with (
+            mock.patch.object(
+                core,
+                "OllamaClient",
+                return_value=client,
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_normalize_plan_transition_validation",
+                side_effect=lambda content, canonical: (
+                    content,
+                    canonical,
+                    None,
+                ),
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_critique_plan_draft",
+                return_value=[
+                    "The first work unit uses the wrong approved replacement."
+                ],
+            ) as critic,
+            mock.patch.object(
+                core.Agent,
+                "_plan_recovery_evidence_context",
+                return_value="EVIDENCE SENTINEL",
+            ),
+            mock.patch.object(
+                core.memory,
+                "load_recent_notes",
+                return_value=[],
+            ),
+            mock.patch.object(
+                core.memory,
+                "load_recent_messages",
+                return_value=[],
+            ),
+            mock.patch.object(
+                core.memory,
+                "match_lesson_records",
+                return_value=[],
+            ),
+            mock.patch.object(
+                core.memory,
+                "save_message",
+            ),
+            mock.patch.object(
+                core.memory,
+                "get_latest_plan",
+                return_value=None,
+            ),
+            mock.patch.object(
+                core.memory,
+                "create_plan",
+                return_value=101,
+            ) as create_plan,
+            mock.patch.dict(
+                os.environ,
+                {"LIAM_HELPER_OLLAMA_URL": ""},
+                clear=False,
+            ),
+        ):
+            agent = core.Agent(
+                channel="gui",
+                plan_mode=True,
+                workdir="/var/www/LiamAgent",
+                session_id=17,
+            )
+            agent.on_status = mock.Mock()
+
+            reply = agent.step(
+                "Create a complete implementation plan, but do not execute it."
+            )
+
+        self.assertEqual(client.chat.call_count, 2)
+        critic.assert_called_once()
+        create_plan.assert_called_once()
+
+        retry_kwargs = client.chat.call_args_list[1].kwargs
+        self.assertEqual(retry_kwargs.get("tools"), [])
+        self.assertEqual(
+            retry_kwargs.get("response_format"),
+            core.PLAN_DRAFT_JSON_SCHEMA,
+        )
+
+        retry_messages = client.chat.call_args_list[1].args[0]
+        retry_text = retry_messages[-1]["content"]
+        initial_canonical, initial_error = core._extract_plan_draft(
+            fenced(initial),
+            require_v2=True,
+        )
+        self.assertIsNone(initial_error)
+
+        self.assertIn(
+            "The first work unit uses the wrong approved replacement.",
+            retry_text,
+        )
+        self.assertIn(initial_canonical, retry_text)
+        self.assertIn("--- BEGIN PROPOSED PLAN ---", retry_text)
+        self.assertIn("--- END PROPOSED PLAN ---", retry_text)
+        self.assertIn("EVIDENCE SENTINEL", retry_text)
+        self.assertIn(
+            "[Plan draft #101 is ready for approval.]",
+            reply,
+        )
+
+
+    def test_final_fallback_critique_allows_one_tool_free_revision(self):
+        initial = valid_v2_plan()
+        initial["steps"] = ["Apply the fallback initial change."]
+        initial["work_units"][0]["description"] = (
+            "Apply the fallback initial change."
+        )
+
+        revised = valid_v2_plan()
+        revised["steps"] = ["Apply the fallback corrected change."]
+        revised["work_units"][0]["description"] = (
+            "Apply the fallback corrected change."
+        )
+
+        client = mock.Mock()
+        client.chat.side_effect = [
+            {
+                "role": "assistant",
+                "content": fenced(initial),
+            },
+            {
+                "role": "assistant",
+                "content": fenced(revised),
+            },
+        ]
+
+        with (
+            mock.patch.object(
+                core,
+                "MAX_STEPS",
+                0,
+            ),
+            mock.patch.object(
+                core,
+                "OllamaClient",
+                return_value=client,
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_plan_draft_required_for_request",
+                return_value=True,
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_normalize_plan_transition_validation",
+                side_effect=lambda content, canonical: (
+                    content,
+                    canonical,
+                    None,
+                ),
+            ),
+            mock.patch.object(
+                core.Agent,
+                "_critique_plan_draft",
+                return_value=[
+                    "The fallback work unit needs the corrected approved edit."
+                ],
+            ) as critic,
+            mock.patch.object(
+                core.Agent,
+                "_plan_recovery_evidence_context",
+                return_value="FALLBACK EVIDENCE SENTINEL",
+            ),
+            mock.patch.object(
+                core.memory,
+                "load_recent_notes",
+                return_value=[],
+            ),
+            mock.patch.object(
+                core.memory,
+                "load_recent_messages",
+                return_value=[],
+            ),
+            mock.patch.object(
+                core.memory,
+                "match_lesson_records",
+                return_value=[],
+            ),
+            mock.patch.object(
+                core.memory,
+                "save_message",
+            ),
+            mock.patch.object(
+                core.memory,
+                "get_latest_plan",
+                return_value=None,
+            ),
+            mock.patch.object(
+                core.memory,
+                "create_plan",
+                return_value=102,
+            ) as create_plan,
+            mock.patch.dict(
+                os.environ,
+                {"LIAM_HELPER_OLLAMA_URL": ""},
+                clear=False,
+            ),
+        ):
+            agent = core.Agent(
+                channel="gui",
+                plan_mode=True,
+                workdir="/var/www/LiamAgent",
+                session_id=17,
+            )
+            agent.on_status = mock.Mock()
+
+            reply = agent.step(
+                "Create a complete implementation plan, but do not execute it."
+            )
+
+        self.assertEqual(client.chat.call_count, 2)
+        critic.assert_called_once()
+        create_plan.assert_called_once()
+
+        revision_kwargs = client.chat.call_args_list[1].kwargs
+        self.assertEqual(revision_kwargs.get("tools"), [])
+        self.assertEqual(
+            revision_kwargs.get("response_format"),
+            core.PLAN_DRAFT_JSON_SCHEMA,
+        )
+
+        revision_messages = client.chat.call_args_list[1].args[0]
+        revision_text = revision_messages[-1]["content"]
+        initial_canonical, initial_error = core._extract_plan_draft(
+            fenced(initial),
+            require_v2=True,
+        )
+        revised_canonical, revised_error = core._extract_plan_draft(
+            fenced(revised),
+            require_v2=True,
+        )
+        self.assertIsNone(initial_error)
+        self.assertIsNone(revised_error)
+
+        self.assertIn(initial_canonical, revision_text)
+        self.assertIn("FALLBACK EVIDENCE SENTINEL", revision_text)
+        self.assertIn(
+            "The fallback work unit needs the corrected approved edit.",
+            revision_text,
+        )
+        self.assertEqual(
+            create_plan.call_args.args[1],
+            revised_canonical,
+        )
+        self.assertIn(
+            "[Plan draft #102 is ready for approval.]",
+            reply,
+        )
+
 
 
 if __name__ == "__main__":

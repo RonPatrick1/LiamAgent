@@ -329,6 +329,45 @@ class OllamaErrorTests(unittest.TestCase):
         self.assertEqual(payload["format"], schema)
 
 
+    def test_tool_call_response_normalizes_null_content_to_empty_string(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {
+                                "path": "agent/core.py",
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+
+        with mock.patch(
+            "agent.llm.requests.post",
+            return_value=response,
+        ):
+            result = OllamaClient().chat(
+                [{"role": "user", "content": "read the file"}],
+                tools=[{"type": "function"}],
+            )
+
+        self.assertEqual(result["content"], "")
+        self.assertEqual(
+            result["tool_calls"][0]["function"]["name"],
+            "read_file",
+        )
+        self.assertEqual(
+            result["tool_calls"][0]["function"]["arguments"],
+            {"path": "agent/core.py"},
+        )
+
     def test_transport_error_is_machine_detectable_for_fallback(self):
         with mock.patch(
             "agent.llm.requests.post",

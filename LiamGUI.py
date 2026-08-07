@@ -2554,8 +2554,23 @@ class LiamWindow(Gtk.ApplicationWindow):
             if match:
                 outcomes[match.group(2).splitlines()[0].strip()] = match.group(1)
 
+        work_units = payload.get("work_units")
+        if isinstance(work_units, list) and work_units:
+            implementation_actions = [
+                item.get("description")
+                for item in work_units
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("description"), str)
+                    and item.get("description").strip()
+                )
+            ]
+        else:
+            # Legacy Plans have only human-readable steps.
+            implementation_actions = payload.get("steps") or []
+
         end_iter = self.plan_steps_buffer.get_end_iter()
-        for index, step_text in enumerate(payload.get("steps") or [], start=1):
+        for index, step_text in enumerate(implementation_actions, start=1):
             self.plan_steps_buffer.insert(end_iter, f"{index}. {step_text}\n")
             end_iter = self.plan_steps_buffer.get_end_iter()
 
@@ -2657,8 +2672,8 @@ class LiamWindow(Gtk.ApplicationWindow):
             Gtk.Label(
                 label=(
                     "Review the exact stored plan below. Approving it "
-                    "authorizes Liam to begin its implementation and "
-                    "validation cycles."
+                    "authorizes Liam to execute its exact work units and "
+                    "then run the listed validation checks."
                 ),
                 xalign=0,
             ),

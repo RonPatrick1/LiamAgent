@@ -12,12 +12,26 @@ def fenced(payload):
 
 
 def plan_payload():
+    description = (
+        "Run the approved project repair command using the inspected evidence."
+    )
     return {
+        "version": core.PLAN_VERSION,
         "title": "Repair project",
         "objective": "Repair the observed project defects.",
         "files": [],
         "steps": [
-            "Use the inspected project evidence to identify and repair the defect.",
+            description,
+        ],
+        "work_units": [
+            {
+                "description": description,
+                "tool": "run_shell_command",
+                "arguments": {
+                    "command": "python3 -m unittest discover -s tests -t .",
+                },
+                "affected_paths": [],
+            }
         ],
         "validation": [
             {

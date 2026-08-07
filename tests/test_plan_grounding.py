@@ -20,20 +20,44 @@ TEST_LISTENING_PORTS_RESULT = (
 class PlanGroundingTests(unittest.TestCase):
     def test_grounding_tools_do_not_replace_structured_plan(self):
         with tempfile.TemporaryDirectory() as directory:
+            index_path = os.path.join(directory, "index.html")
+            server_step = (
+                "Serve the directory with `nohup python3 -m "
+                "http.server 8000 --bind 0.0.0.0 "
+                ">/dev/null 2>&1 &` so it remains running during "
+                "validation."
+            )
             plan = {
+                "version": core.PLAN_VERSION,
                 "title": "Create Fluxa webpage",
                 "objective": "Create a local webpage on port 8000.",
                 "files": [
-                    os.path.join(directory, "index.html"),
+                    index_path,
                 ],
                 "steps": [
                     "Create the listed webpage file.",
-                    (
-                        "Serve the directory with `nohup python3 -m "
-                        "http.server 8000 --bind 0.0.0.0 "
-                        ">/dev/null 2>&1 &` so it remains running during "
-                        "validation."
-                    ),
+                    server_step,
+                ],
+                "work_units": [
+                    {
+                        "description": "Create the listed webpage file.",
+                        "tool": "write_file",
+                        "arguments": {
+                            "path": index_path,
+                            "content": "<html></html>\n",
+                        },
+                    },
+                    {
+                        "description": server_step,
+                        "tool": "run_shell_command",
+                        "arguments": {
+                            "command": (
+                                "nohup python3 -m http.server 8000 "
+                                "--bind 0.0.0.0 >/dev/null 2>&1 &"
+                            ),
+                        },
+                        "affected_paths": [],
+                    },
                 ],
                 "validation": [
                     {

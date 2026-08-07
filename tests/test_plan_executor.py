@@ -109,235 +109,349 @@ def install_validation_results(agent, results):
     agent._execute_tool = mock.Mock(side_effect=execute)
 
 
+class PlanWorkUnitContractTests(unittest.TestCase):
+    def test_work_unit_contract_requires_exact_approved_arguments(self):
+        work_unit = {
+            "description": "Apply the approved edit.",
+            "tool": "edit_file",
+            "arguments": {
+                "path": "agent/core.py",
+                "old_string": "old text",
+                "new_string": "new text",
+            },
+        }
+        contract = core.Agent._plan_work_unit_contract(work_unit)
+
+        exact_event = core.build_tool_event(
+            "edit_file",
+            dict(work_unit["arguments"]),
+            "Updated agent/core.py",
+            {
+                "tool": "edit_file",
+                "args": dict(work_unit["arguments"]),
+                "result": "Updated agent/core.py",
+                "status": "success",
+                "reason": "completed",
+            },
+            core.TOOL_DEFINITIONS,
+        )
+        wrong_event = core.build_tool_event(
+            "edit_file",
+            {
+                **work_unit["arguments"],
+                "new_string": "different text",
+            },
+            "Updated agent/core.py",
+            {
+                "tool": "edit_file",
+                "args": {},
+                "result": "Updated agent/core.py",
+                "status": "success",
+                "reason": "completed",
+            },
+            core.TOOL_DEFINITIONS,
+        )
+
+        self.assertTrue(
+            core.event_satisfies_contract(contract, exact_event)
+        )
+        self.assertFalse(
+            core.event_satisfies_contract(contract, wrong_event)
+        )
+
+
+class ApprovedPlanToolAuthorizationTests(unittest.TestCase):
+    def test_exact_approved_work_unit_skips_confirmation_only_for_exact_call(self):
+        agent = build_path_guard_agent("/var/www/LiamAgent")
+        agent.auto_confirm = False
+        agent.session_id = None
+        agent.on_confirm = mock.Mock(return_value=False)
+
+        work_unit = {
+            "description": "Write the approved file contents.",
+            "tool": "write_file",
+            "arguments": {
+                "path": "agent/core.py",
+                "content": "approved content",
+            },
+        }
+        agent._active_plan_execution = {
+            "plan_id": 41,
+            "payload": {
+                "files": ["agent/core.py"],
+                "steps": [work_unit["description"]],
+                "validation": [],
+            },
+            "phase": "implementation",
+            "current_work_unit": work_unit,
+        }
+
+        implementation = mock.Mock(
+            return_value="Wrote 16 bytes to /var/www/LiamAgent/agent/core.py"
+        )
+
+        with mock.patch.dict(
+            core.TOOL_IMPL,
+            {"write_file": implementation},
+        ):
+            exact_result = agent._run_tool(
+                "write_file",
+                dict(work_unit["arguments"]),
+            )
+            wrong_result = agent._run_tool(
+                "write_file",
+                {
+                    "path": "agent/core.py",
+                    "content": "different content",
+                },
+            )
+
+        self.assertTrue(exact_result.startswith("Wrote "))
+        self.assertEqual(wrong_result, "User denied this tool call.")
+        implementation.assert_called_once()
+        agent.on_confirm.assert_called_once()
+
 class ApprovedPlanExecutorTests(unittest.TestCase):
     @mock.patch.object(core.memory, "transition_plan", return_value=True)
     @mock.patch.object(core.memory, "get_plan")
-    def test_cycle_limit_continues_same_step_instead_of_ending_plan(
+    def test_version_2_validation_failure_does_not_start_ai_repair(
         self,
         get_plan,
         transition_plan,
     ):
-        get_plan.return_value = plan_record()
+        record = plan_record()
+        payload = json.loads(record["content"])
+        payload["version"] = core.PLAN_VERSION
+        payload["steps"] = ["Write the approved contents."]
+        payload["work_units"] = [
+            {
+                "description": "Write the approved contents.",
+                "tool": "write_file",
+                "arguments": {
+                    "path": "agent/core.py",
+                    "content": "approved content",
+                },
+            }
+        ]
+        record["content"] = json.dumps(payload)
+        get_plan.return_value = record
+
         agent = build_agent()
-        install_step_replies(
-            agent,
-            [
-                "(stopped: reached the reasoning step limit "
-                "without a final answer)",
-                "First step complete.",
-                "Second step complete.",
-            ],
+        agent.step = mock.Mock()
+
+        def execute(name, args):
+            result = "Wrote 16 bytes to /var/www/LiamAgent/agent/core.py"
+            agent._tool_events.append(
+                core.build_tool_event(
+                    name,
+                    dict(args),
+                    result,
+                    {
+                        "tool": name,
+                        "args": dict(args),
+                        "result": result,
+                        "status": "success",
+                        "reason": "completed",
+                    },
+                    core.TOOL_DEFINITIONS,
+                )
+            )
+            return result
+
+        agent._execute_tool = mock.Mock(side_effect=execute)
+        agent._run_plan_validation = mock.Mock(
+            return_value=[
+                {
+                    "command": "python3 -m unittest discover -s tests",
+                    "expected": "Exit code 0.",
+                    "result": "One test failed.\n[exit code: 1]",
+                    "passed": False,
+                }
+            ]
         )
-        install_validation_results(
-            agent,
-            ["All tests passed.\n[exit code: 0]"],
+
+        result = agent.execute_plan(41)
+
+        self.assertTrue(result.startswith("FAIL:"))
+        agent.step.assert_not_called()
+
+    @mock.patch.object(core.memory, "transition_plan", return_value=True)
+    @mock.patch.object(core.memory, "get_plan")
+    def test_version_2_edit_work_unit_rereads_target_before_exact_edit(
+        self,
+        get_plan,
+        transition_plan,
+    ):
+        record = plan_record()
+        payload = json.loads(record["content"])
+        payload["version"] = core.PLAN_VERSION
+        payload["steps"] = ["Apply the approved edit."]
+        payload["work_units"] = [
+            {
+                "description": "Apply the approved edit.",
+                "tool": "edit_file",
+                "arguments": {
+                    "path": "agent/core.py",
+                    "old_string": "old text",
+                    "new_string": "new text",
+                },
+            }
+        ]
+        record["content"] = json.dumps(payload)
+        get_plan.return_value = record
+
+        agent = build_agent()
+        agent.step = mock.Mock()
+
+        def execute(name, args):
+            if name == "read_file":
+                return "old text"
+
+            result = "Updated /var/www/LiamAgent/agent/core.py"
+            agent._tool_events.append(
+                core.build_tool_event(
+                    name,
+                    dict(args),
+                    result,
+                    {
+                        "tool": name,
+                        "args": dict(args),
+                        "result": result,
+                        "status": "success",
+                        "reason": "completed",
+                    },
+                    core.TOOL_DEFINITIONS,
+                )
+            )
+            return result
+
+        agent._execute_tool = mock.Mock(side_effect=execute)
+        agent._run_plan_validation = mock.Mock(
+            return_value=[
+                {
+                    "command": "python3 -m unittest discover -s tests",
+                    "expected": "Exit code 0.",
+                    "result": "All tests passed.\n[exit code: 0]",
+                    "passed": True,
+                }
+            ]
         )
 
         result = agent.execute_plan(41)
 
         self.assertTrue(result.startswith("PASS:"))
-        self.assertEqual(agent.step.call_count, 3)
+        agent.step.assert_not_called()
         self.assertEqual(
-            transition_plan.call_args_list,
+            agent._execute_tool.call_args_list[:2],
             [
-                mock.call(41, "approved", "running"),
                 mock.call(
-                    41,
-                    "running",
-                    "passed",
-                    result=mock.ANY,
+                    "read_file",
+                    {"path": "agent/core.py"},
+                ),
+                mock.call(
+                    "edit_file",
+                    {
+                        "path": "agent/core.py",
+                        "old_string": "old text",
+                        "new_string": "new text",
+                    },
                 ),
             ],
         )
 
     @mock.patch.object(core.memory, "transition_plan", return_value=True)
     @mock.patch.object(core.memory, "get_plan")
-    def test_failed_validation_triggers_repair_and_rerun(
+    def test_version_2_plan_executes_stored_work_unit_without_ai_step(
         self,
         get_plan,
         transition_plan,
     ):
-        get_plan.return_value = plan_record()
+        record = plan_record()
+        payload = json.loads(record["content"])
+        payload["version"] = core.PLAN_VERSION
+        payload["steps"] = ["Write the approved contents."]
+        payload["work_units"] = [
+            {
+                "description": "Write the approved contents.",
+                "tool": "write_file",
+                "arguments": {
+                    "path": "agent/core.py",
+                    "content": "approved content",
+                },
+            }
+        ]
+        record["content"] = json.dumps(payload)
+        get_plan.return_value = record
+
         agent = build_agent()
-        install_step_replies(
-            agent,
-            [
-                "First step complete.",
-                "Second step complete.",
-                "Validation repair complete.",
-            ],
-        )
-        install_validation_results(
-            agent,
-            [
-                "One test failed.\n[exit code: 1]",
-                "All tests passed.\n[exit code: 0]",
-            ],
+        agent.step = mock.Mock()
+        def execute(name, args):
+            result = (
+                "Wrote 16 bytes to /var/www/LiamAgent/agent/core.py"
+            )
+            agent._tool_events.append(
+                core.build_tool_event(
+                    name,
+                    dict(args),
+                    result,
+                    {
+                        "tool": name,
+                        "args": dict(args),
+                        "result": result,
+                        "status": "success",
+                        "reason": "completed",
+                    },
+                    core.TOOL_DEFINITIONS,
+                )
+            )
+            return result
+
+        agent._execute_tool = mock.Mock(side_effect=execute)
+        agent._run_plan_validation = mock.Mock(
+            return_value=[
+                {
+                    "command": "python3 -m unittest discover -s tests",
+                    "expected": "Exit code 0.",
+                    "result": "All tests passed.\n[exit code: 0]",
+                    "passed": True,
+                }
+            ]
         )
 
         result = agent.execute_plan(41)
 
         self.assertTrue(result.startswith("PASS:"))
-        self.assertEqual(agent.step.call_count, 3)
-        self.assertEqual(agent._execute_tool.call_count, 2)
+        agent.step.assert_not_called()
+        agent._execute_tool.assert_any_call(
+            "write_file",
+            {
+                "path": "agent/core.py",
+                "content": "approved content",
+            },
+        )
 
     @mock.patch.object(core.memory, "transition_plan", return_value=True)
     @mock.patch.object(core.memory, "get_plan")
-    def test_toolless_validation_repair_retries_before_validation(
+    def test_legacy_string_only_plan_fails_before_execution(
         self,
         get_plan,
         transition_plan,
     ):
         get_plan.return_value = plan_record()
         agent = build_agent()
-        replies = [
-            "First step complete.",
-            "Second step complete.",
-            "Repair described without a tool.",
-            "Validation repair complete.",
-        ]
-        call_number = 0
-
-        def step(_prompt):
-            nonlocal call_number
-            reply = replies[call_number]
-            call_number += 1
-
-            if call_number == 3:
-                agent._tool_events = []
-            else:
-                agent._tool_events = [{
-                    "tool": "edit_file",
-                    "args": {},
-                    "result": "Applied mocked Plan work.",
-                    "status": "success",
-                    "reason": "completed",
-                }]
-
-            return reply
-
-        agent.step = mock.Mock(side_effect=step)
-        install_validation_results(
-            agent,
-            [
-                "One test failed.\n[exit code: 1]",
-                "All tests passed.\n[exit code: 0]",
-            ],
-        )
-
-        result = agent.execute_plan(41)
-
-        self.assertTrue(result.startswith("PASS:"))
-        self.assertEqual(agent.step.call_count, 4)
-        self.assertEqual(agent._execute_tool.call_count, 2)
-        self.assertIn(
-            mock.call(
-                "  [approved plan validation repair produced no "
-                "successful corrective action event; retrying the "
-                "same repair...]"
-            ),
-            agent.on_status.call_args_list,
-        )
-
-    @mock.patch.object(core.memory, "transition_plan", return_value=True)
-    @mock.patch.object(core.memory, "get_plan")
-    def test_three_toolless_validation_repairs_stop_without_rerun(
-        self,
-        get_plan,
-        transition_plan,
-    ):
-        get_plan.return_value = plan_record()
-        agent = build_agent()
-        replies = [
-            "First step complete.",
-            "Second step complete.",
-            "Repair prose one.",
-            "Repair prose two.",
-            "Repair prose three.",
-        ]
-        call_number = 0
-
-        def step(_prompt):
-            nonlocal call_number
-            reply = replies[call_number]
-            call_number += 1
-
-            if call_number <= 2:
-                agent._tool_events = [{
-                    "tool": "edit_file",
-                    "args": {},
-                    "result": "Applied mocked Plan step.",
-                    "status": "success",
-                    "reason": "completed",
-                }]
-            else:
-                agent._tool_events = []
-
-            return reply
-
-        agent.step = mock.Mock(side_effect=step)
-        install_validation_results(
-            agent,
-            ["Same failure.\n[exit code: 1]"],
-        )
+        agent.step = mock.Mock()
 
         result = agent.execute_plan(41)
 
         self.assertTrue(result.startswith("FAIL:"))
-        self.assertIn(
-            "validation repair produced no successful corrective "
-            "action event in three consecutive attempts",
-            result,
-        )
-        self.assertEqual(agent.step.call_count, 5)
-        self.assertEqual(agent._execute_tool.call_count, 1)
-        transition_plan.assert_called_with(
-            41,
-            "running",
-            "failed",
-            result=mock.ANY,
-        )
+        self.assertIn("legacy string-only Plan", result)
+        agent.step.assert_not_called()
+        transition_plan.assert_not_called()
 
-    @mock.patch.object(core.memory, "transition_plan", return_value=True)
-    @mock.patch.object(core.memory, "get_plan")
-    def test_repeated_identical_validation_failure_stops_as_failure(
-        self,
-        get_plan,
-        transition_plan,
-    ):
-        get_plan.return_value = plan_record()
-        agent = build_agent()
-        install_step_replies(
-            agent,
-            [
-                "First step complete.",
-                "Second step complete.",
-                "Repair attempt one.",
-                "Repair attempt two.",
-            ],
-        )
-        install_validation_results(
-            agent,
-            [
-                "Same failure.\n[exit code: 1]",
-                "Same failure.\n[exit code: 1]",
-                "Same failure.\n[exit code: 1]",
-            ],
-        )
 
-        result = agent.execute_plan(41)
 
-        self.assertTrue(result.startswith("FAIL:"))
-        self.assertIn(
-            "same failure 3 consecutive times",
-            result,
-        )
-        transition_plan.assert_called_with(
-            41,
-            "running",
-            "failed",
-            result=mock.ANY,
-        )
+
+
 
     def test_approved_execution_rejects_invented_nonexistent_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -548,45 +662,157 @@ class ApprovedPlanExecutorTests(unittest.TestCase):
         get_plan,
         transition_plan,
     ):
-        get_plan.return_value = plan_record()
+        record = plan_record()
+        payload = json.loads(record["content"])
+        descriptions = list(payload["steps"])
+        payload["version"] = core.PLAN_VERSION
+        payload["files"] = ["script.js"]
+        payload["work_units"] = [
+            {
+                "description": description,
+                "tool": "write_file",
+                "arguments": {
+                    "path": "script.js",
+                    "content": f"approved content {index}",
+                },
+            }
+            for index, description in enumerate(descriptions, start=1)
+        ]
+        record["content"] = json.dumps(payload)
+        get_plan.return_value = record
+
         agent = build_agent()
         observed = []
 
-        def step(_prompt):
-            observed.append(
-                dict(agent._active_plan_execution)
+        def execute(name, args):
+            observed.append(dict(agent._active_plan_execution))
+            result = "Applied approved Plan work."
+            agent._tool_events.append(
+                core.build_tool_event(
+                    name,
+                    dict(args),
+                    result,
+                    {
+                        "tool": name,
+                        "args": dict(args),
+                        "result": result,
+                        "status": "success",
+                        "reason": "completed",
+                    },
+                    core.TOOL_DEFINITIONS,
+                )
             )
-            agent._tool_events = [{
-                "tool": "edit_file",
-                "args": {},
-                "result": "Applied mocked Plan step.",
-                "status": "success",
-                "reason": "completed",
-            }]
-            return "Step complete."
+            return result
 
-        agent.step = mock.Mock(side_effect=step)
-        install_validation_results(
-            agent,
-            ["All tests passed.\n[exit code: 0]"],
+        agent._execute_tool = mock.Mock(side_effect=execute)
+        agent.step = mock.Mock()
+        agent._run_plan_validation = mock.Mock(
+            return_value=[
+                {
+                    "command": "python3 -m unittest",
+                    "expected": "Exit code 0.",
+                    "result": "All tests passed.\n[exit code: 0]",
+                    "passed": True,
+                }
+            ]
         )
 
         result = agent.execute_plan(41)
 
         self.assertTrue(result.startswith("PASS:"))
-        self.assertEqual(len(observed), 2)
+        self.assertEqual(len(observed), len(descriptions))
         self.assertEqual(
             [item["step_number"] for item in observed],
-            [0, 1],
+            list(range(len(descriptions))),
         )
         self.assertEqual(
             [item["current_step"] for item in observed],
-            json.loads(plan_record()["content"])["steps"],
+            descriptions,
+        )
+        self.assertEqual(
+            [item["current_work_unit"] for item in observed],
+            payload["work_units"],
         )
         self.assertTrue(
             all(item["plan_id"] == 41 for item in observed)
         )
+        agent.step.assert_not_called()
         self.assertIsNone(agent._active_plan_execution)
+
+    @mock.patch.object(core.memory, "transition_plan", return_value=True)
+    @mock.patch.object(core.memory, "get_plan")
+    def test_shell_work_unit_does_not_pass_affected_paths_to_tool(
+        self,
+        get_plan,
+        transition_plan,
+    ):
+        record = plan_record()
+        payload = json.loads(record["content"])
+        payload["version"] = core.PLAN_VERSION
+        payload["files"] = ["script.js"]
+        payload["steps"] = ["Create the approved local file."]
+        payload["work_units"] = [
+            {
+                "description": "Create the approved local file.",
+                "tool": "run_shell_command",
+                "arguments": {
+                    "command": "touch script.js",
+                },
+                "affected_paths": ["script.js"],
+            }
+        ]
+        record["content"] = json.dumps(payload)
+        get_plan.return_value = record
+
+        agent = build_agent()
+        agent.step = mock.Mock()
+        observed_args = []
+
+        def execute(name, args):
+            observed_args.append(dict(args))
+            result = "command completed\n[exit code: 0]"
+            agent._tool_events.append(
+                core.build_tool_event(
+                    name,
+                    dict(args),
+                    result,
+                    {
+                        "tool": name,
+                        "args": dict(args),
+                        "result": result,
+                        "status": "success",
+                        "reason": "completed",
+                    },
+                    core.TOOL_DEFINITIONS,
+                )
+            )
+            return result
+
+        agent._execute_tool = mock.Mock(side_effect=execute)
+        agent._run_plan_validation = mock.Mock(
+            return_value=[
+                {
+                    "command": "test -f script.js",
+                    "expected": "script.js exists.",
+                    "result": "[exit code: 0]",
+                    "passed": True,
+                }
+            ]
+        )
+
+        result = agent.execute_plan(41)
+
+        self.assertTrue(result.startswith("PASS:"))
+        self.assertEqual(
+            observed_args,
+            [{"command": "touch script.js"}],
+        )
+        self.assertNotIn("affected_paths", observed_args[0])
+        self.assertEqual(
+            payload["work_units"][0]["affected_paths"],
+            ["script.js"],
+        )
+        agent.step.assert_not_called()
 
     @mock.patch.object(core.memory, "transition_plan", return_value=True)
     @mock.patch.object(core.memory, "get_plan")
@@ -595,7 +821,23 @@ class ApprovedPlanExecutorTests(unittest.TestCase):
         get_plan,
         transition_plan,
     ):
-        get_plan.return_value = plan_record()
+        record = plan_record()
+        payload = json.loads(record["content"])
+        payload["version"] = core.PLAN_VERSION
+        payload["steps"] = ["Apply the approved change."]
+        payload["work_units"] = [
+            {
+                "description": "Apply the approved change.",
+                "tool": "write_file",
+                "arguments": {
+                    "path": "script.js",
+                    "content": "approved content",
+                },
+            }
+        ]
+        record["content"] = json.dumps(payload)
+        get_plan.return_value = record
+
         agent = build_agent()
         previous = {
             "plan_id": 99,
@@ -605,7 +847,8 @@ class ApprovedPlanExecutorTests(unittest.TestCase):
             "current_step": None,
         }
         agent._active_plan_execution = previous
-        agent.step = mock.Mock(
+        agent.step = mock.Mock()
+        agent._execute_tool = mock.Mock(
             side_effect=RuntimeError("simulated executor failure")
         )
 
@@ -613,6 +856,7 @@ class ApprovedPlanExecutorTests(unittest.TestCase):
 
         self.assertTrue(result.startswith("FAIL:"))
         self.assertIn("RuntimeError", result)
+        agent.step.assert_not_called()
         self.assertIs(
             agent._active_plan_execution,
             previous,
@@ -695,42 +939,56 @@ class ApprovedPlanExecutorTests(unittest.TestCase):
     ):
         record = plan_record()
         payload = json.loads(record["content"])
+        payload["version"] = core.PLAN_VERSION
         payload["files"] = ["script.js"]
         payload["steps"] = [
             "Update script.js to manage light-mode explicitly."
+        ]
+        payload["work_units"] = [
+            {
+                "description": (
+                    "Update script.js to manage light-mode explicitly."
+                ),
+                "tool": "write_file",
+                "arguments": {
+                    "path": "script.js",
+                    "content": "approved content",
+                },
+            }
         ]
         record["content"] = json.dumps(payload)
         get_plan.return_value = record
 
         agent = build_agent()
+        agent.step = mock.Mock()
 
-        def failed_edit_then_read(_prompt):
-            agent._tool_events = [
-                {
-                    "tool": "edit_file",
-                    "args": {"path": "script.js"},
-                    "status": "failure",
-                    "reason": "edit_text_not_found",
-                },
+        def execute(_name, _args):
+            event = core.build_tool_event(
+                "read_file",
+                {"path": "script.js"},
+                "Read script.js",
                 {
                     "tool": "read_file",
                     "args": {"path": "script.js"},
+                    "result": "Read script.js",
                     "status": "success",
                     "reason": "completed",
                 },
-            ]
-            return "Inspected script.js after the failed edit."
+                core.TOOL_DEFINITIONS,
+            )
+            agent._tool_events.append(event)
+            return "Read script.js"
 
-        agent.step = mock.Mock(side_effect=failed_edit_then_read)
+        agent._execute_tool = mock.Mock(side_effect=execute)
 
         result = agent.execute_plan(41)
 
         self.assertTrue(result.startswith("FAIL:"))
         self.assertIn(
-            "no qualifying Plan progress event",
+            "did not produce the exact host-observed completion event",
             result,
         )
-        self.assertEqual(agent.step.call_count, 3)
+        agent.step.assert_not_called()
         transition_plan.assert_called_with(
             41,
             "running",
@@ -738,70 +996,6 @@ class ApprovedPlanExecutorTests(unittest.TestCase):
             result=mock.ANY,
         )
 
-    @mock.patch.object(core.memory, "transition_plan", return_value=True)
-    @mock.patch.object(core.memory, "get_plan")
-    def test_read_only_repair_does_not_trigger_validation_rerun(
-        self,
-        get_plan,
-        transition_plan,
-    ):
-        record = plan_record()
-        payload = json.loads(record["content"])
-        payload["files"] = ["script.js"]
-        payload["steps"] = [
-            "Update script.js to manage light-mode explicitly."
-        ]
-        record["content"] = json.dumps(payload)
-        get_plan.return_value = record
-
-        agent = build_agent()
-        call_number = 0
-
-        def implementation_then_read_only_repairs(_prompt):
-            nonlocal call_number
-            call_number += 1
-
-            if call_number == 1:
-                agent._tool_events = [{
-                    "tool": "edit_file",
-                    "args": {"path": "script.js"},
-                    "status": "success",
-                    "reason": "completed",
-                }]
-            else:
-                agent._tool_events = [{
-                    "tool": "read_file",
-                    "args": {"path": "script.js"},
-                    "status": "success",
-                    "reason": "completed",
-                }]
-
-            return "Plan execution attempt."
-
-        agent.step = mock.Mock(
-            side_effect=implementation_then_read_only_repairs
-        )
-        install_validation_results(
-            agent,
-            ["Still failing.\n[exit code: 1]"],
-        )
-
-        result = agent.execute_plan(41)
-
-        self.assertTrue(result.startswith("FAIL:"))
-        self.assertIn(
-            "validation repair produced no successful corrective "
-            "action event in three consecutive attempts",
-            result,
-        )
-        self.assertEqual(agent.step.call_count, 4)
-        self.assertEqual(agent._execute_tool.call_count, 1)
-        transition_plan.assert_called_with(
-            41,
-            "running",
-            "failed",
-            result=mock.ANY,
-        )
 
     @mock.patch.object(core.memory, "transition_plan", return_value=True)
     @mock.patch.object(core.memory, "get_plan")

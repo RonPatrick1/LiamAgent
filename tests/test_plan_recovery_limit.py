@@ -41,25 +41,92 @@ class PlanRecoveryLimitTests(unittest.TestCase):
             }
 
             first = dict(base)
+            first["version"] = core.PLAN_VERSION
+            first_server_step = "Start a local web server on port 8000."
             first["steps"] = [
                 f"Create {index_path}.",
-                "Start a local web server on port 8000.",
+                first_server_step,
+            ]
+            first["work_units"] = [
+                {
+                    "description": f"Create {index_path}.",
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": index_path,
+                        "content": "<html></html>\n",
+                    },
+                },
+                {
+                    "description": first_server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": "python3 -m http.server 8000",
+                    },
+                    "affected_paths": [],
+                },
             ]
 
             second = dict(base)
+            second["version"] = core.PLAN_VERSION
+            second_server_step = (
+                "Run `python3 -m http.server 8000 --bind 0.0.0.0`."
+            )
             second["steps"] = [
                 f"Create {index_path}.",
-                "Run `python3 -m http.server 8000 --bind 0.0.0.0`.",
+                second_server_step,
+            ]
+            second["work_units"] = [
+                {
+                    "description": f"Create {index_path}.",
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": index_path,
+                        "content": "<html></html>\n",
+                    },
+                },
+                {
+                    "description": second_server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "python3 -m http.server 8000 --bind 0.0.0.0"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
             ]
 
             third = dict(base)
+            third["version"] = core.PLAN_VERSION
+            third_server_step = (
+                "Run `nohup python3 -m http.server 8000 "
+                "--bind 0.0.0.0 >/dev/null 2>&1 &` so it remains "
+                "running during validation."
+            )
             third["steps"] = [
                 f"Create {index_path}.",
-                (
-                    "Run `nohup python3 -m http.server 8000 "
-                    "--bind 0.0.0.0 >/dev/null 2>&1 &` so it remains "
-                    "running during validation."
-                ),
+                third_server_step,
+            ]
+            third["work_units"] = [
+                {
+                    "description": f"Create {index_path}.",
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": index_path,
+                        "content": "<html></html>\n",
+                    },
+                },
+                {
+                    "description": third_server_step,
+                    "tool": "run_shell_command",
+                    "arguments": {
+                        "command": (
+                            "nohup python3 -m http.server 8000 "
+                            "--bind 0.0.0.0 >/dev/null 2>&1 &"
+                        ),
+                    },
+                    "affected_paths": [],
+                },
             ]
 
             client = mock.Mock()
