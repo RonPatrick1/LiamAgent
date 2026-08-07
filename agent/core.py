@@ -3084,6 +3084,122 @@ class Agent:
         return answer == "y"
 
     @staticmethod
+    def _path_within_context_root(path, root):
+        try:
+            candidate = os.path.normpath(path)
+            context_root = os.path.normpath(root)
+            return os.path.commonpath([context_root, candidate]) == context_root
+        except ValueError:
+            return False
+
+    def _thread_path_context_roots(self):
+        """Host-owned task context roots; these establish relevance, not access."""
+        configured = [
+            getattr(self, "workdir", os.getcwd()),
+            *(getattr(self, "extra_folders", None) or []),
+        ]
+        roots = []
+
+        for value in configured:
+            if not isinstance(value, str) or not value.strip():
+                continue
+
+            root = os.path.normpath(
+                os.path.abspath(
+                    os.path.expanduser(value.strip())
+                )
+            )
+            if root not in roots:
+                roots.append(root)
+
+        return roots
+
+    def _path_grounded_by_successful_context_evidence(
+        self,
+        raw_path,
+        resolved,
+    ):
+        """Accept outside paths only when grounded evidence links them to this task."""
+        for event in getattr(self, "_tool_events", []) or []:
+            if (
+                not isinstance(event, dict)
+                or event.get("status") != "success"
+            ):
+                continue
+
+            tool = event.get("tool")
+            args = event.get("args") or {}
+            event_paths = []
+
+            for field in APPROVED_PLAN_PATH_ARGS.get(tool, ()):
+                value = args.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    continue
+
+                event_paths.append(
+                    os.path.normpath(
+                        _resolve(
+                            value.strip(),
+                            self.workdir,
+                        )
+                    )
+                )
+
+            event_is_context_grounded = any(
+                any(
+                    self._path_within_context_root(
+                        event_path,
+                        root,
+                    )
+                    for root in self._thread_path_context_roots()
+                )
+                or self._text_names_exact_path(
+                    getattr(self, "_current_user_input", ""),
+                    event_path,
+                    event_path,
+                )
+                for event_path in event_paths
+            )
+
+            if not event_is_context_grounded:
+                continue
+
+            if any(event_path == resolved for event_path in event_paths):
+                return True
+
+            if self._text_names_exact_path(
+                str(event.get("result", "")),
+                raw_path,
+                resolved,
+            ):
+                return True
+
+        return False
+
+    def _plan_path_is_grounded(self, raw_path, resolved):
+        """A Plan path needs task provenance; its filesystem location is irrelevant."""
+        if any(
+            self._path_within_context_root(
+                resolved,
+                root,
+            )
+            for root in self._thread_path_context_roots()
+        ):
+            return True
+
+        if self._text_names_exact_path(
+            getattr(self, "_current_user_input", ""),
+            raw_path,
+            resolved,
+        ):
+            return True
+
+        return self._path_grounded_by_successful_context_evidence(
+            raw_path,
+            resolved,
+        )
+
+    @staticmethod
     def _text_names_exact_path(text, raw_path, resolved):
         if not isinstance(text, str) or not text:
             return False
@@ -3094,7 +3210,7 @@ class Agent:
             if re.search(
                 r"(?<![A-Za-z0-9_.-])"
                 + re.escape(candidate)
-                + r"(?![A-Za-z0-9_.-])",
+                + r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_-])",
                 text,
             ):
                 return True
@@ -3173,37 +3289,56 @@ class Agent:
                 _resolve(raw_path, self.workdir)
             )
 
-            # Existing paths are concrete runtime evidence. This deliberately
-            # keeps diagnostics flexible instead of restricting Liam to files[]
-            # that happened to be known when the Plan was drafted.
-            if os.path.exists(resolved):
-                continue
-
-            # Defense in depth for older stored Plans created before the draft
-            # validator learned to reject prose-template paths.
+            # Placeholder/template paths are never made trustworthy merely
+            # because they happen to resolve beneath the project folder.
             if PLAN_UNRESOLVED_PLACEHOLDER_RE.search(raw_path):
                 return (
                     "Error: approved Plan execution rejected unresolved "
-                    f"filesystem path {raw_path!r}. The path does not exist "
-                    "and still contains a placeholder/template value. Use a "
-                    "real path established by the approved Plan or successful "
-                    "filesystem evidence; do not guess a replacement."
+                    f"filesystem path {raw_path!r}. The path still contains "
+                    "a placeholder/template value. Use a real path established "
+                    "by the approved Plan or successful filesystem evidence; "
+                    "do not guess a replacement."
                 )
 
+            # The approved payload is host-owned authority for paths the user
+            # actually approved, including legitimate locations outside the
+            # thread project such as explicit temporary/runtime targets.
             if self._approved_plan_authorizes_path(
                 raw_path,
                 resolved,
             ):
                 continue
 
+            if self._path_grounded_by_successful_context_evidence(
+                raw_path,
+                resolved,
+            ):
+                continue
+
+            # Existing paths beneath the actual thread context may be used for
+            # diagnostics discovered while executing the Plan. Nonexistent
+            # invented paths do not become grounded just because their spelling
+            # places them beneath workdir.
+            if (
+                os.path.exists(resolved)
+                and any(
+                    self._path_within_context_root(
+                        resolved,
+                        root,
+                    )
+                    for root in self._thread_path_context_roots()
+                )
+            ):
+                continue
+
             return (
-                "Error: approved Plan execution rejected nonexistent "
-                f"{name}.{field} path {raw_path!r}. Neither that path nor "
-                "its resolved absolute path is authorized by the host-owned "
-                "approved Plan payload, and it does not currently exist. "
-                "Use an exact approved path or a real path discovered from "
-                "successful filesystem evidence; do not invent a replacement "
-                "path."
+                "Error: approved Plan execution rejected ungrounded "
+                f"{name}.{field} path {raw_path!r}. The path is not authorized "
+                "by the host-owned approved Plan payload and was not established "
+                "by successful task-grounded tool evidence. Its existence on "
+                "disk does not make it relevant to this Plan, and a nonexistent "
+                "path beneath the project is not evidence that the path is real. "
+                "Do not invent or substitute another location."
             )
 
         return None
@@ -3744,16 +3879,23 @@ class Agent:
             if not isinstance(declared, str) or not declared.strip():
                 continue
 
-            resolved = os.path.normpath(_resolve(declared, self.workdir))
-            try:
-                inside_workdir = (
-                    os.path.commonpath([workdir, resolved]) == workdir
+            resolved = os.path.normpath(
+                _resolve(
+                    declared,
+                    self.workdir,
                 )
-            except ValueError:
-                inside_workdir = False
+            )
 
-            if not inside_workdir:
-                continue
+            if not self._plan_path_is_grounded(
+                declared,
+                resolved,
+            ):
+                return (
+                    f"files contains ungrounded path {declared!r}; the path "
+                    "was not established by the thread working folder, an "
+                    "explicit user path, an explicitly configured extra "
+                    "folder, or successful task-grounded tool evidence"
+                )
 
             declared_local.append((declared, resolved))
 
@@ -3976,6 +4118,96 @@ class Agent:
             for item in payload.get("assumptions", []) or []
             if isinstance(item, dict)
         ]
+
+        declared_resolved_paths = {
+            resolved
+            for _declared, resolved in declared_local
+        }
+
+        # Validation commands are executable shell text, so path grounding
+        # must distinguish a command executable from filesystem operands.
+        # Do not scan arbitrary step prose for every absolute-looking token:
+        # file-changing steps already have their own declared-file checks.
+        for validation_index, check in enumerate(validation):
+            if not isinstance(check, dict):
+                continue
+
+            command = check.get("command")
+            if not isinstance(command, str):
+                continue
+
+            try:
+                command_tokens = shlex.split(command)
+            except ValueError:
+                continue
+
+            clauses = []
+            clause = []
+            for token in command_tokens:
+                if token in {"&&", "||", ";", "|"}:
+                    if clause:
+                        clauses.append(clause)
+                    clause = []
+                else:
+                    clause.append(token)
+            if clause:
+                clauses.append(clause)
+
+            for clause in clauses:
+                if not clause:
+                    continue
+
+                # The first token is the executable. A fully-qualified
+                # executable such as /usr/bin/grep is not a project path.
+                operand_start = 1
+
+                # Common command wrappers move the real executable one slot
+                # later; skip that executable too.
+                if (
+                    os.path.basename(clause[0])
+                    in {"command", "env", "nohup", "sudo"}
+                    and len(clause) > 1
+                ):
+                    operand_start = 2
+
+                for token in clause[operand_start:]:
+                    candidate = token.rstrip(".,;:!?")
+
+                    # Ignore options and shell plumbing. Redirection tokens
+                    # such as >/dev/null are not filesystem operands being
+                    # asserted by the Plan.
+                    if (
+                        not candidate
+                        or candidate.startswith("-")
+                        or candidate.startswith((">", "<"))
+                        or not os.path.isabs(candidate)
+                    ):
+                        continue
+
+                    resolved_path = os.path.normpath(candidate)
+
+                    if resolved_path == "/dev/null":
+                        continue
+
+                    if resolved_path in declared_resolved_paths:
+                        continue
+
+                    if self._plan_path_is_grounded(
+                        candidate,
+                        resolved_path,
+                    ):
+                        continue
+
+                    semantic_problems.append(
+                        "validation["
+                        + str(validation_index)
+                        + "].command references ungrounded absolute path "
+                        + repr(candidate)
+                        + "; validation filesystem operands must come from "
+                        "declared Plan files, the thread working folder, an "
+                        "explicit user path, an explicitly configured extra "
+                        "folder, or successful task-grounded tool evidence"
+                    )
 
         for check in validation:
             if not isinstance(check, dict):
@@ -4233,8 +4465,6 @@ class Agent:
         }
 
         if isinstance(validation, list):
-            import shlex
-
             for check in validation:
                 if not isinstance(check, dict):
                     continue

@@ -1553,6 +1553,218 @@ class ActionToolRequirementTests(unittest.TestCase):
                 problem,
             )
 
+    def test_plan_rejects_existing_but_ungrounded_outside_path(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir, \
+             tempfile.TemporaryDirectory() as outside:
+            target = os.path.join(outside, "project.txt")
+            with open(target, "w") as handle:
+                handle.write("real but unrelated\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = workdir
+            agent.extra_folders = []
+            agent._current_user_input = (
+                "Make a plan to fix the project in this folder."
+            )
+            agent._read_paths_this_turn = {target}
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [target],
+                "steps": [f"Modify {target}."],
+            }))
+
+        self.assertIsNotNone(problem)
+        self.assertIn("ungrounded path", problem)
+
+    def test_plan_allows_explicit_user_named_outside_path_after_read(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir, \
+             tempfile.TemporaryDirectory() as outside:
+            target = os.path.join(outside, "shared.txt")
+            with open(target, "w") as handle:
+                handle.write("shared\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = workdir
+            agent.extra_folders = []
+            agent._current_user_input = (
+                f"Update the existing file {target}."
+            )
+            agent._read_paths_this_turn = {target}
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [target],
+                "steps": [f"Modify {target}."],
+            }))
+
+        self.assertIsNone(problem)
+
+    def test_plan_allows_outside_path_grounded_by_project_evidence(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir, \
+             tempfile.TemporaryDirectory() as outside:
+            config = os.path.join(workdir, "config.txt")
+            target = os.path.join(outside, "shared.txt")
+
+            with open(config, "w") as handle:
+                handle.write(f"shared_path={target}\n")
+            with open(target, "w") as handle:
+                handle.write("shared\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = workdir
+            agent.extra_folders = []
+            agent._current_user_input = (
+                "Make a plan to fix the project in this folder."
+            )
+            agent._read_paths_this_turn = {config, target}
+            agent._tool_events = [
+                {
+                    "tool": "read_file",
+                    "args": {"path": config},
+                    "result": f"shared_path={target}\n",
+                    "status": "success",
+                },
+                {
+                    "tool": "read_file",
+                    "args": {"path": target},
+                    "result": "shared\n",
+                    "status": "success",
+                },
+            ]
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [target],
+                "steps": [f"Modify {target}."],
+            }))
+
+        self.assertIsNone(problem)
+
+    def test_plan_rejects_ungrounded_absolute_validation_path(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir:
+            target = os.path.join(workdir, "config.txt")
+            with open(target, "w") as handle:
+                handle.write("enabled=true\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = workdir
+            agent.extra_folders = []
+            agent._current_user_input = (
+                "Make a plan to update config.txt in this project."
+            )
+            agent._read_paths_this_turn = {target}
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [target],
+                "steps": [f"Modify {target}."],
+                "validation": [{
+                    "command": (
+                        "grep -Fq enabled "
+                        "/home/jupyter/project"
+                    ),
+                    "expected": "The configuration is enabled.",
+                }],
+            }))
+
+        self.assertIsNotNone(problem)
+        self.assertIn(
+            "references ungrounded absolute path "
+            "'/home/jupyter/project'",
+            problem,
+        )
+
+    def test_validation_absolute_executable_is_not_treated_as_project_path(self):
+        import json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir:
+            target = os.path.join(workdir, "config.txt")
+            with open(target, "w") as handle:
+                handle.write("enabled=true\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = workdir
+            agent.extra_folders = []
+            agent._current_user_input = (
+                "Make a plan to update config.txt in this project."
+            )
+            agent._read_paths_this_turn = {target}
+            agent._tool_events = []
+
+            problem = agent._plan_file_evidence_problem(json.dumps({
+                "files": [target],
+                "steps": [f"Modify {target}."],
+                "validation": [{
+                    "command": (
+                        f"/usr/bin/grep -Fq enabled {target}"
+                    ),
+                    "expected": "The configuration is enabled.",
+                }],
+            }))
+
+        self.assertIsNone(problem)
+
+    def test_approved_execution_rejects_existing_unrelated_path(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir, \
+             tempfile.TemporaryDirectory() as outside:
+            target = os.path.join(outside, "unrelated.txt")
+            with open(target, "w") as handle:
+                handle.write("real but unrelated\n")
+
+            agent = core.Agent.__new__(core.Agent)
+            agent.workdir = workdir
+            agent.extra_folders = []
+            agent._current_user_input = ""
+            agent._tool_events = []
+            agent._active_plan_execution = {
+                "plan_id": 41,
+                "payload": {
+                    "files": [],
+                    "steps": [
+                        "Fix the project in the thread folder."
+                    ],
+                    "validation": [],
+                },
+                "phase": "implementation",
+                "step_number": 0,
+                "current_step": (
+                    "Fix the project in the thread folder."
+                ),
+            }
+
+            problem = agent._approved_plan_path_problem(
+                "file_info",
+                {"path": target},
+            )
+
+        self.assertIsNotNone(problem)
+        self.assertIn("rejected ungrounded", problem)
+        self.assertIn(
+            "existence on disk does not make it relevant",
+            problem,
+        )
+
     def test_plan_rejects_existing_file_not_read_this_turn(self):
         import json
         import os
