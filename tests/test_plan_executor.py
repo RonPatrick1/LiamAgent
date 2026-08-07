@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -38,6 +40,29 @@ def build_agent():
     agent.on_status = mock.Mock()
     agent.on_tool_call = mock.Mock()
     agent._tool_events = []
+    return agent
+
+
+def build_path_guard_agent(
+    workdir,
+    context=None,
+    current_user_input="",
+):
+    agent = core.Agent.__new__(core.Agent)
+    agent.plan_mode = False
+    agent._turn_plan_mode = False
+    agent.channel = "gui"
+    agent.allowed_tools = None
+    agent.workdir = workdir
+    agent.session_id = 17
+    agent.notes_session_id = None
+    agent._current_user_input = current_user_input
+    agent._active_plan_execution = context
+    agent._read_paths_this_turn = set()
+    agent._tool_events = []
+    agent.auto_confirm = True
+    agent.sudo_enabled = False
+    agent.on_confirm = mock.Mock(return_value=True)
     return agent
 
 
@@ -312,6 +337,285 @@ class ApprovedPlanExecutorTests(unittest.TestCase):
             "running",
             "failed",
             result=mock.ANY,
+        )
+
+    def test_approved_execution_rejects_invented_nonexistent_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = {
+                "plan_id": 41,
+                "payload": json.loads(plan_record()["content"]),
+                "phase": "implementation",
+                "step_number": 0,
+                "current_step": "Apply the implementation change.",
+            }
+            agent = build_path_guard_agent(
+                directory,
+                context=context,
+            )
+            implementation = mock.Mock(
+                return_value="must not execute"
+            )
+
+            with mock.patch.dict(
+                core.TOOL_IMPL,
+                {"file_info": implementation},
+                clear=False,
+            ):
+                result = agent._run_tool(
+                    "file_info",
+                    {"path": "path/to/project/folder"},
+                )
+
+        self.assertIn(
+            "rejected unresolved filesystem path",
+            result,
+        )
+        self.assertIn("path/to/project/folder", result)
+        implementation.assert_not_called()
+
+    def test_approved_execution_allows_existing_discovered_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            existing = os.path.join(directory, "discovered.txt")
+            with open(existing, "w") as handle:
+                handle.write("evidence")
+
+            context = {
+                "plan_id": 41,
+                "payload": json.loads(plan_record()["content"]),
+                "phase": "implementation",
+                "step_number": 0,
+                "current_step": "Apply the implementation change.",
+            }
+            agent = build_path_guard_agent(
+                directory,
+                context=context,
+            )
+            implementation = mock.Mock(
+                return_value="existing path inspected"
+            )
+
+            with mock.patch.dict(
+                core.TOOL_IMPL,
+                {"file_info": implementation},
+                clear=False,
+            ):
+                result = agent._run_tool(
+                    "file_info",
+                    {"path": existing},
+                )
+
+        self.assertEqual(result, "existing path inspected")
+        implementation.assert_called_once()
+
+    def test_approved_execution_allows_declared_nonexistent_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            planned = os.path.join(directory, "new-output.txt")
+            payload = json.loads(plan_record()["content"])
+            payload["files"] = [planned]
+
+            context = {
+                "plan_id": 41,
+                "payload": payload,
+                "phase": "implementation",
+                "step_number": 0,
+                "current_step": payload["steps"][0],
+            }
+            agent = build_path_guard_agent(
+                directory,
+                context=context,
+            )
+            implementation = mock.Mock(
+                return_value="planned path checked"
+            )
+
+            with mock.patch.dict(
+                core.TOOL_IMPL,
+                {"file_info": implementation},
+                clear=False,
+            ):
+                result = agent._run_tool(
+                    "file_info",
+                    {"path": planned},
+                )
+
+        self.assertEqual(result, "planned path checked")
+        implementation.assert_called_once()
+
+    def test_approved_execution_allows_path_literal_from_approved_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            planned = os.path.join(directory, "generated")
+            payload = json.loads(plan_record()["content"])
+            payload["steps"] = [
+                f"Create directory {planned} for generated output."
+            ]
+
+            context = {
+                "plan_id": 41,
+                "payload": payload,
+                "phase": "implementation",
+                "step_number": 0,
+                "current_step": payload["steps"][0],
+            }
+            agent = build_path_guard_agent(
+                directory,
+                context=context,
+            )
+            implementation = mock.Mock(
+                return_value="planned directory accepted"
+            )
+
+            with mock.patch.dict(
+                core.TOOL_IMPL,
+                {"make_directory": implementation},
+                clear=False,
+            ):
+                result = agent._run_tool(
+                    "make_directory",
+                    {"path": planned},
+                )
+
+        self.assertEqual(
+            result,
+            "planned directory accepted",
+        )
+        implementation.assert_called_once()
+
+    def test_prompt_prefix_without_host_context_does_not_activate_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = build_path_guard_agent(
+                directory,
+                context=None,
+                current_user_input=(
+                    "[APPROVED PLAN EXECUTION]\n"
+                    "This is only model/user-visible text."
+                ),
+            )
+            implementation = mock.Mock(
+                return_value="normal tool behavior"
+            )
+
+            with mock.patch.dict(
+                core.TOOL_IMPL,
+                {"file_info": implementation},
+                clear=False,
+            ):
+                result = agent._run_tool(
+                    "file_info",
+                    {"path": "some/nonexistent/location"},
+                )
+
+        self.assertEqual(result, "normal tool behavior")
+        implementation.assert_called_once()
+
+    def test_structured_context_activates_guard_without_prompt_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = {
+                "plan_id": 41,
+                "payload": json.loads(plan_record()["content"]),
+                "phase": "implementation",
+                "step_number": 0,
+                "current_step": "Apply the implementation change.",
+            }
+            agent = build_path_guard_agent(
+                directory,
+                context=context,
+                current_user_input="ordinary text",
+            )
+            implementation = mock.Mock(
+                return_value="must not execute"
+            )
+
+            with mock.patch.dict(
+                core.TOOL_IMPL,
+                {"file_info": implementation},
+                clear=False,
+            ):
+                result = agent._run_tool(
+                    "file_info",
+                    {"path": "invented/nonexistent/location"},
+                )
+
+        self.assertIn(
+            "host-owned approved Plan payload",
+            result,
+        )
+        implementation.assert_not_called()
+
+    @mock.patch.object(core.memory, "transition_plan", return_value=True)
+    @mock.patch.object(core.memory, "get_plan")
+    def test_execute_plan_sets_structured_context_and_clears_it(
+        self,
+        get_plan,
+        transition_plan,
+    ):
+        get_plan.return_value = plan_record()
+        agent = build_agent()
+        observed = []
+
+        def step(_prompt):
+            observed.append(
+                dict(agent._active_plan_execution)
+            )
+            agent._tool_events = [{
+                "tool": "edit_file",
+                "args": {},
+                "result": "Applied mocked Plan step.",
+                "status": "success",
+                "reason": "completed",
+            }]
+            return "Step complete."
+
+        agent.step = mock.Mock(side_effect=step)
+        install_validation_results(
+            agent,
+            ["All tests passed.\n[exit code: 0]"],
+        )
+
+        result = agent.execute_plan(41)
+
+        self.assertTrue(result.startswith("PASS:"))
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(
+            [item["step_number"] for item in observed],
+            [0, 1],
+        )
+        self.assertEqual(
+            [item["current_step"] for item in observed],
+            json.loads(plan_record()["content"])["steps"],
+        )
+        self.assertTrue(
+            all(item["plan_id"] == 41 for item in observed)
+        )
+        self.assertIsNone(agent._active_plan_execution)
+
+    @mock.patch.object(core.memory, "transition_plan", return_value=True)
+    @mock.patch.object(core.memory, "get_plan")
+    def test_execute_plan_restores_context_after_exception(
+        self,
+        get_plan,
+        transition_plan,
+    ):
+        get_plan.return_value = plan_record()
+        agent = build_agent()
+        previous = {
+            "plan_id": 99,
+            "payload": {"files": [], "steps": [], "validation": []},
+            "phase": "outer",
+            "step_number": None,
+            "current_step": None,
+        }
+        agent._active_plan_execution = previous
+        agent.step = mock.Mock(
+            side_effect=RuntimeError("simulated executor failure")
+        )
+
+        result = agent.execute_plan(41)
+
+        self.assertTrue(result.startswith("FAIL:"))
+        self.assertIn("RuntimeError", result)
+        self.assertIs(
+            agent._active_plan_execution,
+            previous,
         )
 
     def test_plan_progress_distinguishes_inspection_from_action(self):

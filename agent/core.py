@@ -357,6 +357,26 @@ APPROVED_PLAN_STEP_PREFIXES = (
     "[APPROVED PLAN EXECUTION]",
     "[APPROVED PLAN VALIDATION REPAIR]",
 )
+
+APPROVED_PLAN_PATH_ARGS = {
+    "read_file": ("path",),
+    "read_json": ("path",),
+    "list_directory": ("path",),
+    "search_text": ("path",),
+    "find_files": ("path",),
+    "file_info": ("path",),
+    "diff_files": ("path_a", "path_b"),
+    "write_file": ("path",),
+    "edit_file": ("path",),
+    "make_directory": ("path",),
+    "copy_path": ("src", "dst"),
+    "move_path": ("src", "dst"),
+    "delete_path": ("path",),
+    "git_add": ("path",),
+    "git_diff": ("path",),
+    "git_log": ("path",),
+    "git_blame": ("path",),
+}
 EXPLICIT_PLAN_REQUEST_RE = re.compile(
     r"^\s*(?:please\s+)?"
     r"(?:make|create|draft|write|prepare|build|put\s+together)\s+"
@@ -517,7 +537,9 @@ PLAN_HTTP_ASSERTION_RE = re.compile(
 PLAN_UNRESOLVED_PLACEHOLDER_RE = re.compile(
     r"<\s*(?:port|path|file|host|hostname|ip|url|command|value|"
     r"name|id|number|choose[^>]*)\s*>|"
-    r"\b(?:TBD|TO[ -]?DO|CHANGEME)\b",
+    r"\b(?:TBD|TO[ -]?DO|CHANGEME)\b|"
+    r"(?<![A-Za-z0-9_.-])/?path/to(?:/[A-Za-z0-9_.-]+)+"
+    r"(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
 PLAN_STEP_FILE_REFERENCE_RE = re.compile(
@@ -2160,6 +2182,7 @@ class Agent:
         self.sudo_enabled = bool(sudo_enabled) and self.is_owner
         self.learning_enabled = bool(learning_enabled) and not self.plan_mode
         self._current_user_input = ""
+        self._active_plan_execution = None
         self._tool_events = []
         self._lesson_uses = []
         offered_tools = set(TOOL_IMPL) - {"propose_lesson"}
@@ -3060,6 +3083,131 @@ class Agent:
         answer = input("Allow this? [y/N] ").strip().lower()
         return answer == "y"
 
+    @staticmethod
+    def _text_names_exact_path(text, raw_path, resolved):
+        if not isinstance(text, str) or not text:
+            return False
+
+        for candidate in (raw_path, resolved):
+            if not candidate:
+                continue
+            if re.search(
+                r"(?<![A-Za-z0-9_.-])"
+                + re.escape(candidate)
+                + r"(?![A-Za-z0-9_.-])",
+                text,
+            ):
+                return True
+
+        return False
+
+    def _approved_plan_authorizes_path(self, raw_path, resolved):
+        """Use host-owned approved Plan data, never rendered prompt prose."""
+        context = getattr(
+            self,
+            "_active_plan_execution",
+            None,
+        )
+        if not isinstance(context, dict):
+            return False
+
+        payload = context.get("payload")
+        if not isinstance(payload, dict):
+            return False
+
+        for declared in payload.get("files") or []:
+            if not isinstance(declared, str):
+                continue
+            declared_resolved = os.path.normpath(
+                _resolve(declared, self.workdir)
+            )
+            if declared_resolved == resolved:
+                return True
+
+        authoritative_text = []
+
+        authoritative_text.extend(
+            step
+            for step in payload.get("steps") or []
+            if isinstance(step, str)
+        )
+
+        for check in payload.get("validation") or []:
+            if not isinstance(check, dict):
+                continue
+            for field in ("command", "expected"):
+                value = check.get(field)
+                if isinstance(value, str):
+                    authoritative_text.append(value)
+
+        return any(
+            self._text_names_exact_path(
+                value,
+                raw_path,
+                resolved,
+            )
+            for value in authoritative_text
+        )
+
+    def _approved_plan_path_problem(self, name, args):
+        """Reject invented nonexistent paths during approved Plan execution."""
+        context = getattr(
+            self,
+            "_active_plan_execution",
+            None,
+        )
+        if not isinstance(context, dict):
+            return None
+
+        fields = APPROVED_PLAN_PATH_ARGS.get(name, ())
+        if not fields:
+            return None
+
+        for field in fields:
+            value = args.get(field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+
+            raw_path = value.strip()
+            resolved = os.path.normpath(
+                _resolve(raw_path, self.workdir)
+            )
+
+            # Existing paths are concrete runtime evidence. This deliberately
+            # keeps diagnostics flexible instead of restricting Liam to files[]
+            # that happened to be known when the Plan was drafted.
+            if os.path.exists(resolved):
+                continue
+
+            # Defense in depth for older stored Plans created before the draft
+            # validator learned to reject prose-template paths.
+            if PLAN_UNRESOLVED_PLACEHOLDER_RE.search(raw_path):
+                return (
+                    "Error: approved Plan execution rejected unresolved "
+                    f"filesystem path {raw_path!r}. The path does not exist "
+                    "and still contains a placeholder/template value. Use a "
+                    "real path established by the approved Plan or successful "
+                    "filesystem evidence; do not guess a replacement."
+                )
+
+            if self._approved_plan_authorizes_path(
+                raw_path,
+                resolved,
+            ):
+                continue
+
+            return (
+                "Error: approved Plan execution rejected nonexistent "
+                f"{name}.{field} path {raw_path!r}. Neither that path nor "
+                "its resolved absolute path is authorized by the host-owned "
+                "approved Plan payload, and it does not currently exist. "
+                "Use an exact approved path or a real path discovered from "
+                "successful filesystem evidence; do not invent a replacement "
+                "path."
+            )
+
+        return None
+
     def _run_tool(self, name, args):
         if name not in TOOL_IMPL:
             return f"Error: unknown tool '{name}'. There is no such tool — the only tools that exist are: {', '.join(sorted(TOOL_IMPL))}."
@@ -3077,6 +3225,14 @@ class Agent:
             return f"Error: the '{name}' tool isn't available in this conversation."
         aliases = PARAM_ALIASES.get(name, {})
         args = {aliases.get(k, k): v for k, v in args.items()}
+
+        approved_path_problem = self._approved_plan_path_problem(
+            name,
+            args,
+        )
+        if approved_path_problem is not None:
+            return approved_path_problem
+
         if name == "run_shell_command" and _unsafe_generic_shell_command(
             args.get("command", "")
         ):
@@ -4763,7 +4919,16 @@ class Agent:
         if self._plan_mode_active():
             return False
 
-        if user_input.lstrip().startswith(APPROVED_PLAN_STEP_PREFIXES):
+        plan_execution = getattr(
+            self,
+            "_active_plan_execution",
+            None,
+        )
+        if (
+            isinstance(plan_execution, dict)
+            and plan_execution.get("phase")
+            in {"implementation", "repair"}
+        ):
             return True
 
         if (
@@ -5899,8 +6064,21 @@ class Agent:
                 "approved to running."
             )
 
+        previous_plan_execution = getattr(
+            self,
+            "_active_plan_execution",
+            None,
+        )
+
         try:
             payload = self._stored_plan_payload(plan)
+            self._active_plan_execution = {
+                "plan_id": plan_id,
+                "payload": payload,
+                "phase": "implementation",
+                "step_number": None,
+                "current_step": None,
+            }
             completed_steps = []
 
             for step_number, step in enumerate(payload["steps"]):
@@ -5910,6 +6088,12 @@ class Agent:
                 while True:
                     if self._plan_cancel_requested(cancel_event):
                         return self._cancel_running_plan(plan_id)
+
+                    self._active_plan_execution.update({
+                        "phase": "implementation",
+                        "step_number": step_number,
+                        "current_step": payload["steps"][step_number],
+                    })
 
                     reply = self.step(
                         self._plan_step_prompt(
@@ -5981,6 +6165,11 @@ class Agent:
                 if self._plan_cancel_requested(cancel_event):
                     return self._cancel_running_plan(plan_id)
 
+                self._active_plan_execution.update({
+                    "phase": "validation",
+                    "step_number": None,
+                    "current_step": None,
+                })
                 self._tool_events = []
                 validation_results = self._run_plan_validation(
                     payload
@@ -6041,6 +6230,12 @@ class Agent:
                     if self._plan_cancel_requested(cancel_event):
                         return self._cancel_running_plan(plan_id)
 
+                    self._active_plan_execution.update({
+                        "phase": "repair",
+                        "step_number": None,
+                        "current_step": None,
+                    })
+
                     self.step(
                         self._plan_repair_prompt(
                             payload,
@@ -6083,6 +6278,10 @@ class Agent:
                 plan_id,
                 f"approved plan execution raised "
                 f"{type(exc).__name__}: {exc}",
+            )
+        finally:
+            self._active_plan_execution = (
+                previous_plan_execution
             )
 
     def _capture_plan_draft(self, content):

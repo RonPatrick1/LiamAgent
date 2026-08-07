@@ -142,6 +142,22 @@ class PlanDraftParserTests(unittest.TestCase):
 
         self.assertIsNone(repaired)
 
+    def test_template_path_to_project_is_rejected(self):
+        payload = valid_plan()
+        payload["steps"] = [
+            "Inspect path/to/project/folder before implementing the fix."
+        ]
+
+        canonical, error = core._extract_plan_draft(
+            fenced(payload)
+        )
+
+        self.assertIsNone(canonical)
+        self.assertIn(
+            "contains unresolved placeholder 'path/to/project/folder'",
+            error,
+        )
+
     def test_file_changing_step_requires_concrete_files(self):
         payload = valid_plan()
         payload["files"] = []
