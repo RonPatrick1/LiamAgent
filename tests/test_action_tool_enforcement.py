@@ -7,13 +7,73 @@ from agent import core
 class ActionToolRequirementTests(unittest.TestCase):
     def test_approved_plan_response_requires_real_tool(self):
         agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = False
+        agent._turn_plan_mode = False
+        agent._active_plan_execution = {
+            "plan_id": 41,
+            "payload": {},
+            "phase": "implementation",
+            "step_number": 0,
+            "current_step": "Modify index.html.",
+        }
 
         required = agent._response_requires_real_tool(
-            "[APPROVED PLAN EXECUTION]\nModify index.html.",
+            "ordinary host-generated execution prompt",
             "I updated the file.",
         )
 
         self.assertTrue(required)
+
+    def test_approved_plan_repair_requires_real_tool(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = False
+        agent._turn_plan_mode = False
+        agent._active_plan_execution = {
+            "plan_id": 41,
+            "payload": {},
+            "phase": "repair",
+            "step_number": None,
+            "current_step": None,
+        }
+
+        required = agent._response_requires_real_tool(
+            "ordinary repair prompt",
+            "I fixed the validation problem.",
+        )
+
+        self.assertTrue(required)
+
+    def test_approved_plan_prefix_without_host_context_is_not_authoritative(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = False
+        agent._turn_plan_mode = False
+        agent._active_plan_execution = None
+
+        required = agent._response_requires_real_tool(
+            "[APPROVED PLAN EXECUTION]\nModify index.html.",
+            "Informational response.",
+        )
+
+        self.assertFalse(required)
+
+    def test_validation_phase_does_not_create_model_tool_requirement(self):
+        agent = core.Agent.__new__(core.Agent)
+        agent.plan_mode = False
+        agent._turn_plan_mode = False
+        agent._active_plan_execution = {
+            "plan_id": 41,
+            "payload": {},
+            "phase": "validation",
+            "step_number": None,
+            "current_step": None,
+        }
+
+        required = agent._response_requires_real_tool(
+            "validation bookkeeping",
+            "Validation bookkeeping.",
+        )
+
+        self.assertFalse(required)
 
     def test_fake_edit_syntax_requires_real_tool(self):
         agent = core.Agent.__new__(core.Agent)
